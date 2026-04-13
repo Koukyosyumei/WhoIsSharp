@@ -1521,7 +1521,7 @@ async fn handle_key(
                         let prev_tab = app.active_tab;
                         app.active_tab = AppTab::Markets;
                         // Filter might hide it — just inline
-                        drop(m);
+                        let _ = m;
                         app.pos_draft = crate::tui::PosDraft {
                             market_id: id,
                             title,

@@ -5,10 +5,9 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::llm::{LlmBackend, LlmMessage, MessageContent, MessageRole, ToolResult};
+use crate::llm::{LlmBackend, LlmMessage, MessageContent, ToolResult};
 use crate::signals::{self, Signal};
 use crate::tools::{self, MarketClients};
 

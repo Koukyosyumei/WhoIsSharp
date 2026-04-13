@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::llm::ToolDefinition;
-use crate::markets::{kalshi::KalshiClient, polymarket::PolymarketClient, ChartInterval, Platform};
+use crate::markets::{kalshi::KalshiClient, polymarket::PolymarketClient, ChartInterval};
 
 // ─── Tool result ─────────────────────────────────────────────────────────────
 
