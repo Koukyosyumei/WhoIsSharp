@@ -2,7 +2,7 @@
 //!
 //! All tools are async and return plain strings shown to the LLM and TUI.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::llm::ToolDefinition;
@@ -61,6 +61,7 @@ async fn dispatch_inner(
         "get_events"       => get_events(clients, args).await,
         "search_markets"   => search_markets(clients, args).await,
         "analyze_insider"  => analyze_insider(clients, args).await,
+        "find_smart_money" => find_smart_money(clients, args).await,
         _                  => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
@@ -442,6 +443,202 @@ fn parse_ob_size(line: &str) -> Option<f64> {
     token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok()
 }
 
+// ─── Smart money / account analysis ──────────────────────────────────────────
+
+/// Identify wallets trading a market with suspiciously high win rates.
+///
+/// Algorithm:
+///   1. Fetch recent trades for the market → find unique wallets and their
+///      position sizes.
+///   2. For each top-N wallet by size, fetch their recent trade history (last
+///      100 events).
+///   3. Compute per-wallet stats:
+///        • n_positions  = distinct conditionIds traded
+///        • n_wins       = REDEEM events (each = a paid-out winning position)
+///        • win_rate     ≈ n_wins / n_positions
+///        • avg_price    = mean entry price (low = aggressive early entry)
+///        • total_volume = sum of sizes
+///   4. Flag wallets with win_rate > WIN_RATE_THRESHOLD and n_positions ≥
+///      MIN_POSITIONS as "smart money".
+///
+/// Note: Kalshi does not expose public trade-level data, so this is
+/// Polymarket-only.
+async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    use std::collections::HashMap;
+
+    let market_id   = args["market_id"].as_str().unwrap_or("");
+    let top_n       = args["top_n"].as_u64().unwrap_or(5).min(10) as usize;
+    let history_len = args["history_trades"].as_u64().unwrap_or(100).min(200) as u32;
+
+    if market_id.is_empty() {
+        return Ok(ToolOutput::err(
+            "Required: market_id (Polymarket conditionId). \
+             Use list_markets or search_markets to find a conditionId.",
+        ));
+    }
+
+    const WIN_RATE_THRESHOLD: f64 = 0.55; // flag at > 55%
+    const MIN_POSITIONS: usize    = 3;    // ignore wallets with too few trades
+
+    let mut report = Vec::new();
+    report.push(format!(
+        "=== SMART MONEY ANALYSIS: {} ===",
+        &market_id[..market_id.len().min(20)]
+    ));
+    report.push(format!(
+        "Fetching top {} traders · {}-trade history per wallet\n",
+        top_n, history_len
+    ));
+
+    // ── 1. Fetch recent trades for this market ──────────────────────────────
+    let market_trades = clients
+        .polymarket
+        .fetch_market_trades(market_id, 200)
+        .await
+        .context("Failed to fetch market trades")?;
+
+    if market_trades.is_empty() {
+        return Ok(ToolOutput::ok(format!(
+            "{}\nNo trades found for this market.",
+            report.join("\n")
+        )));
+    }
+
+    report.push(format!(
+        "--- Market: {} ---",
+        market_trades[0].market_title
+    ));
+
+    // Aggregate per-wallet total size for this market
+    let mut wallet_size: HashMap<String, (f64, String)> = HashMap::new(); // wallet → (total_size, pseudonym)
+    for t in &market_trades {
+        if t.side == "BUY" || t.side.is_empty() {
+            let entry = wallet_size.entry(t.wallet.clone()).or_insert((0.0, t.pseudonym.clone()));
+            entry.0 += t.size;
+        }
+    }
+
+    // Pick top-N wallets by position size
+    let mut ranked: Vec<(String, f64, String)> = wallet_size
+        .into_iter()
+        .map(|(w, (s, p))| (w, s, p))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_n);
+
+    // ── 2. Per-wallet history analysis ─────────────────────────────────────
+    report.push(format!("\n{:<20} {:>8} {:>7} {:>8} {:>10} {:>8}",
+        "Wallet", "Size($)", "Markets", "Wins", "Win Rate", "AvgPrice"));
+    report.push("-".repeat(70));
+
+    let mut flagged = Vec::new();
+
+    for (wallet, market_size, pseudonym) in &ranked {
+        let history = match clients.polymarket.fetch_user_trades(wallet, history_len).await {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        // Unique markets where they traded
+        let positions: std::collections::HashSet<&str> = history
+            .iter()
+            .filter(|t| t.trade_type == "TRADE" || t.trade_type.is_empty())
+            .map(|t| t.condition_id.as_str())
+            .collect();
+        let n_positions = positions.len();
+
+        // REDEEMs = winning payouts
+        let n_wins = history.iter().filter(|t| t.trade_type == "REDEEM").count();
+
+        // Average entry price across all their trades
+        let trades_only: Vec<&_> = history.iter()
+            .filter(|t| (t.trade_type == "TRADE" || t.trade_type.is_empty()) && t.price > 0.0)
+            .collect();
+        let avg_price = if trades_only.is_empty() {
+            0.0
+        } else {
+            trades_only.iter().map(|t| t.price).sum::<f64>() / trades_only.len() as f64
+        };
+
+        // Total buy volume in their history
+        let total_vol: f64 = history.iter()
+            .filter(|t| t.side == "BUY")
+            .map(|t| t.size * t.price)
+            .sum();
+
+        let win_rate = if n_positions >= MIN_POSITIONS {
+            n_wins as f64 / n_positions as f64
+        } else {
+            0.0
+        };
+
+        let display_name = if pseudonym.len() > 18 {
+            format!("{}…", &pseudonym[..17])
+        } else {
+            pseudonym.clone()
+        };
+
+        report.push(format!(
+            "{:<20} {:>8.0} {:>7} {:>8} {:>8.1}% {:>8.2}",
+            display_name,
+            market_size,
+            n_positions,
+            n_wins,
+            win_rate * 100.0,
+            avg_price,
+        ));
+
+        if n_positions >= MIN_POSITIONS && win_rate > WIN_RATE_THRESHOLD {
+            flagged.push((display_name.clone(), wallet.clone(), win_rate, avg_price, total_vol, n_positions, n_wins));
+        }
+    }
+
+    // ── 3. Flagged accounts ─────────────────────────────────────────────────
+    if flagged.is_empty() {
+        report.push("\nNo accounts with suspiciously high win rates found.".to_string());
+        report.push(format!(
+            "(Threshold: win_rate > {:.0}% over ≥ {} markets)",
+            WIN_RATE_THRESHOLD * 100.0,
+            MIN_POSITIONS
+        ));
+    } else {
+        report.push("\n⚠ FLAGGED ACCOUNTS (win_rate > threshold):".to_string());
+        for (name, wallet, wr, avg_px, total_vol, n_pos, n_wins) in &flagged {
+            report.push(format!(
+                "\n  {name}  ({wallet})",
+                name   = name,
+                wallet = &wallet[..wallet.len().min(12)],
+            ));
+            report.push(format!(
+                "    Win rate:   {:.1}%  ({} wins / {} markets)",
+                wr * 100.0, n_wins, n_pos,
+            ));
+            report.push(format!(
+                "    Avg entry:  {:.2} ({:.1}¢)",
+                avg_px, avg_px * 100.0,
+            ));
+            report.push(format!(
+                "    Total vol:  ${:.0}",
+                total_vol,
+            ));
+
+            // Heuristic interpretation
+            if *avg_px < 0.35 {
+                report.push(
+                    "    → Buys early at low prices, often before the move — possible informed timing".to_string()
+                );
+            } else if *avg_px > 0.75 {
+                report.push(
+                    "    → High avg entry price — may be late-stage confirmation or limit arb".to_string()
+                );
+            }
+        }
+        report.push("\nNote: correlation ≠ causation. Cross-check against public news timelines.".to_string());
+    }
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn all_definitions() -> Vec<ToolDefinition> {
@@ -569,6 +766,37 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "find_smart_money".into(),
+            description: "Identify Polymarket wallets trading a specific market that have \
+                suspiciously high historical win rates. Fetches recent trades for the \
+                market, selects the top traders by position size, then pulls their full \
+                trade history to compute win rate (REDEEM events / markets traded), \
+                average entry price, and total volume. Flags accounts above the win-rate \
+                threshold as potential smart money / insider traders. \
+                Use the conditionId from list_markets or search_markets as market_id.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "market_id": {
+                        "type": "string",
+                        "description": "Polymarket conditionId (hex string, e.g. '0xabc…'). \
+                            Required — use list_markets or search_markets to find it."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many top traders (by position size) to analyse. \
+                            Default 5, max 10."
+                    },
+                    "history_trades": {
+                        "type": "integer",
+                        "description": "Number of recent trades to fetch per wallet for \
+                            history analysis. Default 100, max 200."
+                    }
+                },
+                "required": ["market_id"]
             }),
         },
         ToolDefinition {

@@ -20,6 +20,7 @@ use super::{Candle, Market, Orderbook, Platform, PriceLevel};
 
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 const CLOB_BASE:  &str = "https://clob.polymarket.com";
+const DATA_BASE:  &str = "https://data-api.polymarket.com";
 
 pub struct PolymarketClient {
     http: reqwest::Client,
@@ -147,6 +148,69 @@ impl PolymarketClient {
         Ok(Orderbook { bids, asks, last_price: None })
     }
 
+    // ─── Data API ─────────────────────────────────────────────────────────────
+
+    /// Fetch recent trades for a market (by conditionId).
+    /// Returns up to `limit` trades sorted newest-first.
+    pub async fn fetch_market_trades(
+        &self,
+        condition_id: &str,
+        limit: u32,
+    ) -> Result<Vec<PolyTrade>> {
+        let url = format!(
+            "{}/trades?market={}&limit={}",
+            DATA_BASE,
+            urlencoding::encode(condition_id),
+            limit,
+        );
+        self.fetch_trades_from_url(&url).await
+    }
+
+    /// Fetch recent trades for a specific wallet address.
+    pub async fn fetch_user_trades(
+        &self,
+        wallet: &str,
+        limit: u32,
+    ) -> Result<Vec<PolyTrade>> {
+        let url = format!(
+            "{}/trades?user={}&limit={}",
+            DATA_BASE,
+            urlencoding::encode(wallet),
+            limit,
+        );
+        self.fetch_trades_from_url(&url).await
+    }
+
+    async fn fetch_trades_from_url(&self, url: &str) -> Result<Vec<PolyTrade>> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("Polymarket data-api /trades request failed")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Polymarket /trades error {}", resp.status());
+        }
+
+        let raw: Vec<RawPolyTrade> =
+            resp.json().await.context("Failed to parse Polymarket /trades")?;
+
+        Ok(raw.into_iter().map(|r| PolyTrade {
+            wallet:       r.proxy_wallet,
+            pseudonym:    if r.pseudonym.is_empty() { r.name.clone() } else { r.pseudonym },
+            condition_id: r.condition_id,
+            market_title: r.title,
+            trade_type:   r.trade_type.unwrap_or_else(|| "TRADE".to_string()),
+            side:         r.side,
+            outcome:      r.outcome,
+            outcome_index: r.outcome_index,
+            size:         r.size,
+            price:        r.price,
+            timestamp:    r.timestamp,
+        }).collect())
+    }
+
     /// Fetch YES-price history.  `market_id` is the token_id (YES CLOB token).
     pub async fn fetch_price_history(
         &self,
@@ -193,6 +257,35 @@ impl PolymarketClient {
 
         Ok(candles)
     }
+}
+
+// ─── Public trade record type ─────────────────────────────────────────────────
+
+/// A single trade or redemption event for a Polymarket wallet.
+#[derive(Debug, Clone)]
+pub struct PolyTrade {
+    /// On-chain proxy wallet address (hex).
+    pub wallet:        String,
+    /// Human-readable name / pseudonym assigned by Polymarket.
+    pub pseudonym:     String,
+    /// Market condition ID this trade belongs to.
+    pub condition_id:  String,
+    /// Market title (human-readable).
+    pub market_title:  String,
+    /// "TRADE" for a buy/sell; "REDEEM" for a winning payout.
+    pub trade_type:    String,
+    /// "BUY" / "SELL" (empty for REDEEM).
+    pub side:          String,
+    /// Outcome label (e.g. "Yes", "Over").
+    pub outcome:       String,
+    /// 0 = first outcome (usually YES), 1 = second (usually NO).
+    pub outcome_index: i64,
+    /// Number of shares.
+    pub size:          f64,
+    /// Price paid per share (0.0–1.0).
+    pub price:         f64,
+    /// Unix timestamp (seconds).
+    pub timestamp:     i64,
 }
 
 // ─── Raw JSON types ───────────────────────────────────────────────────────────
@@ -308,6 +401,36 @@ struct ClobLevel {
 #[derive(Deserialize, Debug)]
 struct PricesHistoryResponse {
     history: Vec<HistoryPoint>,
+}
+
+/// Raw trade/activity record from `data-api.polymarket.com/trades`.
+#[derive(Deserialize, Debug)]
+struct RawPolyTrade {
+    #[serde(rename = "proxyWallet", default)]
+    proxy_wallet:  String,
+    #[serde(default)]
+    name:          String,
+    #[serde(default)]
+    pseudonym:     String,
+    #[serde(rename = "conditionId", default)]
+    condition_id:  String,
+    #[serde(default)]
+    title:         String,
+    /// "TRADE" or "REDEEM" — absent when queried via `?market=` endpoint.
+    #[serde(rename = "type")]
+    trade_type:    Option<String>,
+    #[serde(default)]
+    side:          String,
+    #[serde(default)]
+    outcome:       String,
+    #[serde(rename = "outcomeIndex", default)]
+    outcome_index: i64,
+    #[serde(default)]
+    size:          f64,
+    #[serde(default)]
+    price:         f64,
+    #[serde(default)]
+    timestamp:     i64,
 }
 
 #[derive(Deserialize, Debug)]
