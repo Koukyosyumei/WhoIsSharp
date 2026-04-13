@@ -197,3 +197,181 @@ pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
         .with_context(|| format!("Cannot write portfolio to '{}'", path.display()))?;
     Ok(())
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markets::Platform;
+
+    fn yes_pos(entry: f64, shares: f64) -> Position {
+        Position::new(Platform::Kalshi, "MKT-1", "Test market", entry, shares, Side::Yes, None)
+    }
+    fn no_pos(entry: f64, shares: f64) -> Position {
+        Position::new(Platform::Kalshi, "MKT-1", "Test market", entry, shares, Side::No, None)
+    }
+
+    // ── Side ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn side_from_str_yes_variants() {
+        assert_eq!(Side::from_str("yes"),  Side::Yes);
+        assert_eq!(Side::from_str("YES"),  Side::Yes);
+        assert_eq!(Side::from_str("Yes"),  Side::Yes);
+        assert_eq!(Side::from_str("blah"), Side::Yes); // default
+    }
+
+    #[test]
+    fn side_from_str_no_variants() {
+        assert_eq!(Side::from_str("no"), Side::No);
+        assert_eq!(Side::from_str("NO"), Side::No);
+        assert_eq!(Side::from_str("No"), Side::No);
+    }
+
+    #[test]
+    fn side_labels() {
+        assert_eq!(Side::Yes.label(), "YES");
+        assert_eq!(Side::No.label(),  "NO");
+    }
+
+    // ── Position cost / value / pnl ───────────────────────────────────────────
+
+    #[test]
+    fn cost_is_entry_times_shares() {
+        let p = yes_pos(0.60, 100.0);
+        assert!((p.cost() - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn market_value_uses_entry_when_no_mark() {
+        let p = yes_pos(0.60, 100.0);
+        assert!((p.market_value() - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pnl_gain() {
+        let mut p = yes_pos(0.50, 100.0);
+        p.mark_price = Some(0.65);
+        assert!((p.pnl()     - 15.0).abs() < 1e-9);
+        assert!((p.pnl_pct() - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pnl_loss() {
+        let mut p = yes_pos(0.70, 200.0);
+        p.mark_price = Some(0.50);
+        assert!((p.pnl() - (-40.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pnl_pct_zero_cost_returns_zero() {
+        let p = yes_pos(0.0, 0.0);
+        assert_eq!(p.pnl_pct(), 0.0);
+    }
+
+    #[test]
+    fn pnl_breakeven() {
+        let mut p = yes_pos(0.50, 100.0);
+        p.mark_price = Some(0.50);
+        assert!(p.pnl().abs() < 1e-9);
+    }
+
+    // ── Portfolio add / remove ────────────────────────────────────────────────
+
+    #[test]
+    fn add_and_remove() {
+        let mut pf = Portfolio::default();
+        let pos = yes_pos(0.50, 100.0);
+        let id = pos.id.clone();
+        pf.add(pos);
+        assert_eq!(pf.positions.len(), 1);
+        assert!(pf.remove(&id));
+        assert!(pf.positions.is_empty());
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false() {
+        let mut pf = Portfolio::default();
+        assert!(!pf.remove("does-not-exist"));
+    }
+
+    #[test]
+    fn remove_only_matching_id() {
+        let mut pf = Portfolio::default();
+        let p1 = yes_pos(0.50, 10.0);
+        let id1 = p1.id.clone();
+        let p2 = yes_pos(0.60, 20.0);
+        pf.add(p1);
+        pf.add(p2);
+        assert!(pf.remove(&id1));
+        assert_eq!(pf.positions.len(), 1);
+    }
+
+    // ── Portfolio totals ──────────────────────────────────────────────────────
+
+    #[test]
+    fn total_pnl_net_zero() {
+        let mut pf = Portfolio::default();
+        let mut p1 = yes_pos(0.50, 100.0);
+        p1.mark_price = Some(0.60); // +10
+        let mut p2 = yes_pos(0.70, 100.0);
+        p2.mark_price = Some(0.60); // -10
+        pf.add(p1);
+        pf.add(p2);
+        assert!(pf.total_pnl().abs() < 1e-9);
+        assert!((pf.total_cost()  - 120.0).abs() < 1e-9);
+        assert!((pf.total_value() - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_pnl_empty_portfolio() {
+        let pf = Portfolio::default();
+        assert_eq!(pf.total_cost(),  0.0);
+        assert_eq!(pf.total_value(), 0.0);
+        assert_eq!(pf.total_pnl(),   0.0);
+    }
+
+    // ── update_marks ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_marks_yes_position() {
+        let mut pf = Portfolio::default();
+        let p = yes_pos(0.50, 100.0);
+        let mkt_id = p.market_id.clone();
+        pf.add(p);
+        pf.update_marks([(Platform::Kalshi, mkt_id, 0.80)].into_iter());
+        assert!((pf.positions[0].mark_price.unwrap() - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_marks_no_position_inverts_price() {
+        let mut pf = Portfolio::default();
+        let p = no_pos(0.50, 100.0);
+        let mkt_id = p.market_id.clone();
+        pf.add(p);
+        // YES price rises to 0.80 → NO mark = 1 - 0.80 = 0.20
+        pf.update_marks([(Platform::Kalshi, mkt_id, 0.80)].into_iter());
+        assert!((pf.positions[0].mark_price.unwrap() - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_marks_wrong_platform_ignored() {
+        let mut pf = Portfolio::default();
+        let p = yes_pos(0.50, 100.0);
+        let mkt_id = p.market_id.clone();
+        pf.add(p);
+        // Send update for Polymarket, but position is on Kalshi
+        pf.update_marks([(Platform::Polymarket, mkt_id, 0.90)].into_iter());
+        assert!(pf.positions[0].mark_price.is_none());
+    }
+
+    #[test]
+    fn update_marks_wrong_market_id_ignored() {
+        let mut pf = Portfolio::default();
+        let p = yes_pos(0.50, 100.0);
+        pf.add(p);
+        pf.update_marks([(Platform::Kalshi, "WRONG-ID".to_string(), 0.90)].into_iter());
+        assert!(pf.positions[0].mark_price.is_none());
+    }
+}

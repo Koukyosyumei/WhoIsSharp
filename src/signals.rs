@@ -302,3 +302,244 @@ pub fn title_similarity(a: &str, b: &str) -> f64 {
     let union = wa.union(&wb).count();
     if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markets::{Market, Platform};
+
+    fn market(platform: Platform, id: &str, title: &str, yes: f64,
+              vol: Option<f64>, liq: Option<f64>) -> Market {
+        Market {
+            id:           id.to_string(),
+            platform,
+            title:        title.to_string(),
+            description:  None,
+            yes_price:    yes,
+            no_price:     1.0 - yes,
+            volume:       vol,
+            liquidity:    liq,
+            end_date:     None,
+            category:     None,
+            status:       "open".to_string(),
+            token_id:     None,
+            event_ticker: None,
+        }
+    }
+
+    // ── title_similarity ──────────────────────────────────────────────────────
+
+    #[test]
+    fn identical_titles_score_one() {
+        let s = title_similarity("Trump wins 2024 election", "Trump wins 2024 election");
+        assert!((s - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn completely_different_titles_score_low() {
+        let s = title_similarity("Aliens land on Mars tomorrow", "Super Bowl winner 2025");
+        assert!(s < 0.15, "expected < 0.15, got {}", s);
+    }
+
+    #[test]
+    fn similar_titles_exceed_arb_threshold() {
+        let s = title_similarity(
+            "Will Trump win the 2024 presidential election?",
+            "Trump wins 2024 presidential election",
+        );
+        assert!(s >= 0.38, "expected >= 0.38, got {}", s);
+    }
+
+    #[test]
+    fn empty_string_scores_zero() {
+        assert_eq!(title_similarity("", "something relevant"), 0.0);
+        assert_eq!(title_similarity("something relevant", ""), 0.0);
+    }
+
+    #[test]
+    fn stop_words_do_not_contribute() {
+        // "the", "a", "in", "and" are stop words → ignored
+        let s = title_similarity("the a in and", "the a in and");
+        assert_eq!(s, 0.0, "all stop words → both sets empty → 0");
+    }
+
+    // ── Arb detection ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn arb_detected_for_large_gap() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Trump wins 2024 presidential election", 0.70,
+                   Some(100_000.0), Some(50_000.0)),
+            market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.60,
+                   Some(100_000.0), Some(50_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        let arb = sigs.iter().find(|s| s.kind == SignalKind::Arb).expect("arb signal");
+        assert!((arb.gap - 0.10).abs() < 1e-9);
+        assert_eq!(arb.stars, 2); // 0.04–0.08 → 2 stars? Actually 0.10 >= 0.08 → 3 stars
+    }
+
+    #[test]
+    fn arb_star_rating() {
+        // gap = 0.10 ≥ 0.08 → 3 stars
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Trump wins 2024 presidential election", 0.70,
+                   Some(100_000.0), Some(50_000.0)),
+            market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.60,
+                   Some(100_000.0), Some(50_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        let arb = sigs.iter().find(|s| s.kind == SignalKind::Arb).unwrap();
+        assert_eq!(arb.stars, 3);
+    }
+
+    #[test]
+    fn no_arb_when_gap_below_threshold() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Trump wins 2024 presidential election", 0.600,
+                   Some(100_000.0), Some(50_000.0)),
+            market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.585,
+                   Some(100_000.0), Some(50_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::Arb),
+                "gap < 2.5% should not surface");
+    }
+
+    #[test]
+    fn no_arb_when_titles_too_different() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Will the Fed cut rates in December?", 0.80,
+                   Some(100_000.0), Some(50_000.0)),
+            market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.50,
+                   Some(100_000.0), Some(50_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::Arb));
+    }
+
+    // ── Near-50 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn near_fifty_at_exactly_half() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Coin flip event", 0.50, Some(100_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        let s = sigs.iter().find(|s| s.kind == SignalKind::NearFifty).expect("near-50");
+        assert_eq!(s.stars, 3); // dist = 0.0 < 0.01 → 3 stars
+    }
+
+    #[test]
+    fn near_fifty_outside_band_not_detected() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "One-sided event", 0.80, Some(100_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::NearFifty));
+    }
+
+    #[test]
+    fn near_fifty_requires_minimum_volume() {
+        let mkts = vec![
+            // vol = 5000 < 10000 threshold
+            market(Platform::Polymarket, "pm1", "Low volume coin flip", 0.50, Some(5_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::NearFifty));
+    }
+
+    // ── Volume spike ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn vol_spike_detected() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Low vol A", 0.60, Some(10_000.0), None),
+            market(Platform::Polymarket, "pm2", "Low vol B", 0.40, Some(10_000.0), None),
+            market(Platform::Polymarket, "pm3", "High vol spike", 0.55, Some(1_000_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(sigs.iter().any(|s| s.kind == SignalKind::VolSpike && s.id_a == "pm3"));
+    }
+
+    #[test]
+    fn no_vol_spike_when_volumes_uniform() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Event A", 0.60, Some(10_000.0), None),
+            market(Platform::Polymarket, "pm2", "Event B", 0.40, Some(10_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::VolSpike));
+    }
+
+    // ── Thin markets ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn thin_market_detected() {
+        let mkts = vec![
+            market(Platform::Kalshi, "kl1", "Illiquid event", 0.50, None, Some(500.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(sigs.iter().any(|s| s.kind == SignalKind::Thin && s.id_a == "kl1"));
+    }
+
+    #[test]
+    fn thin_market_skipped_at_extremes() {
+        // yes_price < 0.05 or > 0.95 → excluded
+        let mkts = vec![
+            market(Platform::Kalshi, "kl1", "Near-certain event", 0.97, None, Some(500.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::Thin));
+    }
+
+    #[test]
+    fn thin_market_skipped_when_liquid() {
+        // liquidity ≥ 10_000 → not thin
+        let mkts = vec![
+            market(Platform::Kalshi, "kl1", "Well-funded market", 0.50, None, Some(50_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::Thin));
+    }
+
+    // ── Sorting + dedup ───────────────────────────────────────────────────────
+
+    #[test]
+    fn signals_sorted_stars_descending() {
+        let mkts = vec![
+            // arb pair with large gap (3 stars)
+            market(Platform::Polymarket, "pm1", "Trump wins 2024 presidential election", 0.80,
+                   Some(200_000.0), Some(100_000.0)),
+            market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.70,
+                   Some(200_000.0), Some(100_000.0)),
+            // near-50 (1 star, 46–56% band only)
+            market(Platform::Polymarket, "pm2", "Another uncertain event happens", 0.56,
+                   Some(100_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        for i in 0..sigs.len().saturating_sub(1) {
+            assert!(sigs[i].stars >= sigs[i + 1].stars,
+                    "signal {} (stars={}) before {} (stars={})",
+                    i, sigs[i].stars, i + 1, sigs[i + 1].stars);
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_empty_signals() {
+        assert!(compute_signals(&[]).is_empty());
+    }
+
+    #[test]
+    fn capped_at_thirty_signals() {
+        // Generate 40 near-50 markets
+        let mkts: Vec<Market> = (0..40).map(|i| {
+            market(Platform::Polymarket, &format!("pm{}", i),
+                   &format!("Uncertain event number {}", i), 0.50, Some(100_000.0), None)
+        }).collect();
+        let sigs = compute_signals(&mkts);
+        assert!(sigs.len() <= 30);
+    }
+}

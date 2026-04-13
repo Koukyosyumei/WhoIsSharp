@@ -352,3 +352,123 @@ fn kalshi_to_market(k: KalshiMarket) -> Market {
         event_ticker: k.event_ticker,
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_dollar_str ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_dollar_valid() {
+        assert!((parse_dollar_str(Some("0.65")).unwrap() - 0.65).abs() < 1e-9);
+        assert!((parse_dollar_str(Some("0.00")).unwrap()).abs() < 1e-9);
+        assert!((parse_dollar_str(Some("1.00")).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_dollar_none_input() {
+        assert!(parse_dollar_str(None).is_none());
+    }
+
+    #[test]
+    fn parse_dollar_invalid_string() {
+        assert!(parse_dollar_str(Some("not_a_number")).is_none());
+        assert!(parse_dollar_str(Some("")).is_none());
+    }
+
+    // ── kalshi_to_market ──────────────────────────────────────────────────────
+
+    fn market_json(extra: &str) -> String {
+        format!(r#"{{"ticker":"ABC-123","title":"Test market"{}}}"#, extra)
+    }
+
+    #[test]
+    fn mid_price_from_yes_bid_ask() {
+        let json = market_json(r#","yes_bid_dollars":"0.44","yes_ask_dollars":"0.46""#);
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert!((m.yes_price - 0.45).abs() < 1e-9);
+        assert!((m.no_price  - 0.55).abs() < 1e-9);
+        assert_eq!(m.id, "ABC-123");
+    }
+
+    #[test]
+    fn yes_bid_only() {
+        let json = market_json(r#","yes_bid_dollars":"0.60""#);
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert!((m.yes_price - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_side_fallback() {
+        // No yes prices → fall back to no prices, YES = 1 - mid(no)
+        let json = market_json(r#","no_bid_dollars":"0.60","no_ask_dollars":"0.62""#);
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert!((m.yes_price - 0.39).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_price_when_no_quotes() {
+        let json = market_json("");
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert!((m.yes_price - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn event_ticker_propagated() {
+        let json = market_json(r#","event_ticker":"KXMLB-26""#);
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert_eq!(m.event_ticker.as_deref(), Some("KXMLB-26"));
+    }
+
+    #[test]
+    fn subtitle_becomes_description() {
+        let json = market_json(r#","subtitle":"Extra detail here""#);
+        let k: KalshiMarket = serde_json::from_str(&json).unwrap();
+        let m = kalshi_to_market(k);
+        assert_eq!(m.description.as_deref(), Some("Extra detail here"));
+    }
+
+    // ── Candlestick price fallback ────────────────────────────────────────────
+
+    #[test]
+    fn candle_previous_dollars_used_when_no_ohlc() {
+        let json = r#"{"end_period_ts":1700000000,"price":{"previous_dollars":"0.55"},"volume_fp":"0.00"}"#;
+        let c: KalshiCandle = serde_json::from_str(json).unwrap();
+        assert_eq!(c.price.previous_dollars.as_deref(), Some("0.55"));
+        assert!(c.price.open_dollars.is_none());
+        assert!(c.price.close_dollars.is_none());
+    }
+
+    #[test]
+    fn candle_full_ohlc_parsed() {
+        let json = r#"{"end_period_ts":1700000000,"price":{"open_dollars":"0.45","high_dollars":"0.60","low_dollars":"0.40","close_dollars":"0.55"},"volume_fp":"100.00"}"#;
+        let c: KalshiCandle = serde_json::from_str(json).unwrap();
+        assert_eq!(c.price.open_dollars.as_deref(),  Some("0.45"));
+        assert_eq!(c.price.high_dollars.as_deref(),  Some("0.60"));
+        assert_eq!(c.price.low_dollars.as_deref(),   Some("0.40"));
+        assert_eq!(c.price.close_dollars.as_deref(), Some("0.55"));
+        assert_eq!(c.volume_fp.as_deref(), Some("100.00"));
+    }
+
+    // ── Series ticker derivation convention ───────────────────────────────────
+
+    #[test]
+    fn series_from_event_ticker_first_segment() {
+        for (event, expected) in [
+            ("KXMLB-26",    "KXMLB"),
+            ("PRES-24",     "PRES"),
+            ("NBA-2025-CHI", "NBA"),
+        ] {
+            let series = event.split('-').next().unwrap();
+            assert_eq!(series, expected, "failed for event_ticker={}", event);
+        }
+    }
+}

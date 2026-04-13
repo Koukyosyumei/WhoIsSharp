@@ -554,11 +554,7 @@ fn render_signal_list(f: &mut Frame, area: Rect, app: &App) {
         let kind_color = signal_kind_color(&sig.kind);
         let price_str = format!("{:.0}¢", sig.price_a * 100.0);
 
-        let title_str = if sig.title.len() > 35 {
-            format!("{}…", &sig.title[..34])
-        } else {
-            sig.title.clone()
-        };
+        let title_str = trunc(&sig.title, 35);
 
         let line = Line::from(vec![
             Span::styled(format!("{} ", stars), Style::default().fg(Color::Yellow)),
@@ -714,11 +710,7 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
             let pct_color = price_color(m.yes_price);
             let vol = format_volume(m.volume);
 
-            let title_str = if m.title.len() > 32 {
-                format!("{}…", &m.title[..31])
-            } else {
-                m.title.clone()
-            };
+            let title_str = trunc(&m.title, 32);
 
             let line = Line::from(vec![
                 Span::styled(m.platform.label(), Style::default().fg(platform_color)),
@@ -1035,11 +1027,7 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
         };
         let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
 
-        let title_str = if pos.title.len() > 30 {
-            format!("{}…", &pos.title[..29])
-        } else {
-            pos.title.clone()
-        };
+        let title_str = trunc(&pos.title, 30);
 
         let line = Line::from(vec![
             Span::styled(pos.platform.label(), Style::default().fg(platform_color)),
@@ -1209,6 +1197,22 @@ fn format_volume(v: Option<f64>) -> String {
     }
 }
 
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…` if cut.
+fn trunc(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out = String::with_capacity(max_chars + 3);
+    let mut count = 0;
+    while let Some(c) = chars.next() {
+        if count == max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+        count += 1;
+    }
+    out
+}
+
 fn textwrap(s: &str, width: usize) -> Vec<String> {
     if width == 0 { return vec![s.to_string()]; }
     let mut lines = Vec::new();
@@ -1226,6 +1230,162 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
     }
     if !line.is_empty() { lines.push(line); }
     lines
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── trunc ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn trunc_short_string_unchanged() {
+        assert_eq!(trunc("hello", 10), "hello");
+    }
+
+    #[test]
+    fn trunc_at_exact_length_unchanged() {
+        assert_eq!(trunc("hello", 5), "hello");
+    }
+
+    #[test]
+    fn trunc_long_string_ellipsis() {
+        assert_eq!(trunc("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn trunc_unicode_char_boundary_safe() {
+        // "café" = 4 chars but 5 bytes; slicing at byte 4 would split 'é'
+        assert_eq!(trunc("café extra", 4), "café…");
+    }
+
+    #[test]
+    fn trunc_multibyte_emoji() {
+        // Each emoji is 1 char (but 4 bytes)
+        assert_eq!(trunc("🚀🎯🎪 overflow", 3), "🚀🎯🎪…");
+    }
+
+    #[test]
+    fn trunc_empty_string() {
+        assert_eq!(trunc("", 5), "");
+    }
+
+    // ── textwrap ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn textwrap_fits_on_one_line() {
+        assert_eq!(textwrap("hello world", 20), vec!["hello world"]);
+    }
+
+    #[test]
+    fn textwrap_wraps_at_word_boundary() {
+        let lines = textwrap("one two three four five", 10);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.len() <= 10, "line too long: {:?}", line);
+        }
+        // All words should be present
+        let rejoined = lines.join(" ");
+        assert!(rejoined.contains("one") && rejoined.contains("five"));
+    }
+
+    #[test]
+    fn textwrap_zero_width_returns_original() {
+        assert_eq!(textwrap("hello world", 0), vec!["hello world"]);
+    }
+
+    #[test]
+    fn textwrap_empty_input() {
+        assert!(textwrap("", 20).is_empty());
+    }
+
+    // ── format_volume ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_volume_none() {
+        assert_eq!(format_volume(None), "");
+    }
+
+    #[test]
+    fn format_volume_millions() {
+        assert_eq!(format_volume(Some(2_500_000.0)), "$2.5M");
+    }
+
+    #[test]
+    fn format_volume_millions_round() {
+        assert_eq!(format_volume(Some(1_000_000.0)), "$1.0M");
+    }
+
+    #[test]
+    fn format_volume_thousands() {
+        assert_eq!(format_volume(Some(12_345.0)), "$12K");
+    }
+
+    #[test]
+    fn format_volume_sub_thousand() {
+        assert_eq!(format_volume(Some(500.0)), "$500");
+    }
+
+    // ── price_color ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn price_color_all_ranges() {
+        // Just confirm no panic across the full [0, 1] range
+        for i in 0..=100 {
+            let _ = price_color(i as f64 / 100.0);
+        }
+    }
+
+    #[test]
+    fn price_color_green_for_high() {
+        assert_eq!(price_color(0.75), Color::Green);
+    }
+
+    #[test]
+    fn price_color_red_for_low() {
+        assert_eq!(price_color(0.10), Color::Red);
+    }
+
+    // ── PlatformFilter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn platform_filter_all_matches_everything() {
+        assert!(PlatformFilter::All.matches(&Platform::Polymarket));
+        assert!(PlatformFilter::All.matches(&Platform::Kalshi));
+    }
+
+    #[test]
+    fn platform_filter_polymarket_only() {
+        assert!( PlatformFilter::Polymarket.matches(&Platform::Polymarket));
+        assert!(!PlatformFilter::Polymarket.matches(&Platform::Kalshi));
+    }
+
+    #[test]
+    fn platform_filter_kalshi_only() {
+        assert!( PlatformFilter::Kalshi.matches(&Platform::Kalshi));
+        assert!(!PlatformFilter::Kalshi.matches(&Platform::Polymarket));
+    }
+
+    // ── Tab cycle ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tab_next_cycles_forward() {
+        assert_eq!(Tab::Signals.next(),   Tab::Markets);
+        assert_eq!(Tab::Markets.next(),   Tab::Chart);
+        assert_eq!(Tab::Chart.next(),     Tab::Orderbook);
+        assert_eq!(Tab::Orderbook.next(), Tab::Portfolio);
+        assert_eq!(Tab::Portfolio.next(), Tab::Chat);
+        assert_eq!(Tab::Chat.next(),      Tab::Signals); // wraps
+    }
+
+    #[test]
+    fn tab_prev_cycles_backward() {
+        assert_eq!(Tab::Signals.prev(),   Tab::Chat); // wraps
+        assert_eq!(Tab::Markets.prev(),   Tab::Signals);
+        assert_eq!(Tab::Chat.prev(),      Tab::Portfolio);
+    }
 }
 
 // ─── Main TUI loop ────────────────────────────────────────────────────────────

@@ -394,3 +394,173 @@ mod urlencoding {
         out
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── deserialize_string_array (outcomePrices / clobTokenIds) ───────────────
+
+    #[test]
+    fn outcome_prices_real_array() {
+        let json = r#"{"conditionId":"abc","outcomePrices":["0.65","0.35"],"clobTokenIds":[]}"#;
+        let m: GammaMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.outcome_prices, vec!["0.65", "0.35"]);
+    }
+
+    #[test]
+    fn outcome_prices_json_encoded_string() {
+        let json = r#"{"conditionId":"abc","outcomePrices":"[\"0.65\",\"0.35\"]","clobTokenIds":[]}"#;
+        let m: GammaMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.outcome_prices, vec!["0.65", "0.35"]);
+    }
+
+    #[test]
+    fn outcome_prices_null_gives_empty() {
+        let json = r#"{"conditionId":"abc","outcomePrices":null,"clobTokenIds":null}"#;
+        let m: GammaMarket = serde_json::from_str(json).unwrap();
+        assert!(m.outcome_prices.is_empty());
+    }
+
+    #[test]
+    fn clob_token_ids_real_array() {
+        let json = r#"{"conditionId":"abc","outcomePrices":[],"clobTokenIds":["tok1","tok2"]}"#;
+        let m: GammaMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.clob_token_ids, vec!["tok1", "tok2"]);
+    }
+
+    #[test]
+    fn clob_token_ids_json_encoded_string() {
+        // This is the actual format Polymarket returns in the wild.
+        let json = r#"{"conditionId":"abc","outcomePrices":[],"clobTokenIds":"[\"tok1\",\"tok2\"]"}"#;
+        let m: GammaMarket = serde_json::from_str(json).unwrap();
+        assert_eq!(m.clob_token_ids, vec!["tok1", "tok2"]);
+    }
+
+    // ── gamma_to_market ───────────────────────────────────────────────────────
+
+    #[test]
+    fn gamma_prefers_condition_id_over_id() {
+        let json = r#"{"conditionId":"0xABC","id":"999","question":"Q?","outcomePrices":["0.5","0.5"],"clobTokenIds":[]}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert_eq!(m.id, "0xABC");
+    }
+
+    #[test]
+    fn gamma_falls_back_to_id_when_no_condition_id() {
+        let json = r#"{"conditionId":"","id":"999","question":"Q?","outcomePrices":["0.5","0.5"],"clobTokenIds":[]}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert_eq!(m.id, "999");
+    }
+
+    #[test]
+    fn gamma_returns_none_when_both_ids_empty() {
+        let json = r#"{"conditionId":"","id":"","question":"Q?","outcomePrices":[],"clobTokenIds":[]}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        assert!(gamma_to_market(g).is_none());
+    }
+
+    #[test]
+    fn gamma_prices_parsed_correctly() {
+        let json = r#"{"conditionId":"abc","question":"Q?","outcomePrices":["0.70","0.30"],"clobTokenIds":[]}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert!((m.yes_price - 0.70).abs() < 1e-9);
+        assert!((m.no_price  - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gamma_token_id_from_tokens_array_first() {
+        // tokens array takes priority over clobTokenIds
+        let json = r#"{"conditionId":"abc","question":"Q","outcomePrices":[],"tokens":[{"token_id":"YES_TOK","outcome":"Yes"},{"token_id":"NO_TOK","outcome":"No"}],"clobTokenIds":"[\"fallback\"]"}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert_eq!(m.token_id.unwrap(), "YES_TOK");
+    }
+
+    #[test]
+    fn gamma_token_id_falls_back_to_clob_token_ids() {
+        let json = r#"{"conditionId":"abc","question":"Q","outcomePrices":[],"tokens":[],"clobTokenIds":"[\"clob1\",\"clob2\"]"}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert_eq!(m.token_id.unwrap(), "clob1");
+    }
+
+    #[test]
+    fn gamma_volume_prefers_volume_num() {
+        let json = r#"{"conditionId":"abc","question":"Q","outcomePrices":[],"clobTokenIds":[],"volumeNum":"1500000","volume":"500000"}"#;
+        let g: GammaMarket = serde_json::from_str(json).unwrap();
+        let m = gamma_to_market(g).unwrap();
+        assert!((m.volume.unwrap() - 1_500_000.0).abs() < 1.0);
+    }
+
+    // ── parse_outcome_prices ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_outcome_prices_empty_defaults_to_50_50() {
+        let (yes, no) = parse_outcome_prices(&[]);
+        assert!((yes - 0.5).abs() < 1e-9);
+        assert!((no  - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_outcome_prices_only_yes_implies_no() {
+        let (yes, no) = parse_outcome_prices(&["0.70".to_string()]);
+        assert!((yes - 0.70).abs() < 1e-9);
+        assert!((no  - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_outcome_prices_both_explicit() {
+        let prices = vec!["0.65".to_string(), "0.35".to_string()];
+        let (yes, no) = parse_outcome_prices(&prices);
+        assert!((yes - 0.65).abs() < 1e-9);
+        assert!((no  - 0.35).abs() < 1e-9);
+    }
+
+    // ── parse_f64_value ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_f64_value_from_number() {
+        let v = serde_json::json!(42.5_f64);
+        assert!((parse_f64_value(&v).unwrap() - 42.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_f64_value_from_string() {
+        let v = serde_json::json!("1234.56");
+        assert!((parse_f64_value(&v).unwrap() - 1234.56).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_f64_value_from_bool_is_none() {
+        let v = serde_json::json!(true);
+        assert!(parse_f64_value(&v).is_none());
+    }
+
+    // ── urlencoding ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn url_encode_space() {
+        assert_eq!(urlencoding::encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn url_encode_safe_chars_unchanged() {
+        assert_eq!(urlencoding::encode("abc123-_.~"), "abc123-_.~");
+    }
+
+    #[test]
+    fn url_encode_percent() {
+        assert_eq!(urlencoding::encode("50%"), "50%25");
+    }
+
+    #[test]
+    fn url_encode_query_string() {
+        assert_eq!(urlencoding::encode("50% YES"), "50%25%20YES");
+    }
+}

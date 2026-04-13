@@ -209,3 +209,76 @@ impl ChartInterval {
         }
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ob(bids: &[(f64, f64)], asks: &[(f64, f64)]) -> Orderbook {
+        Orderbook {
+            bids: bids.iter().map(|&(p, s)| PriceLevel { price: p, size: s }).collect(),
+            asks: asks.iter().map(|&(p, s)| PriceLevel { price: p, size: s }).collect(),
+            last_price: None,
+        }
+    }
+
+    #[test]
+    fn orderbook_spread_and_mid() {
+        let ob = make_ob(&[(0.60, 10.0)], &[(0.65, 5.0)]);
+        assert!((ob.spread().unwrap() - 0.05).abs() < 1e-9);
+        assert!((ob.mid().unwrap() - 0.625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn orderbook_empty_returns_none() {
+        let ob = make_ob(&[], &[]);
+        assert!(ob.spread().is_none());
+        assert!(ob.mid().is_none());
+    }
+
+    #[test]
+    fn orderbook_one_side_returns_none() {
+        let ob = make_ob(&[(0.60, 1.0)], &[]);
+        assert!(ob.spread().is_none());
+        assert!(ob.mid().is_none());
+    }
+
+    #[test]
+    fn chart_interval_cycle_wraps() {
+        use ChartInterval::*;
+        assert_eq!(OneHour.next(),  SixHours);
+        assert_eq!(SixHours.next(), OneDay);
+        assert_eq!(OneDay.next(),   OneWeek);
+        assert_eq!(OneWeek.next(),  OneMonth);
+        assert_eq!(OneMonth.next(), OneHour); // wraps
+    }
+
+    #[test]
+    fn chart_interval_seconds_ordered() {
+        use ChartInterval::*;
+        assert!(OneHour.seconds() < SixHours.seconds());
+        assert!(SixHours.seconds() < OneDay.seconds());
+        assert!(OneDay.seconds() < OneWeek.seconds());
+        assert!(OneWeek.seconds() < OneMonth.seconds());
+    }
+
+    #[test]
+    fn chart_interval_labels() {
+        use ChartInterval::*;
+        assert_eq!(OneHour.label(),  "1h");
+        assert_eq!(SixHours.label(), "6h");
+        assert_eq!(OneDay.label(),   "1d");
+        assert_eq!(OneWeek.label(),  "1w");
+        assert_eq!(OneMonth.label(), "1m");
+    }
+
+    #[test]
+    fn platform_labels() {
+        assert_eq!(Platform::Polymarket.label(), "PM");
+        assert_eq!(Platform::Kalshi.label(),     "KL");
+        assert_eq!(Platform::Polymarket.name(),  "Polymarket");
+        assert_eq!(Platform::Kalshi.name(),      "Kalshi");
+    }
+}
