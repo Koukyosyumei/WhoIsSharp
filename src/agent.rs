@@ -263,9 +263,17 @@ pub async fn refresh_price_history(
                 .await
         }
         Platform::Kalshi => {
+            // The candlestick endpoint is /series/{series}/markets/{ticker}/candlesticks.
+            // series_ticker is the first hyphen-delimited segment of event_ticker
+            // (e.g. "KXMLB-26" → "KXMLB").
+            let series = market
+                .event_ticker
+                .as_deref()
+                .and_then(|et| et.split('-').next())
+                .unwrap_or("");
             clients
                 .kalshi
-                .fetch_candlesticks(&market.id, interval.kalshi_period_interval(), start_ts, now)
+                .fetch_candlesticks(series, &market.id, interval.kalshi_period_interval(), start_ts, now)
                 .await
         }
     };

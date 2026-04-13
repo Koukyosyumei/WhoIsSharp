@@ -218,9 +218,16 @@ async fn get_price_history(
                 .await?
         }
         "kalshi" => {
+            // Kalshi candlestick endpoint: /series/{series}/markets/{ticker}/candlesticks
+            // series_ticker is first hyphen-segment of the ticker (e.g. "KXMLB-26-WSH" → "KXMLB")
+            // unless an explicit series_ticker arg was supplied.
+            let series = args["series_ticker"]
+                .as_str()
+                .or_else(|| id.split('-').next())
+                .unwrap_or("");
             clients
                 .kalshi
-                .fetch_candlesticks(id, interval.kalshi_period_interval(), start_ts, now)
+                .fetch_candlesticks(series, id, interval.kalshi_period_interval(), start_ts, now)
                 .await?
         }
         _ => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),

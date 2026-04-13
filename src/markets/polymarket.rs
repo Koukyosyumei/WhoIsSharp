@@ -2,9 +2,19 @@
 //!
 //! Gamma API  (public): https://gamma-api.polymarket.com
 //! CLOB API   (public): https://clob.polymarket.com
+//!
+//! Notes from polymarket-cli SDK reference:
+//!   - `outcomePrices` arrives as either a real JSON array OR a JSON-encoded
+//!     string ("[\\"0.65\\",\\"0.35\\"]"). Both forms are handled below.
+//!   - Numeric fields come in two variants: `volume` (may be absent or a raw
+//!     number) and `volumeNum` (a numeric string like "1500000"). We prefer
+//!     `volumeNum`/`liquidityNum` and fall back to `volume`/`liquidity`.
+//!   - Token IDs for the CLOB can come from either the `tokens` array (objects
+//!     with `outcome` + `token_id`) or the flat `clobTokenIds` array (same
+//!     order as `outcomes`). We try `tokens` first, then `clobTokenIds`.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::{Candle, Market, Orderbook, Platform, PriceLevel};
 
@@ -77,10 +87,7 @@ impl PolymarketClient {
             .context("Polymarket /events request failed")?;
 
         if !resp.status().is_success() {
-            anyhow::bail!(
-                "Polymarket /events error {}",
-                resp.status()
-            );
+            anyhow::bail!("Polymarket /events error {}", resp.status());
         }
 
         let raw: Vec<GammaEvent> =
@@ -109,8 +116,7 @@ impl PolymarketClient {
             .context("Polymarket /order-book request failed")?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!("Polymarket /order-book error {}", status);
+            anyhow::bail!("Polymarket /order-book error {}", resp.status());
         }
 
         let raw: ClobOrderbook =
@@ -141,17 +147,21 @@ impl PolymarketClient {
         Ok(Orderbook { bids, asks, last_price: None })
     }
 
-    /// `market_id` is the conditionId; `token_id` is the YES token ID.
+    /// Fetch YES-price history.  `market_id` is the token_id (YES CLOB token).
     pub async fn fetch_price_history(
         &self,
         market_id: &str,
-        fidelity: u32,
+        fidelity:  u32,
         start_ts:  i64,
         end_ts:    i64,
     ) -> Result<Vec<Candle>> {
+        // The CLOB endpoint takes `fidelity` (minute granularity) and optional
+        // `startTs`/`endTs` timestamps (seconds). The `interval` param is a
+        // human-readable alias for the same granularity and is not required when
+        // `fidelity` is supplied — omitting it avoids sending a redundant param.
         let url = format!(
-            "{}/prices-history?market={}&interval={}&fidelity={}&startTs={}&endTs={}",
-            CLOB_BASE, market_id, fidelity, fidelity, start_ts, end_ts
+            "{}/prices-history?market={}&fidelity={}&startTs={}&endTs={}",
+            CLOB_BASE, market_id, fidelity, start_ts, end_ts
         );
 
         let resp = self
@@ -162,8 +172,7 @@ impl PolymarketClient {
             .context("Polymarket /prices-history request failed")?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!("Polymarket /prices-history error {}", status);
+            anyhow::bail!("Polymarket /prices-history error {}", resp.status());
         }
 
         let raw: PricesHistoryResponse =
@@ -188,26 +197,82 @@ impl PolymarketClient {
 
 // ─── Raw JSON types ───────────────────────────────────────────────────────────
 
+/// Deserializer for fields that the Gamma API sends as either:
+///   - a real JSON array:    `["0.65", "0.35"]`
+///   - a JSON-encoded string: `"[\"0.65\",\"0.35\"]"`
+///
+/// Used for both `outcomePrices` and `clobTokenIds`.
+fn deserialize_string_array<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let v = serde_json::Value::deserialize(de)?;
+    let extract = |arr: Vec<serde_json::Value>| -> Result<Vec<String>, D::Error> {
+        arr.into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(s) => Ok(s),
+                serde_json::Value::Number(n) => Ok(n.to_string()),
+                _ => Err(D::Error::custom("expected string element in array")),
+            })
+            .collect()
+    };
+
+    match v {
+        serde_json::Value::Array(arr) => extract(arr),
+        serde_json::Value::String(s)  => {
+            let inner: Vec<serde_json::Value> = serde_json::from_str(&s)
+                .map_err(|e| D::Error::custom(format!("array field decode: {}", e)))?;
+            extract(inner)
+        }
+        serde_json::Value::Null => Ok(vec![]),
+        _ => Err(D::Error::custom("field must be an array or JSON-encoded string")),
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct GammaMarket {
+    /// Hex condition ID — primary stable ID for CLOB lookups.
     #[serde(rename = "conditionId", default)]
     condition_id:     String,
+    /// Numeric / legacy ID (fallback).
     #[serde(default)]
     id:               String,
     question:         Option<String>,
     description:      Option<String>,
     #[serde(rename = "endDate", default)]
     end_date:         Option<String>,
+
+    // Volume — prefer `volumeNum` (reliable numeric string), fall back to `volume`.
+    #[serde(rename = "volumeNum", default)]
+    volume_num:       Option<serde_json::Value>,
     #[serde(default)]
     volume:           Option<serde_json::Value>,
+
+    // Liquidity — same dual-field pattern.
+    #[serde(rename = "liquidityNum", default)]
+    liquidity_num:    Option<serde_json::Value>,
     #[serde(default)]
     liquidity:        Option<serde_json::Value>,
-    #[serde(rename = "outcomePrices", default)]
+
+    /// YES/NO prices — arrives as a real array or a JSON-encoded string.
+    #[serde(rename = "outcomePrices", default, deserialize_with = "deserialize_string_array")]
     outcome_prices:   Vec<String>,
+
     #[serde(default)]
     category:         Option<String>,
+
+    /// Token objects with `token_id` + `outcome` labels.
     #[serde(default)]
     tokens:           Vec<GammaToken>,
+
+    /// Flat list of CLOB token IDs in the same order as `outcomes`.
+    /// Index 0 = YES token, index 1 = NO token.
+    /// Arrives as a real JSON array OR a JSON-encoded string — same dual-form
+    /// as `outcomePrices`.
+    #[serde(rename = "clobTokenIds", default, deserialize_with = "deserialize_string_array")]
+    clob_token_ids:   Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -268,28 +333,35 @@ fn gamma_to_market(g: GammaMarket) -> Option<Market> {
 
     let (yes_price, no_price) = parse_outcome_prices(&g.outcome_prices);
 
-    let volume = g.volume.as_ref().and_then(parse_f64_value);
-    let liquidity = g.liquidity.as_ref().and_then(parse_f64_value);
+    // Prefer the `*Num` fields (clean numeric strings) over the raw fields.
+    let volume = g.volume_num.as_ref().and_then(parse_f64_value)
+        .or_else(|| g.volume.as_ref().and_then(parse_f64_value));
+    let liquidity = g.liquidity_num.as_ref().and_then(parse_f64_value)
+        .or_else(|| g.liquidity.as_ref().and_then(parse_f64_value));
 
+    // YES token ID: try the labelled `tokens` array first, then the flat
+    // `clobTokenIds` list (index 0 = YES by convention).
     let token_id = g
         .tokens
         .iter()
         .find(|t| t.outcome.eq_ignore_ascii_case("yes"))
-        .map(|t| t.token_id.clone());
+        .map(|t| t.token_id.clone())
+        .or_else(|| g.clob_token_ids.into_iter().next());
 
     Some(Market {
         id,
-        platform: Platform::Polymarket,
+        platform:     Platform::Polymarket,
         title,
-        description: g.description,
+        description:  g.description,
         yes_price,
         no_price,
         volume,
         liquidity,
-        end_date: g.end_date,
-        category: g.category,
-        status: "open".to_string(),
+        end_date:     g.end_date,
+        category:     g.category,
+        status:       "open".to_string(),
         token_id,
+        event_ticker: None,
     })
 }
 
@@ -307,7 +379,8 @@ fn parse_f64_value(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-// Manual URL encoding for the search query (avoids extra dep for a simple use case).
+// ─── Minimal URL percent-encoding ────────────────────────────────────────────
+
 mod urlencoding {
     pub fn encode(input: &str) -> String {
         let mut out = String::new();

@@ -54,6 +54,9 @@ pub struct Market {
     pub status:      String,
     /// Polymarket CLOB token ID for the YES outcome (orderbook / price history).
     pub token_id:    Option<String>,
+    /// Kalshi event ticker (e.g. "KXMLB-26"). Used to derive series_ticker for
+    /// the candlestick endpoint: first hyphen-delimited segment = "KXMLB".
+    pub event_ticker: Option<String>,
 }
 
 impl Market {

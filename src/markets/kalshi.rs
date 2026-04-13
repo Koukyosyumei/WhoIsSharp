@@ -1,7 +1,12 @@
-//! Kalshi Trade API client.
+//! Kalshi Trade API v2 client.
 //!
 //! Base: https://api.elections.kalshi.com/trade-api/v2
 //! All read-only endpoints are public (no auth required).
+//!
+//! Field-name conventions from the Kalshi API (as documented in pykalshi):
+//!   Prices  → `*_dollars`  strings in [0, 1] range (e.g. "0.45")
+//!   Volumes → `*_fp`       fixed-point strings      (e.g. "1234.00")
+//!   Orderbook levels → `[[price_dollars_str, qty_fp_str], ...]`
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -35,7 +40,6 @@ impl KalshiClient {
             KALSHI_BASE, limit
         );
         if let Some(q) = search {
-            // Kalshi doesn't have a dedicated search param, but supports event_ticker filter
             url.push_str(&format!("&event_ticker={}", q));
         }
 
@@ -83,7 +87,7 @@ impl KalshiClient {
             title:        e.title,
             category:     e.category,
             market_count: 0,
-            description:  e.mutually_exclusive.map(|_| String::new()),
+            description:  None,
         }).collect())
     }
 
@@ -99,45 +103,42 @@ impl KalshiClient {
             .context("Kalshi /orderbook request failed")?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!("Kalshi /orderbook error {}", status);
+            anyhow::bail!("Kalshi /orderbook error {}", resp.status());
         }
 
         let raw: KalshiOrderbookResponse =
             resp.json().await.context("Failed to parse Kalshi /orderbook")?;
 
-        // Kalshi uses [price_cents, size] pairs in the yes/no arrays.
+        // API returns [[price_dollars_str, qty_fp_str], ...] for yes and no sides.
+        // YES bids: yes_dollars levels, prices already in [0, 1] dollar range.
         let bids: Vec<PriceLevel> = {
             let mut v: Vec<PriceLevel> = raw
                 .orderbook
-                .yes
+                .yes_dollars
                 .into_iter()
                 .filter_map(|pair| {
                     if pair.len() < 2 { return None; }
-                    Some(PriceLevel {
-                        price: pair[0] as f64 / 100.0,
-                        size:  pair[1] as f64,
-                    })
+                    let price = pair[0].parse::<f64>().ok()?;
+                    let size  = pair[1].parse::<f64>().ok()?;
+                    Some(PriceLevel { price, size })
                 })
                 .collect();
             v.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
             v
         };
 
+        // NO bids at price X imply YES asks at (1 − X).
         let asks: Vec<PriceLevel> = {
-            // "no" bids at price X imply "yes" asks at (100 - X) cents
             let mut v: Vec<PriceLevel> = raw
                 .orderbook
-                .no
+                .no_dollars
                 .into_iter()
                 .filter_map(|pair| {
                     if pair.len() < 2 { return None; }
-                    let no_price_cents = pair[0] as f64;
-                    let yes_implied = (100.0 - no_price_cents) / 100.0;
-                    Some(PriceLevel {
-                        price: yes_implied,
-                        size:  pair[1] as f64,
-                    })
+                    let no_price   = pair[0].parse::<f64>().ok()?;
+                    let yes_implied = 1.0 - no_price;
+                    let size        = pair[1].parse::<f64>().ok()?;
+                    Some(PriceLevel { price: yes_implied, size })
                 })
                 .collect();
             v.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
@@ -149,14 +150,15 @@ impl KalshiClient {
 
     pub async fn fetch_candlesticks(
         &self,
+        series_ticker:   &str,
         ticker:          &str,
         period_interval: u32,
         start_ts:        i64,
         end_ts:          i64,
     ) -> Result<Vec<Candle>> {
         let url = format!(
-            "{}/markets/{}/candlesticks?period_interval={}&start_ts={}&end_ts={}",
-            KALSHI_BASE, ticker, period_interval, start_ts, end_ts
+            "{}/series/{}/markets/{}/candlesticks?period_interval={}&start_ts={}&end_ts={}",
+            KALSHI_BASE, series_ticker, ticker, period_interval, start_ts, end_ts
         );
 
         let resp = self
@@ -176,20 +178,22 @@ impl KalshiClient {
         let raw: KalshiCandlesticksResponse =
             resp.json().await.context("Failed to parse Kalshi /candlesticks")?;
 
+        let parse_dollar = |s: Option<&str>| -> Option<f64> {
+            s.and_then(|s| s.parse::<f64>().ok())
+        };
+
         let candles = raw
             .candlesticks
             .into_iter()
-            .map(|c| Candle {
-                ts:    c.end_period_ts,
-                open:  c.price.open,
-                high:  c.price.high,
-                low:   c.price.low,
-                close: c.price.close,
-                volume: Some(
-                    c.volume
-                        .map(|v| v.yes_volume + v.no_volume)
-                        .unwrap_or(0.0),
-                ),
+            .map(|c| {
+                // When no trades occurred, only `previous_dollars` is set.
+                let prev = parse_dollar(c.price.previous_dollars.as_deref()).unwrap_or(0.0);
+                let open  = parse_dollar(c.price.open_dollars.as_deref()).unwrap_or(prev);
+                let high  = parse_dollar(c.price.high_dollars.as_deref()).unwrap_or(prev);
+                let low   = parse_dollar(c.price.low_dollars.as_deref()).unwrap_or(prev);
+                let close = parse_dollar(c.price.close_dollars.as_deref()).unwrap_or(prev);
+                let volume = c.volume_fp.as_deref().and_then(|s| s.parse::<f64>().ok());
+                Candle { ts: c.end_period_ts, open, high, low, close, volume }
             })
             .collect();
 
@@ -204,34 +208,42 @@ struct KalshiMarketsResponse {
     markets: Vec<KalshiMarket>,
 }
 
+/// Kalshi market as returned by the v2 API.
+/// Prices are dollar strings in [0, 1]; volumes are fixed-point strings.
 #[derive(Deserialize, Debug)]
 struct KalshiMarket {
-    ticker:         String,
-    title:          String,
+    ticker:              String,
+    title:               String,
+    /// YES bid in dollars (e.g. "0.45")
     #[serde(default)]
-    yes_bid:        Option<f64>,
+    yes_bid_dollars:     Option<String>,
+    /// YES ask in dollars (e.g. "0.47")
     #[serde(default)]
-    yes_ask:        Option<f64>,
+    yes_ask_dollars:     Option<String>,
+    /// NO bid in dollars
     #[serde(default)]
-    no_bid:         Option<f64>,
+    no_bid_dollars:      Option<String>,
+    /// NO ask in dollars
     #[serde(default)]
-    no_ask:         Option<f64>,
+    no_ask_dollars:      Option<String>,
+    /// Total volume as fixed-point string (e.g. "12345.00")
     #[serde(default)]
-    volume:         Option<serde_json::Value>,
+    volume_fp:           Option<String>,
+    /// Available liquidity in dollars (e.g. "5000.00")
     #[serde(default)]
-    open_interest:  Option<serde_json::Value>,
+    liquidity_dollars:   Option<String>,
     #[serde(default)]
-    close_time:     Option<String>,
+    close_time:          Option<String>,
     #[serde(default)]
-    event_ticker:   Option<String>,
+    event_ticker:        Option<String>,
     #[serde(default)]
-    category:       Option<String>,
+    category:            Option<String>,
     #[serde(default)]
-    status:         Option<String>,
+    status:              Option<String>,
     #[serde(default)]
-    result:         Option<String>,
+    result:              Option<String>,
     #[serde(default)]
-    subtitle:       Option<String>,
+    subtitle:            Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -241,12 +253,10 @@ struct KalshiEventsResponse {
 
 #[derive(Deserialize, Debug)]
 struct KalshiEvent {
-    event_ticker:      String,
-    title:             String,
+    event_ticker: String,
+    title:        String,
     #[serde(default)]
-    category:          Option<String>,
-    #[serde(default)]
-    mutually_exclusive: Option<bool>,
+    category:     Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -254,12 +264,14 @@ struct KalshiOrderbookResponse {
     orderbook: KalshiOrderbookData,
 }
 
+/// Kalshi orderbook levels: `[[price_dollars_str, qty_fp_str], ...]`
+/// YES levels are bids; NO levels imply YES asks via (1 − no_price).
 #[derive(Deserialize, Debug)]
 struct KalshiOrderbookData {
     #[serde(default)]
-    yes: Vec<Vec<i64>>,
+    yes_dollars: Vec<Vec<String>>,
     #[serde(default)]
-    no:  Vec<Vec<i64>>,
+    no_dollars:  Vec<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -271,64 +283,72 @@ struct KalshiCandlesticksResponse {
 struct KalshiCandle {
     end_period_ts: i64,
     price:         KalshiCandlePrice,
+    /// Total volume for the period as a fixed-point string.
     #[serde(default)]
-    volume:        Option<KalshiCandleVolume>,
+    volume_fp:     Option<String>,
 }
 
+/// OHLC price data from the live candlestick endpoint.
+/// Fields use the `_dollars` suffix and are dollar strings in [0, 1].
+/// When no trades occurred in a period, only `previous_dollars` is present.
 #[derive(Deserialize, Debug)]
 struct KalshiCandlePrice {
-    open:  f64,
-    high:  f64,
-    low:   f64,
-    close: f64,
-}
-
-#[derive(Deserialize, Debug)]
-struct KalshiCandleVolume {
     #[serde(default)]
-    yes_volume: f64,
+    previous_dollars: Option<String>,
     #[serde(default)]
-    no_volume:  f64,
+    open_dollars:     Option<String>,
+    #[serde(default)]
+    high_dollars:     Option<String>,
+    #[serde(default)]
+    low_dollars:      Option<String>,
+    #[serde(default)]
+    close_dollars:    Option<String>,
 }
 
 // ─── Conversion ───────────────────────────────────────────────────────────────
 
+fn parse_dollar_str(s: Option<&str>) -> Option<f64> {
+    s.and_then(|s| s.parse::<f64>().ok())
+}
+
 fn kalshi_to_market(k: KalshiMarket) -> Market {
-    // Best estimate of YES probability from bid/ask midpoint
-    let yes_price = match (k.yes_bid, k.yes_ask) {
-        (Some(bid), Some(ask)) => (bid + ask) / 2.0,
-        (Some(bid), None)      => bid,
-        (None, Some(ask))      => ask,
-        _                      => {
-            // Derive from NO prices
-            match (k.no_bid, k.no_ask) {
-                (Some(nb), Some(na)) => 1.0 - (nb + na) / 2.0,
-                (Some(nb), None)     => 1.0 - nb,
-                (None, Some(na))     => 1.0 - na,
-                _                    => 0.5,
+    let yes_price = {
+        let bid = parse_dollar_str(k.yes_bid_dollars.as_deref());
+        let ask = parse_dollar_str(k.yes_ask_dollars.as_deref());
+        match (bid, ask) {
+            (Some(b), Some(a)) => (b + a) / 2.0,
+            (Some(b), None)    => b,
+            (None, Some(a))    => a,
+            _ => {
+                let nb = parse_dollar_str(k.no_bid_dollars.as_deref());
+                let na = parse_dollar_str(k.no_ask_dollars.as_deref());
+                match (nb, na) {
+                    (Some(nb), Some(na)) => 1.0 - (nb + na) / 2.0,
+                    (Some(nb), None)     => 1.0 - nb,
+                    (None, Some(na))     => 1.0 - na,
+                    _                   => 0.5,
+                }
             }
         }
     };
     let no_price = 1.0 - yes_price;
 
-    let volume = k.volume.as_ref().and_then(|v| match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    });
+    let volume    = parse_dollar_str(k.volume_fp.as_deref());
+    let liquidity = parse_dollar_str(k.liquidity_dollars.as_deref());
 
     Market {
-        id:          k.ticker.clone(),
-        platform:    Platform::Kalshi,
-        title:       k.title,
-        description: k.subtitle,
+        id:           k.ticker,
+        platform:     Platform::Kalshi,
+        title:        k.title,
+        description:  k.subtitle,
         yes_price,
         no_price,
         volume,
-        liquidity:   None,
-        end_date:    k.close_time,
-        category:    k.category,
-        status:      k.status.unwrap_or_else(|| "open".to_string()),
-        token_id:    None,
+        liquidity,
+        end_date:     k.close_time,
+        category:     k.category,
+        status:       k.status.unwrap_or_else(|| "open".to_string()),
+        token_id:     None,
+        event_ticker: k.event_ticker,
     }
 }
