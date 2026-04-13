@@ -9,7 +9,9 @@
 //!   whoissharp --help                                   # all flags
 
 mod agent;
+mod cache;
 mod config;
+mod http;
 mod llm;
 mod markets;
 mod portfolio;

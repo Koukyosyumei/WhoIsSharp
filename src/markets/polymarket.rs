@@ -13,27 +13,69 @@
 //!     with `outcome` + `token_id`) or the flat `clobTokenIds` array (same
 //!     order as `outcomes`). We try `tokens` first, then `clobTokenIds`.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 
 use super::{Candle, Market, Orderbook, Platform, PriceLevel};
+use crate::cache::TtlCache;
 
 const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 const CLOB_BASE:  &str = "https://clob.polymarket.com";
 const DATA_BASE:  &str = "https://data-api.polymarket.com";
 
+/// TTL values (seconds) per endpoint class.
+/// Market lists and events change slowly; orderbooks are volatile.
+const CACHE_TTL_MARKETS:  u64 = 60;
+const CACHE_TTL_EVENTS:   u64 = 300;
+const CACHE_TTL_HISTORY:  u64 = 300;
+const CACHE_TTL_TRADES:   u64 = 30;
+
 pub struct PolymarketClient {
-    http: reqwest::Client,
+    http:  reqwest::Client,
+    cache: Arc<TtlCache>,
 }
 
 impl PolymarketClient {
     pub fn new() -> Self {
         PolymarketClient {
-            http: reqwest::Client::builder()
+            http:  reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            cache: Arc::new(TtlCache::new(CACHE_TTL_MARKETS)),
         }
+    }
+
+    // ─── Cache-aware GET helper ───────────────────────────────────────────────
+
+    /// Fetch `url` with retry/backoff.  Returns the raw response body.
+    /// Caller supplies the TTL for caching; pass 0 to skip caching.
+    async fn cached_get(&self, url: &str, ttl_secs: u64) -> Result<String> {
+        // Fast path — cache hit
+        if ttl_secs > 0 {
+            let keyed_url = format!("{}#{}", url, ttl_secs);
+            if let Some(body) = self.cache.get(&keyed_url).await {
+                return Ok(body);
+            }
+        }
+
+        // Slow path — HTTP request with retry
+        let resp = crate::http::retry_get(&self.http, url).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {}: {}", status, &body[..body.len().min(200)]);
+        }
+        let body = resp.text().await.context("Failed to read response body")?;
+
+        if ttl_secs > 0 {
+            let keyed_url = format!("{}#{}", url, ttl_secs);
+            self.cache.set(keyed_url, body.clone()).await;
+        }
+
+        Ok(body)
     }
 
     // ─── Gamma API ────────────────────────────────────────────────────────────
@@ -55,22 +97,10 @@ impl PolymarketClient {
             url.push_str(&format!("&tag={}", urlencoding::encode(t)));
         }
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
+        let body = self.cached_get(&url, CACHE_TTL_MARKETS).await
             .context("Polymarket Gamma /markets request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Polymarket /markets error {}: {}", status, body);
-        }
-
         let raw: Vec<GammaMarket> =
-            resp.json().await.context("Failed to parse Polymarket /markets")?;
-
+            serde_json::from_str(&body).context("Failed to parse Polymarket /markets")?;
         Ok(raw.into_iter().filter_map(gamma_to_market).collect())
     }
 
@@ -80,19 +110,10 @@ impl PolymarketClient {
             GAMMA_BASE, limit
         );
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
+        let body = self.cached_get(&url, CACHE_TTL_EVENTS).await
             .context("Polymarket /events request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("Polymarket /events error {}", resp.status());
-        }
-
         let raw: Vec<GammaEvent> =
-            resp.json().await.context("Failed to parse Polymarket /events")?;
+            serde_json::from_str(&body).context("Failed to parse Polymarket /events")?;
 
         Ok(raw.into_iter().map(|e| super::Event {
             id:           e.id,
@@ -108,20 +129,14 @@ impl PolymarketClient {
 
     pub async fn fetch_orderbook(&self, token_id: &str) -> Result<Orderbook> {
         let url = format!("{}/book?token_id={}", CLOB_BASE, token_id);
-
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("Polymarket /order-book request failed")?;
-
+        // Orderbooks are volatile — short TTL (not cached via cached_get, use retry directly)
+        let resp = crate::http::retry_get(&self.http, &url).await
+            .context("Polymarket /book request failed")?;
         if !resp.status().is_success() {
-            anyhow::bail!("Polymarket /order-book error {}", resp.status());
+            anyhow::bail!("Polymarket /book error {}", resp.status());
         }
-
         let raw: ClobOrderbook =
-            resp.json().await.context("Failed to parse Polymarket /order-book")?;
+            resp.json().await.context("Failed to parse Polymarket /book")?;
 
         let mut bids: Vec<PriceLevel> = raw
             .bids
@@ -182,19 +197,10 @@ impl PolymarketClient {
     }
 
     async fn fetch_trades_from_url(&self, url: &str) -> Result<Vec<PolyTrade>> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
+        let body = self.cached_get(url, CACHE_TTL_TRADES).await
             .context("Polymarket data-api /trades request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("Polymarket /trades error {}", resp.status());
-        }
-
         let raw: Vec<RawPolyTrade> =
-            resp.json().await.context("Failed to parse Polymarket /trades")?;
+            serde_json::from_str(&body).context("Failed to parse Polymarket /trades")?;
 
         Ok(raw.into_iter().map(|r| PolyTrade {
             wallet:       r.proxy_wallet,
@@ -228,19 +234,10 @@ impl PolymarketClient {
             CLOB_BASE, market_id, fidelity, start_ts, end_ts
         );
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
+        let body = self.cached_get(&url, CACHE_TTL_HISTORY).await
             .context("Polymarket /prices-history request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("Polymarket /prices-history error {}", resp.status());
-        }
-
         let raw: PricesHistoryResponse =
-            resp.json().await.context("Failed to parse Polymarket /prices-history")?;
+            serde_json::from_str(&body).context("Failed to parse Polymarket /prices-history")?;
 
         let candles = raw
             .history

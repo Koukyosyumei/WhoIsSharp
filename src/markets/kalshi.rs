@@ -11,23 +11,61 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::{Candle, Market, Orderbook, Platform, PriceLevel};
+use std::sync::Arc;
 
-const KALSHI_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
+use super::{Candle, Market, Orderbook, Platform, PriceLevel};
+use crate::cache::TtlCache;
+
+const KALSHI_BASE:         &str = "https://api.elections.kalshi.com/trade-api/v2";
+const CACHE_TTL_MARKETS:   u64  = 60;
+const CACHE_TTL_EVENTS:    u64  = 300;
+const CACHE_TTL_CANDLES:   u64  = 300;
 
 pub struct KalshiClient {
-    http: reqwest::Client,
+    http:  reqwest::Client,
+    cache: Arc<TtlCache>,
 }
 
 impl KalshiClient {
     pub fn new() -> Self {
         KalshiClient {
-            http: reqwest::Client::builder()
+            http:  reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .user_agent("WhoIsSharp/0.1")
                 .build()
                 .unwrap_or_default(),
+            cache: Arc::new(TtlCache::new(CACHE_TTL_MARKETS)),
         }
+    }
+
+    /// Fetch `url` with Accept: application/json, retry, and optional caching.
+    async fn kalshi_get(&self, url: &str, ttl_secs: u64) -> Result<String> {
+        if ttl_secs > 0 {
+            let key = format!("{}#{}", url, ttl_secs);
+            if let Some(body) = self.cache.get(&key).await {
+                return Ok(body);
+            }
+        }
+
+        let resp = crate::http::retry_builder(|| {
+            self.http.get(url).header("Accept", "application/json")
+        })
+        .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {}: {}", status, &body[..body.len().min(200)]);
+        }
+
+        let body = resp.text().await.context("Failed to read Kalshi response")?;
+
+        if ttl_secs > 0 {
+            let key = format!("{}#{}", url, ttl_secs);
+            self.cache.set(key, body.clone()).await;
+        }
+
+        Ok(body)
     }
 
     pub async fn fetch_markets(
@@ -50,22 +88,10 @@ impl KalshiClient {
     async fn fetch_markets_via_events(&self, limit: u32) -> Result<Vec<Market>> {
         // Fetch events — these are the real prediction categories.
         let events_url = format!("{}/events?limit=50&status=open", KALSHI_BASE);
-        let events_resp = self
-            .http
-            .get(&events_url)
-            .header("Accept", "application/json")
-            .send()
-            .await
+        let body = self.kalshi_get(&events_url, CACHE_TTL_EVENTS).await
             .context("Kalshi /events (for markets) request failed")?;
-
-        if !events_resp.status().is_success() {
-            anyhow::bail!("Kalshi /events error {}", events_resp.status());
-        }
-
-        let events: KalshiEventsResponse = events_resp
-            .json()
-            .await
-            .context("Failed to parse Kalshi /events")?;
+        let events: KalshiEventsResponse =
+            serde_json::from_str(&body).context("Failed to parse Kalshi /events")?;
 
         // For each event, fetch its markets. Stop once we have enough.
         let per_event = ((limit / events.events.len().max(1) as u32) + 1).max(5);
@@ -93,22 +119,10 @@ impl KalshiClient {
             "{}/markets?limit={}&status=open&event_ticker={}",
             KALSHI_BASE, limit, event_ticker
         );
-        let resp = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
+        let body = self.kalshi_get(&url, CACHE_TTL_MARKETS).await
             .context("Kalshi /markets request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Kalshi /markets error {}: {}", status, body);
-        }
-
         let raw: KalshiMarketsResponse =
-            resp.json().await.context("Failed to parse Kalshi /markets")?;
+            serde_json::from_str(&body).context("Failed to parse Kalshi /markets")?;
 
         Ok(raw.markets.into_iter().map(kalshi_to_market).collect())
     }
@@ -116,20 +130,10 @@ impl KalshiClient {
     pub async fn fetch_events(&self, limit: u32) -> Result<Vec<super::Event>> {
         let url = format!("{}/events?limit={}&status=open", KALSHI_BASE, limit);
 
-        let resp = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
+        let body = self.kalshi_get(&url, CACHE_TTL_EVENTS).await
             .context("Kalshi /events request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("Kalshi /events error {}", resp.status());
-        }
-
         let raw: KalshiEventsResponse =
-            resp.json().await.context("Failed to parse Kalshi /events")?;
+            serde_json::from_str(&body).context("Failed to parse Kalshi /events")?;
 
         Ok(raw.events.into_iter().map(|e| super::Event {
             id:           e.event_ticker.clone(),
@@ -144,20 +148,11 @@ impl KalshiClient {
     pub async fn fetch_orderbook(&self, ticker: &str) -> Result<Orderbook> {
         let url = format!("{}/markets/{}/orderbook", KALSHI_BASE, ticker);
 
-        let resp = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
+        // Orderbooks are volatile — no caching
+        let body = self.kalshi_get(&url, 0).await
             .context("Kalshi /orderbook request failed")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("Kalshi /orderbook error {}", resp.status());
-        }
-
         let raw: KalshiOrderbookResponse =
-            resp.json().await.context("Failed to parse Kalshi /orderbook")?;
+            serde_json::from_str(&body).context("Failed to parse Kalshi /orderbook")?;
 
         // API returns [[price_dollars_str, qty_fp_str], ...] for yes and no sides.
         // YES bids: yes_dollars levels, prices already in [0, 1] dollar range.
@@ -211,22 +206,10 @@ impl KalshiClient {
             KALSHI_BASE, series_ticker, ticker, period_interval, start_ts, end_ts
         );
 
-        let resp = self
-            .http
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
+        let body = self.kalshi_get(&url, CACHE_TTL_CANDLES).await
             .context("Kalshi /candlesticks request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Kalshi /candlesticks error {}: {}", status, body);
-        }
-
         let raw: KalshiCandlesticksResponse =
-            resp.json().await.context("Failed to parse Kalshi /candlesticks")?;
+            serde_json::from_str(&body).context("Failed to parse Kalshi /candlesticks")?;
 
         let parse_dollar = |s: Option<&str>| -> Option<f64> {
             s.and_then(|s| s.parse::<f64>().ok())
