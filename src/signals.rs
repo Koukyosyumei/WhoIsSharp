@@ -378,7 +378,8 @@ mod tests {
         let sigs = compute_signals(&mkts);
         let arb = sigs.iter().find(|s| s.kind == SignalKind::Arb).expect("arb signal");
         assert!((arb.gap - 0.10).abs() < 1e-9);
-        assert_eq!(arb.stars, 2); // 0.04–0.08 → 2 stars? Actually 0.10 >= 0.08 → 3 stars
+        // gap 0.10 ≥ 0.08 threshold → 3 stars
+        assert_eq!(arb.stars, 3);
     }
 
     #[test]
@@ -455,13 +456,16 @@ mod tests {
 
     #[test]
     fn vol_spike_detected() {
-        let mkts = vec![
-            market(Platform::Polymarket, "pm1", "Low vol A", 0.60, Some(10_000.0), None),
-            market(Platform::Polymarket, "pm2", "Low vol B", 0.40, Some(10_000.0), None),
-            market(Platform::Polymarket, "pm3", "High vol spike", 0.55, Some(1_000_000.0), None),
-        ];
+        // Need enough baseline markets so the spike remains > 3× mean.
+        // 10 markets @ 10K + 1 spike @ 1M:
+        //   mean = (10 × 10K + 1M) / 11 ≈ 100K  →  threshold = 300K  <  1M ✓
+        let mut mkts: Vec<Market> = (0..10)
+            .map(|i| market(Platform::Polymarket, &format!("base{}", i),
+                            &format!("Baseline event {}", i), 0.60, Some(10_000.0), None))
+            .collect();
+        mkts.push(market(Platform::Polymarket, "spike", "High vol spike", 0.55, Some(1_000_000.0), None));
         let sigs = compute_signals(&mkts);
-        assert!(sigs.iter().any(|s| s.kind == SignalKind::VolSpike && s.id_a == "pm3"));
+        assert!(sigs.iter().any(|s| s.kind == SignalKind::VolSpike && s.id_a == "spike"));
     }
 
     #[test]
