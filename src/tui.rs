@@ -529,10 +529,11 @@ fn render_signals(f: &mut Frame, area: Rect, app: &App) {
 
 fn signal_kind_color(kind: &SignalKind) -> Color {
     match kind {
-        SignalKind::Arb      => Color::Magenta,
-        SignalKind::VolSpike => Color::Yellow,
-        SignalKind::NearFifty => Color::Cyan,
-        SignalKind::Thin     => Color::DarkGray,
+        SignalKind::Arb          => Color::Magenta,
+        SignalKind::InsiderAlert => Color::Red,
+        SignalKind::VolSpike     => Color::Yellow,
+        SignalKind::NearFifty    => Color::Cyan,
+        SignalKind::Thin         => Color::DarkGray,
     }
 }
 
@@ -639,18 +640,20 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
         ]));
     } else {
         let gap_label = match sig.kind {
-            SignalKind::NearFifty => "Distance from 50%",
-            SignalKind::VolSpike  => "Vol × avg",
-            SignalKind::Thin      => "Liquidity ($)",
-            SignalKind::Arb       => "Gap",
+            SignalKind::NearFifty    => "Distance from 50%",
+            SignalKind::VolSpike     => "Vol × avg",
+            SignalKind::Thin         => "Liquidity ($)",
+            SignalKind::Arb          => "Gap",
+            SignalKind::InsiderAlert => "Vol/Liq ratio",
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:>10}: ", gap_label), Style::default().fg(Color::DarkGray)),
             Span::raw(match sig.kind {
-                SignalKind::NearFifty => format!("{:.1}¢", sig.gap * 100.0),
-                SignalKind::VolSpike  => format!("{:.1}×", sig.gap),
-                SignalKind::Thin      => format!("${:.0}K", sig.gap / 1000.0),
-                SignalKind::Arb       => format!("{:.1}¢", sig.gap * 100.0),
+                SignalKind::NearFifty    => format!("{:.1}¢", sig.gap * 100.0),
+                SignalKind::VolSpike     => format!("{:.1}×", sig.gap),
+                SignalKind::Thin         => format!("${:.0}K", sig.gap / 1000.0),
+                SignalKind::Arb          => format!("{:.1}¢", sig.gap * 100.0),
+                SignalKind::InsiderAlert => format!("{:.0}×", sig.gap),
             }),
         ]));
     }

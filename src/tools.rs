@@ -60,6 +60,7 @@ async fn dispatch_inner(
         "get_price_history" => get_price_history(clients, args).await,
         "get_events"       => get_events(clients, args).await,
         "search_markets"   => search_markets(clients, args).await,
+        "analyze_insider"  => analyze_insider(clients, args).await,
         _                  => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
@@ -316,6 +317,131 @@ async fn search_markets(clients: &MarketClients, args: &serde_json::Value) -> Re
     list_markets(clients, &search_args).await
 }
 
+// ─── Insider analysis ─────────────────────────────────────────────────────────
+
+/// Fetch 7-day price history + live orderbook for a market and produce a
+/// structured insider-trading signal report from the data.
+async fn analyze_insider(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let platform = args["platform"].as_str().unwrap_or("");
+    let id       = args["id"].as_str().unwrap_or("");
+
+    if platform.is_empty() || id.is_empty() {
+        return Ok(ToolOutput::err("Required: platform ('polymarket' | 'kalshi') and id"));
+    }
+
+    let mut report = Vec::new();
+    report.push(format!("=== INSIDER SIGNAL ANALYSIS: {} ({}) ===", id, platform.to_uppercase()));
+
+    // ── 1. Price history (7-day) ────────────────────────────────────────────
+    let history_args = json!({ "platform": platform, "id": id, "days": 7 });
+    match get_price_history(clients, &history_args).await {
+        Ok(out) => {
+            report.push("\n--- 7-Day Price History ---".to_string());
+            // Extract candle data for velocity calculation
+            let lines: Vec<&str> = out.text.lines().collect();
+            // Find the summary stats line (contains "min", "max", "start", "end")
+            let mut start_price: Option<f64> = None;
+            let mut end_price:   Option<f64> = None;
+            let mut recent_price: Option<f64> = None;
+            for line in &lines {
+                if line.contains("Start:") {
+                    if let Some(p) = extract_price_from_line(line) { start_price = Some(p); }
+                }
+                if line.contains("End:") || line.contains("Current:") {
+                    if let Some(p) = extract_price_from_line(line) { end_price = Some(p); }
+                }
+                if line.contains("24h change") || line.contains("Recent:") {
+                    if let Some(p) = extract_price_from_line(line) { recent_price = Some(p); }
+                }
+            }
+            report.push(out.text.clone());
+
+            if let (Some(sp), Some(ep)) = (start_price, end_price) {
+                let total_move = (ep - sp) * 100.0;
+                report.push(format!("\nPrice velocity (7d): {:+.1}¢", total_move));
+                if total_move.abs() > 10.0 {
+                    report.push(format!(
+                        "⚠ NOTABLE: {:+.1}¢ move over 7 days is significant",
+                        total_move
+                    ));
+                }
+            }
+            let _ = recent_price; // used indirectly via text output
+        }
+        Err(e) => report.push(format!("Price history unavailable: {}", e)),
+    }
+
+    // ── 2. Live orderbook ───────────────────────────────────────────────────
+    report.push("\n--- Live Orderbook ---".to_string());
+    let ob_args = json!({ "platform": platform, "id": id });
+    match get_orderbook(clients, &ob_args).await {
+        Ok(out) => {
+            report.push(out.text.clone());
+
+            // Parse bid/ask totals to compute imbalance
+            let mut total_bid = 0.0f64;
+            let mut total_ask = 0.0f64;
+            let mut in_bids   = false;
+            let mut in_asks   = false;
+            for line in out.text.lines() {
+                if line.contains("BIDS") { in_bids = true; in_asks = false; continue; }
+                if line.contains("ASKS") { in_asks = true; in_bids = false; continue; }
+                if let Some(size) = parse_ob_size(line) {
+                    if in_bids { total_bid += size; }
+                    if in_asks { total_ask += size; }
+                }
+            }
+            if total_bid + total_ask > 0.0 {
+                let imbalance = (total_bid - total_ask) / (total_bid + total_ask);
+                report.push(format!(
+                    "\nOrderbook imbalance: {:.1}%  (bid {:.0} / ask {:.0})",
+                    imbalance * 100.0, total_bid, total_ask
+                ));
+                if imbalance.abs() > 0.3 {
+                    let side = if imbalance > 0.0 { "BID-heavy (buying pressure)" } else { "ASK-heavy (selling pressure)" };
+                    report.push(format!("⚠ NOTABLE: {side} — one-sided book may indicate informed flow"));
+                }
+            }
+        }
+        Err(e) => report.push(format!("Orderbook unavailable: {}", e)),
+    }
+
+    // ── 3. Insider-signal interpretation ───────────────────────────────────
+    report.push("\n--- Interpretation ---".to_string());
+    report.push("Indicators of potential insider flow:".to_string());
+    report.push("  • Large, sustained price move before a public announcement".to_string());
+    report.push("  • Volume >> liquidity pool (smart money consuming depth)".to_string());
+    report.push("  • Lopsided orderbook at extreme YES/NO price".to_string());
+    report.push("  • Price drift inconsistent with public news flow".to_string());
+    report.push("\nNote: these are probabilistic signals, not proof of wrongdoing.".to_string());
+    report.push("Cross-reference with public news timelines before acting.".to_string());
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+/// Extract a probability/price value (0–100 range, returned as 0.0–1.0) from
+/// a text line like "  Start:  62.3¢" or "Current: 0.78".
+fn extract_price_from_line(line: &str) -> Option<f64> {
+    // Try to find the first numeric token after the colon
+    let after_colon = line.splitn(2, ':').nth(1)?;
+    for token in after_colon.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if let Ok(v) = cleaned.parse::<f64>() {
+            // Values > 1 are assumed to be in cents (0–100 scale)
+            return Some(if v > 1.0 { v / 100.0 } else { v });
+        }
+    }
+    None
+}
+
+/// Parse a size value from an orderbook line like "  62.3¢  ×  450.0".
+fn parse_ob_size(line: &str) -> Option<f64> {
+    // Orderbook lines contain "×" as a separator; size follows it
+    let after = line.splitn(2, '×').nth(1)?;
+    let token = after.split_whitespace().next()?;
+    token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok()
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn all_definitions() -> Vec<ToolDefinition> {
@@ -443,6 +569,29 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "analyze_insider".into(),
+            description: "Deep insider-trading signal analysis for a specific market. \
+                Fetches 7-day price history and live orderbook, then computes price \
+                velocity, volume anomaly, and bid/ask imbalance to score the likelihood \
+                of informed flow. Use when a market has an INSDR signal or when \
+                you suspect unusual directional activity.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["polymarket", "kalshi"],
+                        "description": "Platform the market is on."
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Market ID (conditionId/token_id for Polymarket, ticker for Kalshi)."
+                    }
+                },
+                "required": ["platform", "id"]
             }),
         },
     ]

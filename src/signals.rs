@@ -4,10 +4,11 @@
 //! No network calls — call after every `MarketsLoaded` event.
 //!
 //! Signal types (in priority order):
-//!   Arb       — cross-platform price gap on the same event
-//!   VolSpike  — volume anomaly vs market average
-//!   NearFifty — highly uncertain market (price ≈ 50%)
-//!   Thin      — very low liquidity, high spread risk
+//!   Arb           — cross-platform price gap on the same event
+//!   InsiderAlert  — suspicious vol/liquidity pattern suggesting informed flow
+//!   VolSpike      — volume anomaly vs market average
+//!   NearFifty     — highly uncertain market (price ≈ 50%)
+//!   Thin          — very low liquidity, high spread risk
 
 use std::collections::HashSet;
 
@@ -18,6 +19,7 @@ use crate::markets::{Market, Platform};
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalKind {
     Arb,
+    InsiderAlert,
     VolSpike,
     NearFifty,
     Thin,
@@ -26,10 +28,11 @@ pub enum SignalKind {
 impl SignalKind {
     pub fn label(&self) -> &str {
         match self {
-            SignalKind::Arb      => "ARB",
-            SignalKind::VolSpike => "VOL",
-            SignalKind::NearFifty => "50/50",
-            SignalKind::Thin     => "THIN",
+            SignalKind::Arb          => "ARB",
+            SignalKind::InsiderAlert => "INSDR",
+            SignalKind::VolSpike     => "VOL",
+            SignalKind::NearFifty    => "50/50",
+            SignalKind::Thin         => "THIN",
         }
     }
 }
@@ -81,6 +84,7 @@ impl Signal {
 pub fn compute_signals(markets: &[Market]) -> Vec<Signal> {
     let mut signals = Vec::new();
     signals.extend(find_arb_pairs(markets));
+    signals.extend(find_insider_alerts(markets));
     signals.extend(find_near_fifty(markets));
     signals.extend(find_vol_spikes(markets));
     signals.extend(find_thin_markets(markets));
@@ -161,6 +165,69 @@ fn find_arb_pairs(markets: &[Market]) -> Vec<Signal> {
     }
 
     signals
+}
+
+// ─── Insider-alert detection ──────────────────────────────────────────────────
+//
+// Heuristic: a market with a strongly directional price (>75% or <25%) that is
+// consuming far more volume than its liquidity pool suggests may reflect informed
+// flow — insiders buying before news drops.  We use:
+//
+//   vol_liq_ratio = volume / max(liquidity, 1.0)
+//
+// A healthy market has vol_liq_ratio of 1–5×.  Ratios above INSIDER_VOL_LIQ_RATIO
+// at an extreme price level (>75% YES or <25% YES) are flagged.
+
+const INSIDER_VOL_LIQ_RATIO: f64 = 15.0; // volume ≥ 15× liquidity pool
+const INSIDER_PRICE_EXTREME: f64 = 0.25;  // flag when price < 25% or > 75%
+
+fn find_insider_alerts(markets: &[Market]) -> Vec<Signal> {
+    markets
+        .iter()
+        .filter(|m| {
+            let vol = m.volume.unwrap_or(0.0);
+            let liq = m.liquidity.unwrap_or(0.0);
+            // Need real volume and liquidity to compute the ratio
+            if vol < 1_000.0 || liq < 1.0 {
+                return false;
+            }
+            let ratio = vol / liq;
+            let extreme = m.yes_price > (1.0 - INSIDER_PRICE_EXTREME)
+                || m.yes_price < INSIDER_PRICE_EXTREME;
+            ratio >= INSIDER_VOL_LIQ_RATIO && extreme
+        })
+        .map(|m| {
+            let vol  = m.volume.unwrap_or(0.0);
+            let liq  = m.liquidity.unwrap_or(1.0);
+            let ratio = vol / liq;
+
+            // Higher ratio + more extreme price = more suspicious
+            let price_extremity = (m.yes_price - 0.5).abs() * 2.0; // 0.0 – 1.0
+            let ev_score = ratio * price_extremity * 10.0;
+            let stars = if ratio >= 50.0 { 3 } else if ratio >= 25.0 { 2 } else { 1 };
+
+            let direction = if m.yes_price > 0.5 { "YES" } else { "NO" };
+            Signal {
+                kind:       SignalKind::InsiderAlert,
+                stars,
+                title:      m.title.clone(),
+                platform_a: m.platform.clone(),
+                id_a:       m.id.clone(),
+                price_a:    m.yes_price,
+                platform_b: None,
+                id_b:       None,
+                price_b:    None,
+                gap:        ratio,
+                ev_score,
+                action: format!(
+                    "Vol/Liq {:.0}× at {:.1}% {} — possible informed flow; ask AI: analyze_insider",
+                    ratio,
+                    m.yes_price * 100.0,
+                    direction,
+                ),
+            }
+        })
+        .collect()
 }
 
 // ─── Near-50 (high uncertainty) ───────────────────────────────────────────────
@@ -507,6 +574,95 @@ mod tests {
         ];
         let sigs = compute_signals(&mkts);
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::Thin));
+    }
+
+    // ── Insider alerts ────────────────────────────────────────────────────────
+
+    #[test]
+    fn insider_alert_detected_high_vol_liq_extreme_yes() {
+        // vol=200K, liq=5K → ratio=40× at 80% YES → should flag
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Suspicious directional market",
+                   0.80, Some(200_000.0), Some(5_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        let s = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert)
+            .expect("insider alert should be present");
+        assert!((s.gap - 40.0).abs() < 1e-6, "ratio should be ~40×");
+        assert_eq!(s.stars, 2); // 40 ≥ 25 but < 50 → 2 stars
+    }
+
+    #[test]
+    fn insider_alert_detected_extreme_no_side() {
+        // vol=300K, liq=5K → ratio=60× at 15% YES (NO extreme)
+        let mkts = vec![
+            market(Platform::Kalshi, "kl1", "Smart money shorting this one",
+                   0.15, Some(300_000.0), Some(5_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        let s = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert)
+            .expect("insider alert should be present");
+        assert!(s.gap >= 50.0);
+        assert_eq!(s.stars, 3); // ratio ≥ 50 → 3 stars
+    }
+
+    #[test]
+    fn insider_alert_not_triggered_near_fifty_percent() {
+        // High vol/liq ratio but price is near 50% — not extreme enough
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Uncertain market with heavy trading",
+                   0.52, Some(200_000.0), Some(5_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert),
+                "near-50% price should not trigger insider alert");
+    }
+
+    #[test]
+    fn insider_alert_not_triggered_low_vol_liq_ratio() {
+        // Price is extreme but vol/liq ratio is normal (< 15×)
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Normal high-confidence market",
+                   0.85, Some(50_000.0), Some(100_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert),
+                "low vol/liq ratio should not trigger insider alert");
+    }
+
+    #[test]
+    fn insider_alert_not_triggered_when_volume_too_low() {
+        // vol < 1000 minimum
+        let mkts = vec![
+            market(Platform::Kalshi, "kl1", "Tiny market barely trading",
+                   0.80, Some(500.0), Some(10.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert));
+    }
+
+    #[test]
+    fn insider_alert_not_triggered_when_no_liquidity() {
+        // liquidity < 1 — no pool to compare against
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Zero liquidity market",
+                   0.80, Some(50_000.0), None),
+        ];
+        let sigs = compute_signals(&mkts);
+        assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert));
+    }
+
+    #[test]
+    fn insider_alert_action_mentions_analyze_tool() {
+        let mkts = vec![
+            market(Platform::Polymarket, "pm1", "Suspicious directional market",
+                   0.80, Some(200_000.0), Some(5_000.0)),
+        ];
+        let sigs = compute_signals(&mkts);
+        if let Some(s) = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert) {
+            assert!(s.action.contains("analyze_insider"),
+                    "action should mention the AI tool");
+        }
     }
 
     // ── Sorting + dedup ───────────────────────────────────────────────────────
