@@ -8,7 +8,7 @@
 //!   │ input box (1 line)                                                      │
 //!   └────────────────────────────────────────────────────────────────────────┘
 //!
-//! Tabs: [1] Markets  [2] Chart  [3] Book  [4] Events  [5] Chat  [6] Watchlist
+//! Tabs: [1] Signals  [2] Markets  [3] Chart  [4] Book  [5] Portfolio  [6] Chat
 
 use std::io;
 use std::sync::Arc;
@@ -36,31 +36,33 @@ use tokio::sync::mpsc;
 use crate::agent::{self, AppEvent};
 use crate::llm::{LlmBackend, LlmMessage};
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
+use crate::portfolio::{self, Portfolio, Position, Side};
+use crate::signals::{Signal, SignalKind};
 use crate::tools::MarketClients;
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Markets", "Chart", "Book", "Events", "Chat", "Watchlist"];
+const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
-    Markets   = 0,
-    Chart     = 1,
-    Orderbook = 2,
-    Events    = 3,
-    Chat      = 4,
-    Watchlist = 5,
+    Signals   = 0,
+    Markets   = 1,
+    Chart     = 2,
+    Orderbook = 3,
+    Portfolio = 4,
+    Chat      = 5,
 }
 
 impl Tab {
     fn from_index(n: usize) -> Option<Self> {
         match n {
-            0 => Some(Tab::Markets),
-            1 => Some(Tab::Chart),
-            2 => Some(Tab::Orderbook),
-            3 => Some(Tab::Events),
-            4 => Some(Tab::Chat),
-            5 => Some(Tab::Watchlist),
+            0 => Some(Tab::Signals),
+            1 => Some(Tab::Markets),
+            2 => Some(Tab::Chart),
+            3 => Some(Tab::Orderbook),
+            4 => Some(Tab::Portfolio),
+            5 => Some(Tab::Chat),
             _ => None,
         }
     }
@@ -109,58 +111,83 @@ impl PlatformFilter {
 
 pub struct App {
     // Data
-    pub markets:          Vec<Market>,
-    pub events:           Vec<crate::markets::Event>,
-    pub orderbook:        Option<Orderbook>,
-    pub chart_data:       Vec<(f64, f64)>,
-    pub chart_min:        f64,
-    pub chart_max:        f64,
-    pub watchlist:        Vec<String>,               // market IDs
+    pub markets:           Vec<Market>,
+    pub signals:           Vec<Signal>,
+    pub portfolio:         Portfolio,
+    pub orderbook:         Option<Orderbook>,
+    pub chart_data:        Vec<(f64, f64)>,
+    pub chart_min:         f64,
+    pub chart_max:         f64,
 
     // Navigation
-    pub active_tab:       Tab,
-    pub market_list:      ListState,
-    pub event_list:       ListState,
-    pub watch_list:       ListState,
-    pub chat_scroll:      u16,
-    pub book_scroll:      u16,
+    pub active_tab:        Tab,
+    pub market_list:       ListState,
+    pub signal_list:       ListState,
+    pub portfolio_list:    ListState,
+    pub chat_scroll:       u16,
+    pub book_scroll:       u16,
 
     // Filter / search
-    pub platform_filter:  PlatformFilter,
-    pub search:           String,
-    pub search_mode:      bool,
-    pub chart_interval:   ChartInterval,
+    pub platform_filter:   PlatformFilter,
+    pub search:            String,
+    pub search_mode:       bool,
+    pub chart_interval:    ChartInterval,
 
     // Chat
-    pub chat_msgs:        Vec<ChatMsg>,
-    pub input:            String,
-    pub sent_history:     Vec<String>,
-    pub sent_cursor:      Option<usize>,
+    pub chat_msgs:         Vec<ChatMsg>,
+    pub input:             String,
+    pub sent_history:      Vec<String>,
+    pub sent_cursor:       Option<usize>,
+
+    // Portfolio add-position mode
+    pub pos_input_mode:    bool,
+    pub pos_input_step:    PosInputStep,
+    pub pos_draft:         PosDraft,
 
     // Status
-    pub status:           String,
-    pub is_loading:       bool,
-    pub backend_name:     String,
-    pub last_updated:     Option<chrono::DateTime<chrono::Local>>,
+    pub status:            String,
+    pub is_loading:        bool,
+    pub backend_name:      String,
+    pub last_updated:      Option<chrono::DateTime<chrono::Local>>,
 
     // Selected market ID (for chart / orderbook loading)
     pub selected_market_id: Option<String>,
+}
+
+// Position add-flow state machine
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub enum PosInputStep {
+    #[default]
+    EntryPrice,
+    Shares,
+    Side,
+    Note,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct PosDraft {
+    pub market_id:   String,
+    pub title:       String,
+    pub platform:    Option<Platform>,
+    pub entry_price: Option<f64>,
+    pub shares:      Option<f64>,
+    pub side:        Option<Side>,
 }
 
 impl App {
     pub fn new(backend_name: String) -> Self {
         App {
             markets:           Vec::new(),
-            events:            Vec::new(),
+            signals:           Vec::new(),
+            portfolio:         portfolio::load_portfolio(),
             orderbook:         None,
             chart_data:        Vec::new(),
             chart_min:         0.0,
             chart_max:         100.0,
-            watchlist:         Vec::new(),
-            active_tab:        Tab::Markets,
+            active_tab:        Tab::Signals,
             market_list:       ListState::default(),
-            event_list:        ListState::default(),
-            watch_list:        ListState::default(),
+            signal_list:       ListState::default(),
+            portfolio_list:    ListState::default(),
             chat_scroll:       0,
             book_scroll:       0,
             platform_filter:   PlatformFilter::All,
@@ -171,6 +198,9 @@ impl App {
             input:             String::new(),
             sent_history:      Vec::new(),
             sent_cursor:       None,
+            pos_input_mode:    false,
+            pos_input_step:    PosInputStep::default(),
+            pos_draft:         PosDraft::default(),
             status:            "Loading market data…".to_string(),
             is_loading:        true,
             backend_name,
@@ -198,52 +228,34 @@ impl App {
         filtered.get(idx).copied()
     }
 
-    pub fn selected_watched_market(&self) -> Option<&Market> {
-        let idx = self.watch_list.selected()?;
-        let wid = self.watchlist.get(idx)?;
-        self.markets.iter().find(|m| &m.id == wid)
-    }
-
-    pub fn toggle_watchlist(&mut self) {
-        let market_info = self.selected_market().map(|m| (m.id.clone(), m.title.clone()));
-        if let Some((id, title)) = market_info {
-            if let Some(pos) = self.watchlist.iter().position(|w| w == &id) {
-                self.watchlist.remove(pos);
-                self.status = format!("Removed '{}' from watchlist", title);
-            } else {
-                self.watchlist.push(id);
-                self.status = format!("Added '{}' to watchlist", title);
-            }
-        }
-    }
-
-    pub fn is_watched(&self, id: &str) -> bool {
-        self.watchlist.iter().any(|w| w == id)
+    pub fn selected_signal(&self) -> Option<&Signal> {
+        let idx = self.signal_list.selected()?;
+        self.signals.get(idx)
     }
 
     // ── List navigation ───────────────────────────────────────────────────────
 
     pub fn list_down(&mut self) {
         match self.active_tab {
+            Tab::Signals => {
+                let len = self.signals.len();
+                if len == 0 { return; }
+                let i = self.signal_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
+                self.signal_list.select(Some(i));
+            }
             Tab::Markets => {
                 let len = self.filtered_markets().len();
                 if len == 0 { return; }
                 let i = self.market_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
                 self.market_list.select(Some(i));
             }
-            Tab::Events => {
-                let len = self.events.len();
+            Tab::Portfolio => {
+                let len = self.portfolio.positions.len();
                 if len == 0 { return; }
-                let i = self.event_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
-                self.event_list.select(Some(i));
+                let i = self.portfolio_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
+                self.portfolio_list.select(Some(i));
             }
-            Tab::Watchlist => {
-                let len = self.watchlist.len();
-                if len == 0 { return; }
-                let i = self.watch_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
-                self.watch_list.select(Some(i));
-            }
-            Tab::Chat => { self.chat_scroll = self.chat_scroll.saturating_add(1); }
+            Tab::Chat      => { self.chat_scroll = self.chat_scroll.saturating_add(1); }
             Tab::Orderbook => { self.book_scroll = self.book_scroll.saturating_add(1); }
             _ => {}
         }
@@ -251,6 +263,14 @@ impl App {
 
     pub fn list_up(&mut self) {
         match self.active_tab {
+            Tab::Signals => {
+                let len = self.signals.len();
+                if len == 0 { return; }
+                let i = self.signal_list.selected()
+                    .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                    .unwrap_or(0);
+                self.signal_list.select(Some(i));
+            }
             Tab::Markets => {
                 let len = self.filtered_markets().len();
                 if len == 0 { return; }
@@ -259,29 +279,21 @@ impl App {
                     .unwrap_or(0);
                 self.market_list.select(Some(i));
             }
-            Tab::Events => {
-                let len = self.events.len();
+            Tab::Portfolio => {
+                let len = self.portfolio.positions.len();
                 if len == 0 { return; }
-                let i = self.event_list.selected()
+                let i = self.portfolio_list.selected()
                     .map(|i| if i == 0 { len - 1 } else { i - 1 })
                     .unwrap_or(0);
-                self.event_list.select(Some(i));
+                self.portfolio_list.select(Some(i));
             }
-            Tab::Watchlist => {
-                let len = self.watchlist.len();
-                if len == 0 { return; }
-                let i = self.watch_list.selected()
-                    .map(|i| if i == 0 { len - 1 } else { i - 1 })
-                    .unwrap_or(0);
-                self.watch_list.select(Some(i));
-            }
-            Tab::Chat => { self.chat_scroll = self.chat_scroll.saturating_sub(1); }
+            Tab::Chat      => { self.chat_scroll = self.chat_scroll.saturating_sub(1); }
             Tab::Orderbook => { self.book_scroll = self.book_scroll.saturating_sub(1); }
             _ => {}
         }
     }
 
-    // ── History navigation (↑/↓ in input) ────────────────────────────────────
+    // ── Input history (↑/↓ in chat input) ────────────────────────────────────
 
     pub fn history_up(&mut self) {
         if self.sent_history.is_empty() { return; }
@@ -298,13 +310,128 @@ impl App {
 
     pub fn history_down(&mut self) {
         if self.sent_history.is_empty() { return; }
-        let new_cursor = self.sent_cursor.map(|i| {
-            if i + 1 >= self.sent_history.len() { None } else { Some(i + 1) }
-        }).flatten();
+        let new_cursor = self.sent_cursor
+            .and_then(|i| if i + 1 >= self.sent_history.len() { None } else { Some(i + 1) });
         self.sent_cursor = new_cursor;
         self.input = new_cursor
             .map(|i| self.sent_history[i].clone())
             .unwrap_or_default();
+    }
+
+    // ── Portfolio helpers ─────────────────────────────────────────────────────
+
+    pub fn delete_selected_position(&mut self) {
+        if let Some(idx) = self.portfolio_list.selected() {
+            if let Some(pos) = self.portfolio.positions.get(idx) {
+                let id = pos.id.clone();
+                self.portfolio.remove(&id);
+                let _ = portfolio::save_portfolio(&self.portfolio);
+                if self.portfolio.positions.is_empty() {
+                    self.portfolio_list.select(None);
+                } else {
+                    let new_idx = idx.min(self.portfolio.positions.len() - 1);
+                    self.portfolio_list.select(Some(new_idx));
+                }
+                self.status = "Position deleted.".to_string();
+            }
+        }
+    }
+
+    pub fn update_portfolio_marks(&mut self) {
+        let pairs: Vec<(Platform, String, f64)> = self.markets
+            .iter()
+            .map(|m| (m.platform.clone(), m.id.clone(), m.yes_price))
+            .collect();
+        self.portfolio.update_marks(pairs.into_iter());
+    }
+
+    pub fn start_add_position(&mut self) {
+        if let Some(m) = self.selected_market() {
+            self.pos_draft = PosDraft {
+                market_id: m.id.clone(),
+                title:     m.title.clone(),
+                platform:  Some(m.platform.clone()),
+                entry_price: None,
+                shares:    None,
+                side:      None,
+            };
+            self.pos_input_mode = true;
+            self.pos_input_step = PosInputStep::EntryPrice;
+            self.input.clear();
+            let pct = m.yes_price * 100.0;
+            self.status = format!(
+                "Add position: {} [{:.1}¢] — Enter entry price (¢):",
+                m.title, pct
+            );
+        } else {
+            self.status = "Select a market first.".to_string();
+        }
+    }
+
+    pub fn advance_pos_input(&mut self) -> bool {
+        let val = self.input.trim().to_string();
+        self.input.clear();
+
+        match self.pos_input_step {
+            PosInputStep::EntryPrice => {
+                if let Ok(p) = val.parse::<f64>() {
+                    self.pos_draft.entry_price = Some(p / 100.0);
+                    self.pos_input_step = PosInputStep::Shares;
+                    self.status = "Enter number of shares:".to_string();
+                    false
+                } else {
+                    self.status = "Invalid price. Enter entry price in cents (e.g. 55):".to_string();
+                    false
+                }
+            }
+            PosInputStep::Shares => {
+                if let Ok(s) = val.parse::<f64>() {
+                    self.pos_draft.shares = Some(s);
+                    self.pos_input_step = PosInputStep::Side;
+                    self.status = "Enter side (yes / no):".to_string();
+                    false
+                } else {
+                    self.status = "Invalid shares. Enter a number (e.g. 100):".to_string();
+                    false
+                }
+            }
+            PosInputStep::Side => {
+                let side = Side::from_str(&val);
+                self.pos_draft.side = Some(side);
+                self.pos_input_step = PosInputStep::Note;
+                self.status = "Optional note/thesis (or Enter to skip):".to_string();
+                false
+            }
+            PosInputStep::Note => {
+                // Commit position
+                let note = if val.is_empty() { None } else { Some(val) };
+                if let (Some(plat), Some(price), Some(shares), Some(side)) = (
+                    self.pos_draft.platform.clone(),
+                    self.pos_draft.entry_price,
+                    self.pos_draft.shares,
+                    self.pos_draft.side.clone(),
+                ) {
+                    let pos = Position::new(
+                        plat,
+                        self.pos_draft.market_id.clone(),
+                        self.pos_draft.title.clone(),
+                        price,
+                        shares,
+                        side,
+                        note,
+                    );
+                    self.portfolio.add(pos);
+                    let _ = portfolio::save_portfolio(&self.portfolio);
+                    let new_idx = self.portfolio.positions.len().saturating_sub(1);
+                    self.portfolio_list.select(Some(new_idx));
+                    self.status = "Position added.".to_string();
+                }
+                self.pos_input_mode = false;
+                self.pos_input_step = PosInputStep::EntryPrice;
+                self.pos_draft = PosDraft::default();
+                true // done
+            }
+        }
     }
 }
 
@@ -326,12 +453,12 @@ fn render(f: &mut Frame, app: &App) {
     render_header(f, chunks[0], app);
     render_tabs(f, chunks[1], app);
     match app.active_tab {
+        Tab::Signals   => render_signals(f, chunks[2], app),
         Tab::Markets   => render_markets(f, chunks[2], app),
         Tab::Chart     => render_chart(f, chunks[2], app),
         Tab::Orderbook => render_orderbook(f, chunks[2], app),
-        Tab::Events    => render_events(f, chunks[2], app),
+        Tab::Portfolio => render_portfolio(f, chunks[2], app),
         Tab::Chat      => render_chat(f, chunks[2], app),
-        Tab::Watchlist => render_watchlist(f, chunks[2], app),
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
@@ -346,6 +473,10 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "never".to_string());
     let loading = if app.is_loading { " ⟳" } else { "" };
 
+    let total_pnl = app.portfolio.total_pnl();
+    let pnl_color = if total_pnl >= 0.0 { Color::Green } else { Color::Red };
+    let pnl_str = format!("  PnL: {:+.2}$", total_pnl);
+
     let line = Line::from(vec![
         Span::styled(" WhoIsSharp ", Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
         Span::raw(" "),
@@ -355,6 +486,8 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" + "),
         Span::styled("KL", Style::default().fg(Color::Blue)),
         Span::raw(format!("{}  │  updated: {}  │  ", loading, updated)),
+        Span::styled(pnl_str, Style::default().fg(pnl_color).bold()),
+        Span::raw("  │  "),
         Span::styled(now, Style::default().fg(Color::White)),
     ]);
 
@@ -367,9 +500,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     let titles: Vec<Line> = TAB_NAMES
         .iter()
         .enumerate()
-        .map(|(i, name)| {
-            Line::from(format!(" [{}] {} ", i + 1, name))
-        })
+        .map(|(i, name)| Line::from(format!(" [{}] {} ", i + 1, name)))
         .collect();
 
     let tabs = Tabs::new(titles)
@@ -379,6 +510,171 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .divider(symbols::DOT);
 
     f.render_widget(tabs, area);
+}
+
+// ── Signals tab ───────────────────────────────────────────────────────────────
+
+fn render_signals(f: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    render_signal_list(f, chunks[0], app);
+    render_signal_detail(f, chunks[1], app);
+}
+
+fn signal_kind_color(kind: &SignalKind) -> Color {
+    match kind {
+        SignalKind::Arb      => Color::Magenta,
+        SignalKind::VolSpike => Color::Yellow,
+        SignalKind::NearFifty => Color::Cyan,
+        SignalKind::Thin     => Color::DarkGray,
+    }
+}
+
+fn render_signal_list(f: &mut Frame, area: Rect, app: &App) {
+    if app.signals.is_empty() {
+        let msg = if app.is_loading {
+            "Computing signals…"
+        } else {
+            "No signals detected. Press 'r' to refresh markets."
+        };
+        let p = Paragraph::new(msg)
+            .block(Block::default().title(" Top Signals ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app.signals.iter().map(|sig| {
+        let stars = "★".repeat(sig.stars as usize) + &"☆".repeat(3 - sig.stars as usize);
+        let kind_color = signal_kind_color(&sig.kind);
+        let price_str = format!("{:.0}¢", sig.price_a * 100.0);
+
+        let title_str = if sig.title.len() > 35 {
+            format!("{}…", &sig.title[..34])
+        } else {
+            sig.title.clone()
+        };
+
+        let line = Line::from(vec![
+            Span::styled(format!("{} ", stars), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("[{:5}] ", sig.kind.label()),
+                Style::default().fg(kind_color).bold(),
+            ),
+            Span::styled(sig.platform_a.label(), Style::default().fg(match sig.platform_a {
+                Platform::Polymarket => Color::Green,
+                Platform::Kalshi     => Color::Blue,
+            })),
+            Span::raw(" "),
+            Span::styled(price_str, Style::default().fg(price_color(sig.price_a))),
+            Span::raw("  "),
+            Span::raw(title_str),
+        ]);
+        ListItem::new(line)
+    }).collect();
+
+    let count = app.signals.len();
+    let title = format!(" Top Signals ({}) ", count);
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).bold())
+        .highlight_symbol("▶ ");
+
+    let mut state = app.signal_list.clone();
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(sig) = app.selected_signal() else {
+        let p = Paragraph::new("\n  Select a signal with j/k\n\n  Press Enter to open the primary market.\n  Press 'a' to ask AI about it.")
+            .block(Block::default().title(" Signal Detail ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let kind_color = signal_kind_color(&sig.kind);
+    let stars = "★".repeat(sig.stars as usize) + &"☆".repeat(3 - sig.stars as usize);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!(" {} ", sig.kind.label()), Style::default().fg(kind_color).bold().bg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(stars, Style::default().fg(Color::Yellow)),
+            Span::raw(format!("  EV Score: {:.1}", sig.ev_score)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(format!(" {}", sig.title), Style::default().fg(Color::White).bold())),
+        Line::from(""),
+    ];
+
+    // Primary market
+    lines.push(Line::from(vec![
+        Span::styled(" Primary: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(sig.platform_a.label(), Style::default().fg(match sig.platform_a {
+            Platform::Polymarket => Color::Green,
+            Platform::Kalshi     => Color::Blue,
+        })),
+        Span::raw(format!("  {:.1}¢  ({})", sig.price_a * 100.0, sig.id_a)),
+    ]));
+
+    // Secondary market (arb)
+    if let (Some(plat_b), Some(id_b), Some(price_b)) =
+        (&sig.platform_b, &sig.id_b, sig.price_b)
+    {
+        lines.push(Line::from(vec![
+            Span::styled(" Secondary:", Style::default().fg(Color::DarkGray)),
+            Span::styled(plat_b.label(), Style::default().fg(match plat_b {
+                Platform::Polymarket => Color::Green,
+                Platform::Kalshi     => Color::Blue,
+            })),
+            Span::raw(format!("  {:.1}¢  ({})", price_b * 100.0, id_b)),
+        ]));
+
+        let gap_color = if sig.gap >= 0.08 { Color::Magenta } else if sig.gap >= 0.04 { Color::Yellow } else { Color::White };
+        lines.push(Line::from(vec![
+            Span::styled(" Gap:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢", sig.gap * 100.0), Style::default().fg(gap_color).bold()),
+        ]));
+    } else {
+        let gap_label = match sig.kind {
+            SignalKind::NearFifty => "Distance from 50%",
+            SignalKind::VolSpike  => "Vol × avg",
+            SignalKind::Thin      => "Liquidity ($)",
+            SignalKind::Arb       => "Gap",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:>10}: ", gap_label), Style::default().fg(Color::DarkGray)),
+            Span::raw(match sig.kind {
+                SignalKind::NearFifty => format!("{:.1}¢", sig.gap * 100.0),
+                SignalKind::VolSpike  => format!("{:.1}×", sig.gap),
+                SignalKind::Thin      => format!("${:.0}K", sig.gap / 1000.0),
+                SignalKind::Arb       => format!("{:.1}¢", sig.gap * 100.0),
+            }),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Action:", Style::default().fg(Color::DarkGray))));
+    for chunk in textwrap(&sig.action, (area.width as usize).saturating_sub(4)) {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", chunk),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [Enter] open market  [a] ask AI  [n] add position",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Signal Detail ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 // ── Markets tab ───────────────────────────────────────────────────────────────
@@ -398,7 +694,7 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
     let search_label = if app.search.is_empty() {
         String::new()
     } else {
-        format!(" 🔍{}", app.search)
+        format!(" /{}", app.search)
     };
 
     let title = format!(" Markets [{}]{} ", filter_label, search_label);
@@ -407,20 +703,13 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|m| {
-            let watched = if app.is_watched(&m.id) { "★ " } else { "  " };
             let platform_color = match m.platform {
                 Platform::Polymarket => Color::Green,
                 Platform::Kalshi     => Color::Blue,
             };
             let pct = m.yes_price * 100.0;
             let pct_color = price_color(m.yes_price);
-            let vol = m.volume
-                .map(|v| {
-                    if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
-                    else if v >= 1_000.0 { format!("${:.0}K", v / 1_000.0) }
-                    else { format!("${:.0}", v) }
-                })
-                .unwrap_or_default();
+            let vol = format_volume(m.volume);
 
             let title_str = if m.title.len() > 32 {
                 format!("{}…", &m.title[..31])
@@ -429,7 +718,6 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let line = Line::from(vec![
-                Span::raw(watched),
                 Span::styled(m.platform.label(), Style::default().fg(platform_color)),
                 Span::raw(" "),
                 Span::styled(format!("{:5.1}%", pct), Style::default().fg(pct_color).bold()),
@@ -458,18 +746,10 @@ fn render_market_detail(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let pct_color = price_color(m.yes_price);
-    let vol = m.volume
-        .map(|v| {
-            if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
-            else if v >= 1_000.0 { format!("${:.0}K", v / 1_000.0) }
-            else { format!("${:.0}", v) }
-        })
-        .unwrap_or_else(|| "N/A".into());
+    let vol = format_volume(m.volume);
     let liq = m.liquidity
         .map(|v| format!("${:.0}K", v / 1_000.0))
         .unwrap_or_else(|| "N/A".into());
-
-    let watched = if app.is_watched(&m.id) { " ★ Watched" } else { " ☆ Not watched (w)" };
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(format!(" {} ", m.title), Style::default().fg(Color::White).bold())),
@@ -504,7 +784,10 @@ fn render_market_detail(f: &mut Frame, area: Rect, app: &App) {
         Line::from(format!(" Ends:      {}", m.end_date.as_deref().unwrap_or("N/A"))),
         Line::from(format!(" ID:        {}", m.id)),
         Line::from(""),
-        Line::from(Span::styled(watched, Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            "  [Enter] load chart/book  [n] add position  [a] ask AI  [/] search",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(""),
     ];
 
@@ -551,7 +834,6 @@ fn render_chart(f: &mut Frame, area: Rect, app: &App) {
         .map(|m| format!(" {} [{}] ", m.title, app.chart_interval.label()))
         .unwrap_or_else(|| format!(" Chart [{}] ", app.chart_interval.label()));
 
-    // Build x-axis labels (3 points: start, middle, end)
     let fmt_ts = |ts: f64| {
         let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
             .map(|d| d.with_timezone(&chrono::Local).format("%m/%d %H:%M").to_string())
@@ -641,7 +923,6 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
     let mut bid_total = 0.0f64;
     let mut ask_total = 0.0f64;
 
-    // Pre-calculate totals for depth of field display
     let bids: Vec<(f64, f64, f64)> = book.bids.iter().take(depth).map(|b| {
         bid_total += b.size;
         (b.price, b.size, bid_total)
@@ -687,37 +968,100 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-// ── Events tab ────────────────────────────────────────────────────────────────
+// ── Portfolio tab ─────────────────────────────────────────────────────────────
 
-fn render_events(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app
-        .events
-        .iter()
-        .map(|e| {
-            let platform_color = match e.platform {
-                Platform::Polymarket => Color::Green,
-                Platform::Kalshi     => Color::Blue,
-            };
-            let line = Line::from(vec![
-                Span::styled(e.platform.label(), Style::default().fg(platform_color)),
-                Span::raw(" "),
-                Span::styled(&e.title, Style::default().fg(Color::White)),
-                Span::raw(" "),
-                Span::styled(
-                    e.category.as_deref().unwrap_or("misc"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+fn render_portfolio(f: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(area);
+
+    render_portfolio_summary(f, chunks[0], app);
+    render_portfolio_positions(f, chunks[1], app);
+}
+
+fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
+    let total_cost  = app.portfolio.total_cost();
+    let total_value = app.portfolio.total_value();
+    let total_pnl   = app.portfolio.total_pnl();
+    let pnl_color   = if total_pnl >= 0.0 { Color::Green } else { Color::Red };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Cost basis:   "),
+            Span::styled(format!("${:.2}", total_cost), Style::default().fg(Color::White).bold()),
+            Span::raw("   Mark value: "),
+            Span::styled(format!("${:.2}", total_value), Style::default().fg(Color::White).bold()),
+            Span::raw("   Unrealised PnL: "),
+            Span::styled(format!("{:+.2}$", total_pnl), Style::default().fg(pnl_color).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  [n] Add position  [d] Delete selected  [Enter] Load chart",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Portfolio Summary ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
+    if app.portfolio.positions.is_empty() {
+        let msg = if app.pos_input_mode {
+            "Adding position — follow the prompts in the status bar."
+        } else {
+            "No positions. Navigate to Markets tab, select a market, press 'n' to add a position."
+        };
+        let p = Paragraph::new(msg)
+            .block(Block::default().title(" Positions ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app.portfolio.positions.iter().map(|pos| {
+        let pnl = pos.pnl();
+        let pnl_pct = pos.pnl_pct();
+        let pnl_color = if pnl >= 0.0 { Color::Green } else { Color::Red };
+        let platform_color = match pos.platform {
+            Platform::Polymarket => Color::Green,
+            Platform::Kalshi     => Color::Blue,
+        };
+        let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
+
+        let title_str = if pos.title.len() > 30 {
+            format!("{}…", &pos.title[..29])
+        } else {
+            pos.title.clone()
+        };
+
+        let line = Line::from(vec![
+            Span::styled(pos.platform.label(), Style::default().fg(platform_color)),
+            Span::raw(" "),
+            Span::styled(pos.side.label(), Style::default().fg(Color::White).bold()),
+            Span::raw(format!(" {:>6.1}¢ entry  {:>6.1}¢ mark  ", pos.entry_price * 100.0, mark)),
+            Span::styled(
+                format!("{:+.2}$ ({:+.1}%)", pnl, pnl_pct),
+                Style::default().fg(pnl_color).bold(),
+            ),
+            Span::raw("  "),
+            Span::raw(title_str),
+        ]);
+        ListItem::new(line)
+    }).collect();
 
     let list = List::new(items)
-        .block(Block::default().title(" Events ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-        .highlight_style(Style::default().bg(Color::DarkGray).bold())
+        .block(Block::default()
+            .title(format!(" Positions ({}) ", app.portfolio.positions.len()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).bold())
         .highlight_symbol("▶ ");
 
-    let mut state = app.event_list.clone();
+    let mut state = app.portfolio_list.clone();
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -773,7 +1117,6 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    // Add "thinking" indicator if loading
     if app.is_loading {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -789,7 +1132,6 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
     } else {
         0
     };
-    // Always scroll to bottom unless user has scrolled up
     let effective_scroll = scroll.saturating_sub(app.chat_scroll);
 
     let p = Paragraph::new(lines)
@@ -798,46 +1140,6 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
         .scroll((effective_scroll, 0));
 
     f.render_widget(p, area);
-}
-
-// ── Watchlist tab ─────────────────────────────────────────────────────────────
-
-fn render_watchlist(f: &mut Frame, area: Rect, app: &App) {
-    if app.watchlist.is_empty() {
-        let p = Paragraph::new(" No markets watched. Press 'w' on a market to add it.")
-            .block(Block::default().title(" Watchlist ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-        f.render_widget(p, area);
-        return;
-    }
-
-    let items: Vec<ListItem> = app
-        .watchlist
-        .iter()
-        .filter_map(|id| app.markets.iter().find(|m| &m.id == id))
-        .map(|m| {
-            let pct = m.yes_price * 100.0;
-            let pct_color = price_color(m.yes_price);
-            let platform_color = match m.platform {
-                Platform::Polymarket => Color::Green,
-                Platform::Kalshi     => Color::Blue,
-            };
-            let line = Line::from(vec![
-                Span::styled(m.platform.label(), Style::default().fg(platform_color)),
-                Span::raw(" "),
-                Span::styled(format!("{:5.1}%", pct), Style::default().fg(pct_color).bold()),
-                Span::raw(format!("  {}", m.title)),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::default().title(format!(" Watchlist ({}) ", app.watchlist.len())).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-        .highlight_style(Style::default().bg(Color::DarkGray).bold())
-        .highlight_symbol("▶ ");
-
-    let mut state = app.watch_list.clone();
-    f.render_stateful_widget(list, area, &mut state);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -864,7 +1166,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 // ── Input box ────────────────────────────────────────────────────────────────
 
 fn render_input(f: &mut Frame, area: Rect, app: &App) {
-    let prompt = if app.search_mode { "/search: " } else { "> " };
+    let prompt = if app.search_mode {
+        "/search: "
+    } else if app.pos_input_mode {
+        "pos> "
+    } else {
+        "> "
+    };
     let line = Line::from(vec![
         Span::styled(prompt, Style::default().fg(Color::Cyan)),
         Span::raw(&app.input),
@@ -887,6 +1195,15 @@ fn price_color(p: f64) -> Color {
     else if p >= 0.3 { Color::Yellow }
     else if p >= 0.15 { Color::LightRed }
     else             { Color::Red }
+}
+
+fn format_volume(v: Option<f64>) -> String {
+    match v {
+        None => String::new(),
+        Some(v) if v >= 1_000_000.0 => format!("${:.1}M", v / 1_000_000.0),
+        Some(v) if v >= 1_000.0     => format!("${:.0}K", v / 1_000.0),
+        Some(v)                     => format!("${:.0}", v),
+    }
 }
 
 fn textwrap(s: &str, width: usize) -> Vec<String> {
@@ -915,7 +1232,6 @@ pub async fn run_tui(
     clients:      Arc<MarketClients>,
     backend_name: String,
 ) -> anyhow::Result<()> {
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -939,7 +1255,6 @@ pub async fn run_tui(
         terminal.draw(|f| render(f, &app))?;
 
         tokio::select! {
-            // ── App events (from agent / refresh tasks) ───────────────────────
             Some(ev) = event_rx.recv() => {
                 match ev {
                     AppEvent::MarketsLoaded(markets) => {
@@ -947,9 +1262,13 @@ pub async fn run_tui(
                         if app.market_list.selected().is_none() && !app.markets.is_empty() {
                             app.market_list.select(Some(0));
                         }
+                        app.update_portfolio_marks();
                     }
-                    AppEvent::EventsLoaded(events) => {
-                        app.events = events;
+                    AppEvent::SignalsComputed(sigs) => {
+                        app.signals = sigs;
+                        if app.signal_list.selected().is_none() && !app.signals.is_empty() {
+                            app.signal_list.select(Some(0));
+                        }
                     }
                     AppEvent::PriceHistoryLoaded { market_id, candles } => {
                         if Some(&market_id) == app.selected_market_id.as_ref() {
@@ -973,7 +1292,11 @@ pub async fn run_tui(
                     AppEvent::RefreshDone => {
                         app.is_loading = false;
                         app.last_updated = Some(chrono::Local::now());
-                        app.status = format!("{} markets loaded", app.markets.len());
+                        app.status = format!(
+                            "{} markets  {} signals",
+                            app.markets.len(),
+                            app.signals.len()
+                        );
                     }
                     AppEvent::RefreshError(e) => {
                         app.status = format!("Error: {}", e);
@@ -994,7 +1317,6 @@ pub async fn run_tui(
                         app.chat_msgs.push(ChatMsg::ToolResult { name, preview });
                     }
                     AppEvent::AgentText(text) => {
-                        // Replace the last assistant message if it exists, else push new
                         if let Some(ChatMsg::Assistant(existing)) = app.chat_msgs.last_mut() {
                             if text.len() > existing.len() {
                                 *existing = text;
@@ -1022,18 +1344,16 @@ pub async fn run_tui(
                 }
             }
 
-            // ── Terminal key events ───────────────────────────────────────────
             Some(Ok(ev)) = term_events.next() => {
                 if let Event::Key(key) = ev {
                     if handle_key(&mut app, key, &backend, &clients, &event_tx, &mut llm_history).await {
-                        break; // Quit
+                        break;
                     }
                 }
             }
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -1052,20 +1372,42 @@ async fn handle_key(
     llm_history: &mut Vec<LlmMessage>,
 ) -> bool {
     use crossterm::event::KeyCode as KC;
-    // Alias our Tab enum to avoid clash with KC::Tab
     type AppTab = Tab;
 
-    // Ctrl+C always quits
+    // Ctrl+C always quits (or clears input)
     if key.modifiers == KeyModifiers::CONTROL && key.code == KC::Char('c') {
-        if !app.input.is_empty() {
+        if !app.input.is_empty() || app.pos_input_mode {
             app.input.clear();
             app.sent_cursor = None;
+            app.pos_input_mode = false;
+            app.pos_input_step = PosInputStep::EntryPrice;
+            app.pos_draft = PosDraft::default();
+            app.status = "Cancelled.".to_string();
             return false;
         }
         return true;
     }
 
-    // Search mode
+    // ── Position input flow ───────────────────────────────────────────────────
+    if app.pos_input_mode {
+        match key.code {
+            KC::Esc => {
+                app.pos_input_mode = false;
+                app.input.clear();
+                app.pos_draft = PosDraft::default();
+                app.status = "Cancelled.".to_string();
+            }
+            KC::Enter => {
+                app.advance_pos_input();
+            }
+            KC::Backspace => { app.input.pop(); }
+            KC::Char(c)   => { app.input.push(c); }
+            _ => {}
+        }
+        return false;
+    }
+
+    // ── Search mode ───────────────────────────────────────────────────────────
     if app.search_mode {
         match key.code {
             KC::Esc => {
@@ -1089,75 +1431,64 @@ async fn handle_key(
         return false;
     }
 
-    // Normal mode
+    // ── Normal mode ───────────────────────────────────────────────────────────
     match key.code {
-        // ── Quit ──────────────────────────────────────────────────────────────
         KC::Char('q') if app.input.is_empty() => return true,
 
         // ── Tab switching ─────────────────────────────────────────────────────
-        KC::Char('1') if app.input.is_empty() => { app.active_tab = AppTab::Markets; }
-        KC::Char('2') if app.input.is_empty() => {
+        KC::Char('1') if app.input.is_empty() => { app.active_tab = AppTab::Signals; }
+        KC::Char('2') if app.input.is_empty() => { app.active_tab = AppTab::Markets; }
+        KC::Char('3') if app.input.is_empty() => {
             app.active_tab = AppTab::Chart;
             trigger_chart_load(app, clients, event_tx).await;
         }
-        KC::Char('3') if app.input.is_empty() => {
+        KC::Char('4') if app.input.is_empty() => {
             app.active_tab = AppTab::Orderbook;
             trigger_orderbook_load(app, clients, event_tx).await;
         }
-        KC::Char('4') if app.input.is_empty() => {
-            app.active_tab = AppTab::Events;
-            if app.events.is_empty() {
-                let clients_c = clients.clone();
-                let tx = event_tx.clone();
-                tokio::spawn(async move {
-                    match clients_c.polymarket.fetch_events(30).await {
-                        Ok(mut pm) => {
-                            match clients_c.kalshi.fetch_events(30).await {
-                                Ok(mut kl) => { pm.append(&mut kl); }
-                                Err(_) => {}
-                            }
-                            let _ = tx.send(AppEvent::EventsLoaded(pm));
-                        }
-                        Err(_) => {}
-                    }
-                });
-            }
-        }
-        KC::Char('5') if app.input.is_empty() => { app.active_tab = AppTab::Chat; }
-        KC::Char('6') if app.input.is_empty() => { app.active_tab = AppTab::Watchlist; }
+        KC::Char('5') if app.input.is_empty() => { app.active_tab = AppTab::Portfolio; }
+        KC::Char('6') if app.input.is_empty() => { app.active_tab = AppTab::Chat; }
 
-        KC::Tab => {
-            app.active_tab = app.active_tab.next();
-        }
-        KC::BackTab => {
-            app.active_tab = app.active_tab.prev();
-        }
+        KC::Tab => { app.active_tab = app.active_tab.next(); }
+        KC::BackTab => { app.active_tab = app.active_tab.prev(); }
 
-        // ── List navigation ───────────────────────────────────────────────────
+        // ── Navigation ────────────────────────────────────────────────────────
         KC::Char('j') | KC::Down if app.input.is_empty() => { app.list_down(); }
         KC::Char('k') | KC::Up   if app.input.is_empty() => { app.list_up(); }
 
-        // ── Enter — select market or send chat ────────────────────────────────
+        // ── Enter ─────────────────────────────────────────────────────────────
         KC::Enter => {
             if app.active_tab == AppTab::Chat {
-                // Send chat message
                 if !app.input.is_empty() {
                     send_chat(app, backend, clients, event_tx, llm_history).await;
                 }
-            } else if app.active_tab == AppTab::Markets && app.input.is_empty() {
-                // Load chart + orderbook for selected market
-                if let Some(m) = app.selected_market() {
-                    let id = m.id.clone();
+            } else if !app.input.is_empty() {
+                send_chat(app, backend, clients, event_tx, llm_history).await;
+            } else {
+                // Load chart + orderbook from selected market (Markets or Signals)
+                let market_id = match app.active_tab {
+                    AppTab::Markets => {
+                        app.selected_market().map(|m| m.id.clone())
+                    }
+                    AppTab::Signals => {
+                        app.selected_signal().map(|s| s.id_a.clone())
+                    }
+                    AppTab::Portfolio => {
+                        app.portfolio_list.selected()
+                            .and_then(|i| app.portfolio.positions.get(i))
+                            .map(|p| p.market_id.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(id) = market_id {
                     app.selected_market_id = Some(id.clone());
                     app.chart_data.clear();
                     app.orderbook = None;
                     app.status = format!("Loading data for {}", id);
+                    trigger_chart_load(app, clients, event_tx).await;
+                    trigger_orderbook_load(app, clients, event_tx).await;
+                    app.active_tab = AppTab::Chart;
                 }
-                trigger_chart_load(app, clients, event_tx).await;
-                trigger_orderbook_load(app, clients, event_tx).await;
-            } else if !app.input.is_empty() {
-                // Send chat from non-chat tab
-                send_chat(app, backend, clients, event_tx, llm_history).await;
             }
         }
 
@@ -1169,13 +1500,59 @@ async fn handle_key(
             app.status = "Refreshing markets…".to_string();
         }
 
-        // ── Watchlist ─────────────────────────────────────────────────────────
-        KC::Char('w') if app.input.is_empty() => { app.toggle_watchlist(); }
+        // ── Add position ──────────────────────────────────────────────────────
+        KC::Char('n') if app.input.is_empty() => {
+            // Works from Markets tab (picks selected market) or Signals tab (picks primary market)
+            if app.active_tab == AppTab::Signals {
+                if let Some(sig) = app.selected_signal() {
+                    let id  = sig.id_a.clone();
+                    let plat = sig.platform_a.clone();
+                    let title = sig.title.clone();
+                    let price = sig.price_a;
+                    // Synthesise a dummy market entry to reuse start_add_position flow
+                    if let Some(m) = app.markets.iter().find(|m| m.id == id && m.platform == plat) {
+                        let idx = app.markets.iter().position(|m| m.id == id && m.platform == plat).unwrap();
+                        app.market_list.select(Some(idx));
+                        // Temporarily switch to Markets so start_add_position works
+                        let prev_tab = app.active_tab;
+                        app.active_tab = AppTab::Markets;
+                        // Filter might hide it — just inline
+                        drop(m);
+                        app.pos_draft = crate::tui::PosDraft {
+                            market_id: id,
+                            title,
+                            platform: Some(plat),
+                            entry_price: None,
+                            shares: None,
+                            side: None,
+                        };
+                        app.pos_input_mode = true;
+                        app.pos_input_step = PosInputStep::EntryPrice;
+                        app.input.clear();
+                        app.active_tab = prev_tab;
+                        let pct = price * 100.0;
+                        app.status = format!(
+                            "Add position [{:.1}¢] — Enter entry price (¢):", pct
+                        );
+                    } else {
+                        app.start_add_position();
+                    }
+                }
+            } else {
+                app.start_add_position();
+            }
+        }
 
-        // ── Search / filter ───────────────────────────────────────────────────
+        // ── Delete portfolio position ─────────────────────────────────────────
+        KC::Char('d') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
+            app.delete_selected_position();
+        }
+
+        // ── Search ────────────────────────────────────────────────────────────
         KC::Char('/') if app.input.is_empty() => {
             app.search_mode = true;
             app.search.clear();
+            app.active_tab = AppTab::Markets;
         }
         KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
             app.search.clear();
@@ -1201,11 +1578,25 @@ async fn handle_key(
             trigger_chart_load(app, clients, event_tx).await;
         }
 
-        // ── Ask AI about selected market ──────────────────────────────────────
+        // ── Ask AI ────────────────────────────────────────────────────────────
         KC::Char('a') if app.input.is_empty() => {
-            let market_info = app.selected_market()
-                .map(|m| (m.title.clone(), m.id.clone(), m.platform.name().to_lowercase()));
-            if let Some((title, id, plat)) = market_info {
+            let info = match app.active_tab {
+                AppTab::Signals => {
+                    app.selected_signal().map(|s| (
+                        s.title.clone(),
+                        s.id_a.clone(),
+                        s.platform_a.name().to_lowercase(),
+                    ))
+                }
+                _ => {
+                    app.selected_market().map(|m| (
+                        m.title.clone(),
+                        m.id.clone(),
+                        m.platform.name().to_lowercase(),
+                    ))
+                }
+            };
+            if let Some((title, id, plat)) = info {
                 app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
             }
         }
@@ -1214,7 +1605,6 @@ async fn handle_key(
         KC::Char(c) => { app.input.push(c); app.sent_cursor = None; }
         KC::Backspace => { app.input.pop(); }
 
-        // ── Input history ─────────────────────────────────────────────────────
         KC::Up   if !app.input.is_empty() || app.sent_cursor.is_some() => { app.history_up(); }
         KC::Down if app.sent_cursor.is_some() => { app.history_down(); }
 
@@ -1239,12 +1629,11 @@ async fn send_chat(
     app.sent_cursor = None;
     app.active_tab = Tab::Chat;
 
-    // No LLM configured — show helpful error in chat
     let Some(backend_arc) = backend else {
         app.chat_msgs.push(ChatMsg::User(msg));
         app.chat_msgs.push(ChatMsg::Error(
             "No AI backend configured. Run with --backend anthropic (or gemini/openai/ollama) \
-             and the appropriate API key to enable AI features.".to_string(),
+             and the appropriate API key.".to_string(),
         ));
         app.status = "No AI backend configured.".to_string();
         return;
@@ -1264,14 +1653,7 @@ async fn send_chat(
         hist
     });
 
-    // The history is updated in the spawned task; we swap it back after done.
-    // We use a channel to signal completion — the AgentDone event serves that purpose.
-    // Store the handle so we can await it, but since run_tui drives via events, just detach.
-    // NOTE: The history is moved into the task so it won't persist across calls here.
-    // For simplicity, we accept this limitation — a production version would use Arc<Mutex>.
-    let _ = handle; // detach
-
-    // Clear the local history copy since we handed it off
+    let _ = handle; // detach; history is rebuilt per-turn
     *llm_history = Vec::new();
 }
 
@@ -1283,9 +1665,9 @@ async fn trigger_chart_load(
     let Some(id) = &app.selected_market_id else { return };
     let Some(market) = app.markets.iter().find(|m| &m.id == id).cloned() else { return };
 
-    let clients_c  = clients.clone();
-    let tx         = event_tx.clone();
-    let interval   = app.chart_interval;
+    let clients_c = clients.clone();
+    let tx        = event_tx.clone();
+    let interval  = app.chart_interval;
 
     tokio::spawn(async move {
         agent::refresh_price_history(clients_c, market, interval, tx).await;

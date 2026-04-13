@@ -38,3 +38,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # JWT signing for Gemini Vertex AI service-account auth
 jsonwebtoken = "9"
+
+# Home-directory resolution (portfolio persistence)
+dirs-next = "2"

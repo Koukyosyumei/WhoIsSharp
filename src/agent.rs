@@ -9,6 +9,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::llm::{LlmBackend, LlmMessage, MessageContent, MessageRole, ToolResult};
+use crate::signals::{self, Signal};
 use crate::tools::{self, MarketClients};
 
 // ─── Events sent to the TUI ──────────────────────────────────────────────────
@@ -23,6 +24,9 @@ pub enum AppEvent {
     AgentTextChunk(String),
     AgentDone,
     AgentError(String),
+
+    // ── Signal computation ────────────────────────────────────────────────────
+    SignalsComputed(Vec<Signal>),
 
     // ── Market data refresh ───────────────────────────────────────────────────
     MarketsLoaded(Vec<crate::markets::Market>),
@@ -232,7 +236,11 @@ pub async fn refresh_markets(
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Compute signals synchronously before emitting events
+    let computed_signals = signals::compute_signals(&all);
+
     let _ = event_tx.send(AppEvent::MarketsLoaded(all));
+    let _ = event_tx.send(AppEvent::SignalsComputed(computed_signals));
     let _ = event_tx.send(AppEvent::RefreshDone);
 }
 

@@ -12,6 +12,8 @@ mod agent;
 mod config;
 mod llm;
 mod markets;
+mod portfolio;
+mod signals;
 mod tools;
 mod tui;
 
