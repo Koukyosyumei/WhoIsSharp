@@ -346,11 +346,18 @@ impl App {
     }
 
     pub fn start_add_position(&mut self) {
-        if let Some(m) = self.selected_market() {
+        let market_info = self.selected_market().map(|m| {
+            (m.id.clone(), m.title.clone(), m.platform.clone(), m.yes_price)
+        });
+        if let Some((id, title, platform, yes_price)) = market_info {
+            let pct = yes_price * 100.0;
+            let status = format!(
+                "Add position: {} [{:.1}¢] — Enter entry price (¢):", title, pct
+            );
             self.pos_draft = PosDraft {
-                market_id: m.id.clone(),
-                title:     m.title.clone(),
-                platform:  Some(m.platform.clone()),
+                market_id: id,
+                title,
+                platform:  Some(platform),
                 entry_price: None,
                 shares:    None,
                 side:      None,
@@ -358,11 +365,7 @@ impl App {
             self.pos_input_mode = true;
             self.pos_input_step = PosInputStep::EntryPrice;
             self.input.clear();
-            let pct = m.yes_price * 100.0;
-            self.status = format!(
-                "Add position: {} [{:.1}¢] — Enter entry price (¢):",
-                m.title, pct
-            );
+            self.status = status;
         } else {
             self.status = "Select a market first.".to_string();
         }
@@ -1264,6 +1267,7 @@ pub async fn run_tui(
                         }
                         app.update_portfolio_marks();
                     }
+                    AppEvent::EventsLoaded(_) => {}  // Events tab removed; ignore
                     AppEvent::SignalsComputed(sigs) => {
                         app.signals = sigs;
                         if app.signal_list.selected().is_none() && !app.signals.is_empty() {
