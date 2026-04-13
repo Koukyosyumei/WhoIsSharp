@@ -35,14 +35,64 @@ impl KalshiClient {
         limit: u32,
         search: Option<&str>,
     ) -> Result<Vec<Market>> {
-        let mut url = format!(
-            "{}/markets?limit={}&status=open",
-            KALSHI_BASE, limit
-        );
+        // When searching by keyword, map to event_ticker filter directly.
         if let Some(q) = search {
-            url.push_str(&format!("&event_ticker={}", q));
+            return self.fetch_markets_for_event(q, limit).await;
         }
 
+        // The Kalshi /markets?status=open endpoint currently returns only MVE
+        // (multi-variate event) parlay markets, not regular prediction markets.
+        // Real markets must be fetched per-event via the /events endpoint.
+        self.fetch_markets_via_events(limit).await
+    }
+
+    /// Fetch real prediction markets by going through the events list first.
+    async fn fetch_markets_via_events(&self, limit: u32) -> Result<Vec<Market>> {
+        // Fetch events — these are the real prediction categories.
+        let events_url = format!("{}/events?limit=50&status=open", KALSHI_BASE);
+        let events_resp = self
+            .http
+            .get(&events_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("Kalshi /events (for markets) request failed")?;
+
+        if !events_resp.status().is_success() {
+            anyhow::bail!("Kalshi /events error {}", events_resp.status());
+        }
+
+        let events: KalshiEventsResponse = events_resp
+            .json()
+            .await
+            .context("Failed to parse Kalshi /events")?;
+
+        // For each event, fetch its markets. Stop once we have enough.
+        let per_event = ((limit / events.events.len().max(1) as u32) + 1).max(5);
+        let mut all: Vec<Market> = Vec::new();
+
+        for event in &events.events {
+            if all.len() >= limit as usize {
+                break;
+            }
+            if let Ok(mut mkts) = self
+                .fetch_markets_for_event(&event.event_ticker, per_event)
+                .await
+            {
+                all.append(&mut mkts);
+            }
+        }
+
+        all.truncate(limit as usize);
+        Ok(all)
+    }
+
+    /// Fetch markets belonging to a specific event_ticker.
+    async fn fetch_markets_for_event(&self, event_ticker: &str, limit: u32) -> Result<Vec<Market>> {
+        let url = format!(
+            "{}/markets?limit={}&status=open&event_ticker={}",
+            KALSHI_BASE, limit, event_ticker
+        );
         let resp = self
             .http
             .get(&url)
@@ -261,6 +311,8 @@ struct KalshiEvent {
 
 #[derive(Deserialize, Debug)]
 struct KalshiOrderbookResponse {
+    // The Kalshi v2 API wraps orderbook data under the key "orderbook_fp".
+    #[serde(rename = "orderbook_fp")]
     orderbook: KalshiOrderbookData,
 }
 

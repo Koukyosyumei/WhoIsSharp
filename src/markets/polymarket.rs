@@ -106,7 +106,7 @@ impl PolymarketClient {
     // ─── CLOB API ─────────────────────────────────────────────────────────────
 
     pub async fn fetch_orderbook(&self, token_id: &str) -> Result<Orderbook> {
-        let url = format!("{}/order-book?token_id={}", CLOB_BASE, token_id);
+        let url = format!("{}/book?token_id={}", CLOB_BASE, token_id);
 
         let resp = self
             .http
