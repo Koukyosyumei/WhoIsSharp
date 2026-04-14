@@ -2105,6 +2105,11 @@ pub async fn run_tui(
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+                // Refresh chart + orderbook for whichever market is selected
+                if app.selected_market_id.is_some() {
+                    trigger_chart_load(&app, &clients, &event_tx).await;
+                    trigger_orderbook_load(&app, &clients, &event_tx).await;
+                }
                 if app.refresh_secs > 0 {
                     app.next_refresh_at = Some(
                         std::time::Instant::now()
@@ -2423,8 +2428,26 @@ async fn handle_key(
             trigger_trades_load(app, clients, event_tx).await;
         }
 
-        KC::Tab => { app.active_tab = app.active_tab.next(); }
-        KC::BackTab => { app.active_tab = app.active_tab.prev(); }
+        KC::Tab => {
+            app.active_tab = app.active_tab.next();
+            match app.active_tab {
+                AppTab::Chart     => { trigger_chart_load(app, clients, event_tx).await; }
+                AppTab::Orderbook => { trigger_orderbook_load(app, clients, event_tx).await; }
+                AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
+                AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
+                _ => {}
+            }
+        }
+        KC::BackTab => {
+            app.active_tab = app.active_tab.prev();
+            match app.active_tab {
+                AppTab::Chart     => { trigger_chart_load(app, clients, event_tx).await; }
+                AppTab::Orderbook => { trigger_orderbook_load(app, clients, event_tx).await; }
+                AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
+                AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
+                _ => {}
+            }
+        }
 
         // ── Navigation ────────────────────────────────────────────────────────
         KC::Char('j') | KC::Down if app.input.is_empty() => { app.list_down(); }
@@ -2477,7 +2500,12 @@ async fn handle_key(
             let clients_c = clients.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
-            app.status = "Refreshing markets…".to_string();
+            // Also refresh chart and orderbook for the selected market
+            if app.selected_market_id.is_some() {
+                trigger_chart_load(app, clients, event_tx).await;
+                trigger_orderbook_load(app, clients, event_tx).await;
+            }
+            app.status = "Refreshing…".to_string();
         }
 
         // ── Add position ──────────────────────────────────────────────────────
