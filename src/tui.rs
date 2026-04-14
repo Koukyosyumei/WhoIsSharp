@@ -1138,9 +1138,7 @@ fn render_signal_quickguide(f: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" navigate   "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::styled("  Enter", Style::default().fg(Color::Cyan)),
             Span::raw(" open market   "),
             Span::styled("@", Style::default().fg(Color::Cyan)),
             Span::raw(" AI analysis   "),
@@ -2080,7 +2078,7 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Press 'a' on any market to pre-fill an analysis prompt.",
+            "  Press @ on any market to pre-fill an analysis prompt.",
             Style::default().fg(Color::DarkGray),
         )));
     }
