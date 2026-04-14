@@ -100,25 +100,53 @@ cargo build --release
 
 ## Key bindings
 
+**Navigation**
+
 | Key | Action |
 |-----|--------|
 | `1`–`9` | Switch tabs directly |
 | `Tab` / `Shift+Tab` | Cycle tabs |
 | `j` / `k` | Navigate list / scroll |
-| `Enter` | Select market (loads chart + book) |
-| `r` | Refresh market data |
-| `a` | Pre-fill AI analysis prompt |
-| `n` | Add portfolio position |
-| `w` | Toggle watchlist |
-| `p` | Cycle platform filter (All → PM → KL) |
-| `c` | Cycle chart interval |
-| `x` | Dismiss signal |
-| `t` | Set take-profit / stop-loss |
-| `L` | Re-run LLM pair matching (Pairs tab) |
-| `M` | Export Markdown research report |
-| `!note <text>` | Append timestamped note to research log |
-| `?` | Help overlay |
-| `q` / `Ctrl+C` | Quit |
+| `Enter` | Select market (loads chart + book) / send chat |
+| `Ctrl+C` | Quit (or cancel any active input mode) |
+
+**Direct shortcuts**
+
+| Key | Action |
+|-----|--------|
+| `^` | Refresh market data |
+| `@` | Pre-fill AI analysis prompt for selected market |
+| `?` | Toggle help overlay |
+| `[` / `]` | Lower / raise threshold (SmartMoney & Pairs tabs) |
+
+**Slash commands** — press `/`, type a command, press `Enter`
+
+| Command | Action |
+|---------|--------|
+| `/refresh` or `/r` | Refresh markets + chart + orderbook |
+| `/platform` or `/p` | Cycle platform filter (All → PM → KL) |
+| `/chart` or `/c` | Cycle chart interval (1h → 6h → 1d → 1w → 1m) |
+| `/sort` or `/s` | Cycle sort mode (~50% → Vol → End date → A-Z) |
+| `/watchlist` or `/w` | Toggle watchlist for selected market |
+| `/wf` | Toggle watchlist-only filter |
+| `/alert` or `/e` | Edit price alert thresholds |
+| `/add` or `/n` | Add portfolio position (multi-step) |
+| `/targets` or `/t` | Set take-profit / stop-loss |
+| `/delete` or `/d` | Delete selected position |
+| `/dismiss` or `/x` | Dismiss signal for this session |
+| `/analyze` or `/a` | Pre-fill AI analysis prompt |
+| `/kelly` or `/k` | Open Kelly position-size calculator |
+| `/risk` or `/v` | Toggle risk/exposure view (Portfolio tab) |
+| `/pairs` or `/l` | Re-run LLM pair matching (Pairs tab) |
+| `/lower` / `/raise` | Adjust threshold (SmartMoney / Pairs tab) |
+| `/export` or `/csv` | Export current tab to CSV |
+| `/report` or `/m` | Export Markdown research report |
+| `/help` or `/?` | Toggle help overlay |
+| `/<search term>` | Unrecognised input → filter market list |
+
+| Special | Action |
+|---------|--------|
+| `!note <text>` | Append timestamped note to research log (no AI call) |
 
 ---
 

@@ -169,7 +169,7 @@ Default model: `gemini-2.5-flash`. The backend uses the Vertex AI endpoint with 
   > _
 ```
 
-The input box is always active. Type to send a message to the AI. Prefix with `!note` to log a research note without sending to the AI. Most navigation keys (`j`, `k`, `r`, `a`, `w`, etc.) only fire when the input is empty.
+The input box is always active. Type to send a message to the AI. Prefix with `!note` to log a research note without sending to the AI. Press `/` to open the command bar and type a slash command (e.g. `/refresh`, `/analyze`). Direct shortcuts `^`, `@`, `?`, `[`, `]` fire when the input box is empty.
 
 ---
 
@@ -188,7 +188,7 @@ The main alert dashboard. Signals are recomputed automatically after every marke
 - Gap magnitude and actionable hint
 - Orderbook imbalance summary if available
 
-**Navigation:** `j`/`k` to move, `Enter` to navigate to the signal's primary market (switches to Chart tab), `n` to add a position from a signal, `x` to dismiss the signal for this session.
+**Navigation:** `j`/`k` to move, `Enter` to navigate to the signal's primary market (switches to Chart tab), `@` to pre-fill an AI analysis prompt, `/add` to add a position, `/dismiss` to hide the signal for this session.
 
 ---
 
@@ -206,12 +206,13 @@ Full market list from Polymarket and Kalshi combined.
 - Truncated title
 
 **Controls:**
-- `p` — cycle platform filter: All → PM → KL → All
-- `s` — cycle sort mode: ~50% (closest to 50 first) → Volume → End date → A-Z
-- `w` — toggle watchlist for selected market
+- `/platform` or `/p` — cycle platform filter: All → PM → KL → All
+- `/sort` or `/s` — cycle sort mode: ~50% (closest to 50 first) → Volume → End date → A-Z
+- `/watchlist` or `/w` — toggle watchlist for selected market
+- `@` — pre-fill AI analysis prompt for selected market
 - `Enter` — load chart + orderbook for selected market, switch to Chart tab
-- `/` — enter search/filter mode (type to filter by title)
-- `Esc` — clear search
+- `/` then a search term — filter market list by title
+- `Esc` — clear search / cancel command bar
 
 ---
 
@@ -225,8 +226,8 @@ Price history chart for the selected market.
 - Chart interval shown in status bar
 
 **Controls:**
-- `c` — cycle chart interval: 1h → 6h → 1d → 1w → 1m
-- `r` — refresh chart data
+- `/chart` or `/c` — cycle chart interval: 1h → 6h → 1d → 1w → 1m
+- `^` — refresh chart data
 
 **Chart intervals:**
 
@@ -276,17 +277,18 @@ Position tracking and risk management.
 - Take-profit and stop-loss levels with 🎯/🛑 alert icons when triggered
 
 **Controls:**
-- `n` — add a new position for the selected market (multi-step input flow)
-- `t` — set take-profit / stop-loss for the selected position (2-step flow)
-- `d` — delete selected position
+- `/add` or `/n` — add a new position for the selected market (multi-step input flow)
+- `/targets` or `/t` — set take-profit / stop-loss for the selected position (2-step flow)
+- `/delete` or `/d` — delete selected position
+- `/risk` or `/v` — toggle risk/exposure view
 
-**Adding a position** (`n` key):
+**Adding a position** (`/add`):
 1. Enter entry price in cents (e.g., `68` for 68¢)
 2. Enter number of shares
 3. Enter side: `y` for YES, `n` for NO
 4. Optionally enter a research note, or press `Enter` to skip
 
-**Setting targets** (`t` key):
+**Setting targets** (`/targets`):
 1. Enter take-profit price in cents, or `Enter` to skip
 2. Enter stop-loss price in cents, or `Enter` to skip
 
@@ -356,7 +358,7 @@ Cross-platform market matching and arbitrage analysis.
 
 1. **Jaccard matching** (always on): Computed automatically on every market load. Matches markets by word-set overlap on titles, threshold 0.35. Fast, local, no API calls.
 
-2. **LLM matching** (on demand): Triggered when you switch to the Pairs tab (or press `9` or `L`). Pre-filters candidates with a lower Jaccard threshold (0.15), then sends batches of up to 25 pairs to the LLM for semantic assessment. The LLM returns `match_type`, `res_risk`, `res_risk_note`, and `confidence` for each pair. Falls back to Jaccard results if the LLM call fails.
+2. **LLM matching** (on demand): Triggered when you switch to the Pairs tab (or press `9` or type `/pairs`). Pre-filters candidates with a lower Jaccard threshold (0.15), then sends batches of up to 25 pairs to the LLM for semantic assessment. The LLM returns `match_type`, `res_risk`, `res_risk_note`, and `confidence` for each pair. Falls back to Jaccard results if the LLM call fails.
 
 **Match types:**
 
@@ -409,14 +411,15 @@ This is an upper bound — real fills will be limited by orderbook depth, not to
 
 **Controls:**
 - `j`/`k` — navigate pairs list
-- `9` or `L` — trigger LLM re-matching
+- `/pairs` or `/l` — trigger LLM re-matching
+- `[` / `]` — lower / raise Jaccard threshold
 - `Enter` — open the Polymarket market in Chart tab
 
 ---
 
 ## Key Bindings
 
-### Global
+### Navigation (always available)
 
 | Key | Action |
 |-----|--------|
@@ -425,51 +428,51 @@ This is an upper bound — real fills will be limited by orderbook depth, not to
 | `Shift+Tab` | Cycle to previous tab |
 | `j` / `↓` | Move selection down / scroll down |
 | `k` / `↑` | Move selection up / scroll up |
-| `r` | Refresh market data (+ chart + book if market selected) |
+| `Enter` | Select market (loads chart + book) / send chat message |
+| `Ctrl+C` | Quit (or cancel any active input mode) |
+
+### Direct shortcuts (fire when input is empty)
+
+| Key | Action |
+|-----|--------|
+| `^` | Refresh markets + chart + orderbook |
+| `@` | Pre-fill AI analysis prompt for selected market |
 | `?` | Toggle help overlay |
-| `q` | Quit (when input is empty) |
-| `Ctrl+C` | Quit (or clear input if non-empty) |
+| `[` | Lower threshold by 5% (SmartMoney / Pairs tab) |
+| `]` | Raise threshold by 5% (SmartMoney / Pairs tab) |
 
-### Market-specific
+### Slash commands — press `/`, type, press `Enter`
 
-| Key | Context | Action |
-|-----|---------|--------|
-| `Enter` | Markets / Signals / Portfolio | Load chart + book for selected market |
-| `Enter` | Chat | Send message |
-| `p` | Any | Cycle platform filter (All → PM → KL → All) |
-| `c` | Any | Cycle chart interval (1h → 6h → 1d → 1w → 1m) |
-| `s` | Markets | Cycle sort mode (~50% → Vol → End → A-Z) |
-| `w` | Markets / Signals | Toggle watchlist for selected market |
-| `a` | Any | Pre-fill AI analysis prompt for selected market |
-| `/` | Any | Enter search mode (Markets tab) |
-| `Esc` | Search mode | Clear search filter |
+Unrecognised input is used as a market search/filter term.
 
-### Portfolio
+| Command | Action |
+|---------|--------|
+| `/refresh` or `/r` | Refresh markets + chart + orderbook |
+| `/platform` or `/p` | Cycle platform filter: All → PM → KL → All |
+| `/chart` or `/c` | Cycle chart interval: 1h → 6h → 1d → 1w → 1m |
+| `/sort` or `/s` | Cycle sort mode: ~50% → Vol → End date → A-Z |
+| `/watchlist` or `/w` | Toggle watchlist for selected market |
+| `/wf` | Toggle watchlist-only filter |
+| `/alert` or `/e` | Edit price alert thresholds (above / below) |
+| `/add` or `/n` | Add new position (multi-step) |
+| `/targets` or `/t` | Set take-profit / stop-loss for selected position |
+| `/delete` or `/d` | Delete selected position (Portfolio tab) |
+| `/dismiss` or `/x` | Dismiss selected signal for this session |
+| `/analyze` or `/a` | Pre-fill AI analysis prompt for selected market |
+| `/kelly` or `/k` | Open Kelly position-size calculator |
+| `/risk` or `/v` | Toggle risk/exposure view (Portfolio tab) |
+| `/pairs` or `/l` | Re-run LLM pair matching (Pairs tab) |
+| `/lower` | Lower threshold by 5% (SmartMoney / Pairs tab) |
+| `/raise` | Raise threshold by 5% (SmartMoney / Pairs tab) |
+| `/export` or `/csv` | Export current tab to CSV |
+| `/report` or `/m` | Export Markdown research report |
+| `/help` or `/?` | Toggle help overlay |
 
-| Key | Action |
-|-----|--------|
-| `n` | Add new position (multi-step) |
-| `t` | Set take-profit / stop-loss for selected position |
-| `d` | Delete selected position |
+### Special input
 
-### Signals
-
-| Key | Action |
-|-----|--------|
-| `x` | Dismiss selected signal for this session |
-
-### Pairs tab
-
-| Key | Action |
-|-----|--------|
-| `L` | Re-run LLM pair matching |
-
-### Research
-
-| Key | Action |
-|-----|--------|
-| `M` | Export Markdown research report to `~/.whoissharp/reports/` |
-| `!note <text>` | Append timestamped note (no AI call) |
+| Input | Action |
+|-------|--------|
+| `!note <text>` | Append timestamped note to `~/.whoissharp/notes.md` (no AI call) |
 
 ---
 
