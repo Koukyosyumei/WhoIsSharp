@@ -2513,15 +2513,15 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
 
     let header = Line::from(vec![
         Span::styled(
-            format!("  {:<22} {:>8} {:>6} {:>5} {:>9} {:>10} {:>9}",
-                "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Suspicion"),
+            format!("  {:<22} {:>8} {:>6} {:>5} {:>9} {:>10} {:>6} {:>9}",
+                "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Vol%", "Suspicion"),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
 
     let mut items: Vec<ListItem> = vec![
         ListItem::new(header),
-        ListItem::new(Line::from(Span::styled("  ".to_string() + &"─".repeat(76), Style::default().fg(Color::DarkGray)))),
+        ListItem::new(Line::from(Span::styled("  ".to_string() + &"─".repeat(84), Style::default().fg(Color::DarkGray)))),
     ];
 
     for w in &app.sm_wallets {
@@ -2540,10 +2540,28 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
             Color::White
         };
 
-        let flag = if w.flagged { "⚠ " } else { "  " };
+        // Fresh wallet indicator: 🆕 if fresh, age in days otherwise
+        let age_str = if w.is_fresh {
+            "NEW".to_string()
+        } else {
+            w.wallet_age_days
+                .map(|d| if d >= 365.0 { format!("{:.0}y", d / 365.0) } else { format!("{:.0}d", d) })
+                .unwrap_or_else(|| "?".to_string())
+        };
+
+        let vol_pct_str = if w.volume_impact > 0.0 {
+            format!("{:.1}%", w.volume_impact * 100.0)
+        } else {
+            "—".to_string()
+        };
+
+        let flags = format!("{}{} ",
+            if w.is_fresh { "N" } else { " " },
+            if w.flagged  { "⚠" } else { " " },
+        );
 
         let line = Line::from(vec![
-            Span::styled(flag, Style::default().fg(Color::Yellow)),
+            Span::styled(flags, Style::default().fg(Color::Yellow)),
             Span::styled(format!("{:<22}", name), Style::default().fg(suspicion_color).bold()),
             Span::raw(format!(" {:>8.0}", w.market_size)),
             Span::raw(format!(" {:>6}", w.n_positions)),
@@ -2554,8 +2572,14 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
                 else { Color::White }
             )),
             Span::raw(format!(" {:>10}", alpha_str)),
+            Span::styled(format!(" {:>6}", vol_pct_str), Style::default().fg(
+                if w.volume_impact > 0.05 { Color::Red }
+                else if w.volume_impact > 0.02 { Color::Yellow }
+                else { Color::DarkGray }
+            )),
             Span::styled(format!(" {:>8.0}/100", w.suspicion), Style::default().fg(suspicion_color)),
         ]);
+        let _ = age_str; // shown via the "N" flag; could add a tooltip later
         items.push(ListItem::new(line));
     }
 
@@ -4432,12 +4456,13 @@ async fn trigger_smart_money_load(
     let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
     if market.platform != Platform::Polymarket { return; }
 
-    let clients_c = clients.clone();
-    let tx        = event_tx.clone();
-    let market_id = id.clone();
+    let clients_c     = clients.clone();
+    let tx            = event_tx.clone();
+    let market_id     = id.clone();
+    let market_volume = market.volume;
 
     tokio::spawn(async move {
-        agent::refresh_smart_money(clients_c, market_id, tx).await;
+        agent::refresh_smart_money(clients_c, market_id, market_volume, tx).await;
     });
 }
 

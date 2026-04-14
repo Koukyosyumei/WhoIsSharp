@@ -202,21 +202,36 @@ impl PolymarketClient {
         self.fetch_trades_from_url(&url).await
     }
 
-    /// Fetch recent activity for a specific wallet address.
+    /// Fetch recent TRADE activity for a specific wallet address.
     ///
-    /// Uses `/activity?user=` (not `/trades?user=`): the trades endpoint omits
-    /// the `type` field entirely, so REDEEM events are invisible there.
-    /// The activity endpoint returns both TRADE and REDEEM rows with `type`
-    /// populated correctly.
+    /// Uses `/activity?user=&type=TRADE`: the `type` parameter is required by
+    /// the data-api; omitting it returns HTTP 400.
     pub async fn fetch_user_trades(
         &self,
         wallet: &str,
         limit: u32,
     ) -> Result<Vec<PolyTrade>> {
-        // The data-api /activity endpoint requires &type=TRADE; omitting it
-        // causes HTTP 400 "required query parameter".
         let url = format!(
             "{}/activity?user={}&limit={}&type=TRADE",
+            DATA_BASE,
+            urlencoding::encode(wallet),
+            limit,
+        );
+        self.fetch_trades_from_url(&url).await
+    }
+
+    /// Fetch REDEEM (winning-payout) events for a wallet.
+    ///
+    /// REDEEMs are separate from TRADEs in the activity endpoint and must be
+    /// fetched with `type=REDEEM`.  Merging both gives a complete activity
+    /// picture needed for accurate win-rate and alpha-entry calculations.
+    pub async fn fetch_user_redeems(
+        &self,
+        wallet: &str,
+        limit: u32,
+    ) -> Result<Vec<PolyTrade>> {
+        let url = format!(
+            "{}/activity?user={}&limit={}&type=REDEEM",
             DATA_BASE,
             urlencoding::encode(wallet),
             limit,
