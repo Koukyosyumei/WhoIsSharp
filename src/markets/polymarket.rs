@@ -247,13 +247,11 @@ impl PolymarketClient {
 
     /// Fetch YES-price history.  `market_id` is the token_id (YES CLOB token).
     ///
-    /// The CLOB endpoint requires EITHER (`fidelity` + `startTs` + `endTs`) OR an
-    /// `interval` string.  We use the three-parameter form because:
-    ///   - `interval` alone returns different granularity than expected and can be empty.
-    ///   - `fidelity` alone (without timestamps) causes HTTP 400 — range is required.
-    ///
-    /// Keep `fidelity` ≤ 60 (hourly or finer).  `fidelity=1440` (daily) combined
-    /// with a long date range triggers HTTP 400 for many markets.
+    /// Strategy (two attempts):
+    /// 1. `fidelity + startTs + endTs` — works for most markets with CLOB history.
+    /// 2. `interval=max` fallback — some markets reject timestamp bounds (HTTP 400)
+    ///    but return data when asked for their full history via the interval string.
+    ///    If both return 400, the market simply has no CLOB price history.
     pub async fn fetch_price_history(
         &self,
         market_id: &str,
@@ -261,13 +259,37 @@ impl PolymarketClient {
         start_ts:  i64,
         end_ts:    i64,
     ) -> Result<Vec<Candle>> {
-        let url = format!(
+        let primary_url = format!(
             "{}/prices-history?market={}&fidelity={}&startTs={}&endTs={}",
             CLOB_BASE, market_id, fidelity, start_ts, end_ts
         );
 
-        let body = self.cached_get(&url, CACHE_TTL_HISTORY).await
-            .context("Polymarket /prices-history request failed")?;
+        let body = match self.cached_get(&primary_url, CACHE_TTL_HISTORY).await {
+            Ok(b) => b,
+            Err(primary_err) => {
+                // If we got a 400, try the interval=max fallback.
+                // Any other error (network, 5xx, …) is propagated as-is.
+                let err_str = format!("{:#}", primary_err);
+                if !err_str.contains("HTTP 400") {
+                    return Err(primary_err.context("Polymarket /prices-history request failed"));
+                }
+
+                let fallback_url = format!(
+                    "{}/prices-history?market={}&interval=max",
+                    CLOB_BASE, market_id
+                );
+                match self.cached_get(&fallback_url, CACHE_TTL_HISTORY).await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        // Both attempts failed — market has no CLOB price history.
+                        anyhow::bail!(
+                            "No CLOB price history for this market (tried fidelity+range and interval=max)"
+                        );
+                    }
+                }
+            }
+        };
+
         let raw: PricesHistoryResponse =
             serde_json::from_str(&body).context("Failed to parse Polymarket /prices-history")?;
 
