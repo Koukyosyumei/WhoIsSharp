@@ -3964,9 +3964,7 @@ async fn dispatch_slash_command(
                     let plat  = sig.platform_a.clone();
                     let title = sig.title.clone();
                     let price = sig.price_a;
-                    if let Some(_m) = app.markets.iter().find(|m| m.id == id && m.platform == plat) {
-                        let idx = app.markets.iter().position(|m| m.id == id && m.platform == plat).unwrap();
-                        app.market_list.select(Some(idx));
+                    if app.markets.iter().any(|m| m.id == id && m.platform == plat) {
                         let prev_tab = app.active_tab;
                         app.active_tab = AppTab::Markets;
                         app.pos_draft = PosDraft {
@@ -4145,14 +4143,26 @@ async fn handle_key(
     use crossterm::event::KeyCode as KC;
     type AppTab = Tab;
 
-    // Ctrl+C always quits (or clears input)
+    // Ctrl+C always quits (or cancels any active input mode)
     if key.modifiers == KeyModifiers::CONTROL && key.code == KC::Char('c') {
-        if !app.input.is_empty() || app.pos_input_mode {
+        let any_mode = !app.input.is_empty()
+            || app.search_mode
+            || app.pos_input_mode
+            || app.alert_edit_mode
+            || app.target_input_mode
+            || app.kelly_mode;
+        if any_mode {
             app.input.clear();
+            app.search.clear();
             app.sent_cursor = None;
-            app.pos_input_mode = false;
-            app.pos_input_step = PosInputStep::EntryPrice;
-            app.pos_draft = PosDraft::default();
+            app.search_mode       = false;
+            app.pos_input_mode    = false;
+            app.alert_edit_mode   = false;
+            app.target_input_mode = false;
+            app.kelly_mode        = false;
+            app.pos_input_step    = PosInputStep::EntryPrice;
+            app.alert_edit_step   = AlertEditStep::default();
+            app.pos_draft         = PosDraft::default();
             app.status = "Cancelled.".to_string();
             return false;
         }
