@@ -3050,13 +3050,9 @@ async fn handle_key(
 /// always knows which market is on screen and can answer follow-ups like
 /// "further analyze the above" without asking for a market ID.
 fn build_context_prefix(app: &App) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    let mut sections: Vec<String> = Vec::new();
 
-    // Active tab
-    let tab_name = TAB_NAMES[app.active_tab as usize];
-    lines.push(format!("Active tab: {}", tab_name));
-
-    // Selected market details
+    // ── Selected market details ───────────────────────────────────────────────
     if let Some(ref sel_id) = app.selected_market_id {
         if let Some(m) = app.markets.iter().find(|m| &m.id == sel_id) {
             let plat = match m.platform {
@@ -3066,71 +3062,193 @@ fn build_context_prefix(app: &App) -> String {
             let yes_pct = m.yes_price * 100.0;
             let no_pct  = (1.0 - m.yes_price) * 100.0;
 
-            let vol_str = match m.volume {
-                Some(v) if v >= 1_000_000.0 => format!("${:.1}M", v / 1_000_000.0),
-                Some(v) if v >= 1_000.0     => format!("${:.0}K", v / 1_000.0),
-                Some(v)                     => format!("${:.0}", v),
-                None                        => "n/a".to_string(),
+            let fmt_money = |v: f64| -> String {
+                if v >= 1_000_000.0 { format!("${:.2}M", v / 1_000_000.0) }
+                else if v >= 1_000.0 { format!("${:.1}K", v / 1_000.0) }
+                else { format!("${:.0}", v) }
             };
-            let liq_str = match m.liquidity {
-                Some(l) if l >= 1_000.0 => format!("${:.0}K", l / 1_000.0),
-                Some(l)                 => format!("${:.0}", l),
-                None                    => "n/a".to_string(),
+            let vol_str = m.volume.map(|v| fmt_money(v)).unwrap_or_else(|| "n/a".to_string());
+            let liq_str = m.liquidity.map(|l| fmt_money(l)).unwrap_or_else(|| "n/a".to_string());
+            let vol_liq_ratio = match (m.volume, m.liquidity) {
+                (Some(v), Some(l)) if l > 0.0 => format!("{:.1}×", v / l),
+                _ => "n/a".to_string(),
             };
 
-            let mut mkt = format!(
-                "Selected market: \"{title}\" ({plat})\n\
-                 \x20 Market ID: {id}  YES: {yes:.1}%  NO: {no:.1}%  Volume: {vol}  Liquidity: {liq}",
-                title = m.title,
-                plat  = plat,
-                id    = m.id,
-                yes   = yes_pct,
-                no    = no_pct,
-                vol   = vol_str,
-                liq   = liq_str,
-            );
+            let mut mkt_lines = vec![
+                format!("Title   : {}", m.title),
+                format!("Platform: {}  |  Market ID: {}", plat, m.id),
+                format!("Price   : YES {yes:.1}%  /  NO {no:.1}%  (implied odds YES {yes_o:.2}:1)",
+                    yes = yes_pct, no = no_pct, yes_o = no_pct / yes_pct.max(0.01)),
+                format!("Volume  : {}  |  Liquidity: {}  |  Vol/Liq: {}", vol_str, liq_str, vol_liq_ratio),
+            ];
             if let Some(ref tok) = m.token_id {
-                mkt.push_str(&format!("\n\x20 Token ID (Polymarket CLOB): {}", tok));
+                mkt_lines.push(format!("Token ID (CLOB): {}", tok));
             }
             if let Some(ref end) = m.end_date {
-                mkt.push_str(&format!("\n\x20 End date: {}", &end[..end.len().min(10)]));
+                let end_str = &end[..end.len().min(10)];
+                // Days remaining
+                if let Ok(end_date) = chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d") {
+                    let today = chrono::Local::now().date_naive();
+                    let days = (end_date - today).num_days();
+                    mkt_lines.push(format!("Resolves: {}  ({} days remaining)", end_str, days));
+                } else {
+                    mkt_lines.push(format!("Resolves: {}", end_str));
+                }
             }
             if let Some(ref cat) = m.category {
-                mkt.push_str(&format!("  Category: {}", cat));
+                mkt_lines.push(format!("Category: {}", cat));
             }
-            lines.push(mkt);
+            sections.push(format!("SELECTED MARKET\n{}", mkt_lines.join("\n")));
         }
     }
 
-    // Live orderbook summary if loaded
-    if let Some(ref ob) = app.orderbook {
-        if let (Some(bid), Some(ask)) = (ob.bids.first(), ob.asks.first()) {
-            let spread_pp = (ask.price - bid.price) * 100.0;
-            lines.push(format!(
-                "Live orderbook: best bid {:.1}%  best ask {:.1}%  spread {:.1}pp",
-                bid.price * 100.0,
-                ask.price * 100.0,
-                spread_pp,
-            ));
-        }
-    }
+    // ── Price history (candles) ───────────────────────────────────────────────
+    if !app.chart_candles.is_empty() {
+        let prices: Vec<f64> = app.chart_candles.iter().map(|c| c.close).collect();
+        let n = prices.len();
+        let current = prices[n - 1];
+        let oldest  = prices[0];
 
-    // Portfolio summary
-    let n = app.portfolio.positions.len();
-    if n > 0 {
-        let pnl = app.portfolio.total_pnl();
-        lines.push(format!(
-            "Portfolio: {} open position(s), total unrealised PnL: {}{:.2}",
-            n,
-            if pnl >= 0.0 { "+" } else { "" },
-            pnl,
+        // Compute simple moving averages
+        let ma7 = if n >= 7  { prices[n-7..].iter().sum::<f64>() / 7.0  } else { current };
+        let ma20 = if n >= 20 { prices[n-20..].iter().sum::<f64>() / 20.0 } else { current };
+        let pct_change = (current - oldest) / oldest.max(0.001) * 100.0;
+
+        // Momentum: last 5 candles vs prior 5 candles
+        let recent_avg = if n >= 5  { prices[n-5..].iter().sum::<f64>() / 5.0 } else { current };
+        let prior_avg  = if n >= 10 { prices[n-10..n-5].iter().sum::<f64>() / 5.0 } else { oldest };
+        let momentum_pp = (recent_avg - prior_avg) * 100.0;
+
+        // High/low range
+        let lo = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Volume if available
+        let vol_info = {
+            let vols: Vec<f64> = app.chart_candles.iter().filter_map(|c| c.volume).collect();
+            if vols.len() >= 2 {
+                let recent_vol = vols[vols.len()-1];
+                let avg_vol = vols.iter().sum::<f64>() / vols.len() as f64;
+                format!("  |  Last candle vol: {:.0}  (avg: {:.0}, ratio: {:.1}×)",
+                    recent_vol, avg_vol, recent_vol / avg_vol.max(1.0))
+            } else {
+                String::new()
+            }
+        };
+
+        let trend_label = if momentum_pp > 2.0 { "↑ UPTREND"
+                          } else if momentum_pp < -2.0 { "↓ DOWNTREND"
+                          } else { "→ RANGE-BOUND" };
+
+        sections.push(format!(
+            "PRICE HISTORY ({n} candles, {interval})\n\
+             Current: {cur:.1}%  |  Period Δ: {chg:+.1}%  |  Range: {lo:.1}%–{hi:.1}%\n\
+             MA7: {ma7:.1}%  |  MA20: {ma20:.1}%  |  Momentum (5c): {mom:+.1}pp  →  {trend}{vol}",
+            n       = n,
+            interval = format!("{:?}", app.chart_interval),
+            cur     = current * 100.0,
+            chg     = pct_change,
+            lo      = lo * 100.0,
+            hi      = hi * 100.0,
+            ma7     = ma7 * 100.0,
+            ma20    = ma20 * 100.0,
+            mom     = momentum_pp,
+            trend   = trend_label,
+            vol     = vol_info,
         ));
     }
 
+    // ── Live orderbook (full depth) ───────────────────────────────────────────
+    if let Some(ref ob) = app.orderbook {
+        if !ob.bids.is_empty() || !ob.asks.is_empty() {
+            let total_bid_sz: f64 = ob.bids.iter().map(|b| b.size).sum();
+            let total_ask_sz: f64 = ob.asks.iter().map(|a| a.size).sum();
+            let total_sz = total_bid_sz + total_ask_sz;
+            let imbalance = if total_sz > 0.0 {
+                (total_bid_sz - total_ask_sz) / total_sz
+            } else { 0.0 };
+            let imbalance_label = if imbalance > 0.15 { "BUY PRESSURE" }
+                                  else if imbalance < -0.15 { "SELL PRESSURE" }
+                                  else { "BALANCED" };
+
+            let spread_pp = match (ob.asks.first(), ob.bids.first()) {
+                (Some(ask), Some(bid)) => (ask.price - bid.price) * 100.0,
+                _ => 0.0,
+            };
+            let spread_bps = spread_pp * 100.0;
+
+            let mut ob_lines = vec![
+                format!("Best bid: {:.1}%  |  Best ask: {:.1}%  |  Spread: {:.1}pp ({:.0}bps)",
+                    ob.bids.first().map(|b| b.price * 100.0).unwrap_or(0.0),
+                    ob.asks.first().map(|a| a.price * 100.0).unwrap_or(0.0),
+                    spread_pp, spread_bps),
+                format!("Total bid size: {:.0}  |  Total ask size: {:.0}  |  Imbalance: {:+.1}%  →  {}",
+                    total_bid_sz, total_ask_sz, imbalance * 100.0, imbalance_label),
+            ];
+            // Top 3 bid/ask levels
+            let bid_levels: String = ob.bids.iter().take(3)
+                .map(|b| format!("  {:.1}%×{:.0}", b.price*100.0, b.size))
+                .collect::<Vec<_>>().join("  |");
+            let ask_levels: String = ob.asks.iter().take(3)
+                .map(|a| format!("  {:.1}%×{:.0}", a.price*100.0, a.size))
+                .collect::<Vec<_>>().join("  |");
+            ob_lines.push(format!("Top bids:{}", bid_levels));
+            ob_lines.push(format!("Top asks:{}", ask_levels));
+
+            sections.push(format!("LIVE ORDERBOOK\n{}", ob_lines.join("\n")));
+        }
+    }
+
+    // ── Active signals for this market ────────────────────────────────────────
+    if !app.signals.is_empty() {
+        let sel_id = app.selected_market_id.as_deref().unwrap_or("");
+        let relevant: Vec<String> = app.signals.iter()
+            .filter(|s| s.id_a == sel_id || s.id_b.as_deref() == Some(sel_id))
+            .map(|s| format!("  [{}] {} — {}", s.kind.label(), s.title, s.action))
+            .collect();
+        if !relevant.is_empty() {
+            sections.push(format!("ACTIVE SIGNALS\n{}", relevant.join("\n")));
+        }
+    }
+
+    // ── Portfolio position in this market ─────────────────────────────────────
+    if let Some(ref sel_id) = app.selected_market_id {
+        if let Some(pos) = app.portfolio.positions.iter().find(|p| &p.market_id == sel_id) {
+            let current_price = app.markets.iter()
+                .find(|m| &m.id == sel_id)
+                .map(|m| m.yes_price)
+                .unwrap_or(pos.entry_price);
+            let pnl = (current_price - pos.entry_price) * pos.shares;
+            let mut pos_lines = vec![
+                format!("Side: {:?}  |  Shares: {:.0}  |  Entry: {:.1}%  |  Mark: {:.1}%  |  PnL: {:+.2}",
+                    pos.side, pos.shares, pos.entry_price * 100.0, current_price * 100.0, pnl),
+            ];
+            if let Some(tp) = pos.take_profit {
+                pos_lines.push(format!("Take-profit: {:.1}%  |  Stop-loss: {}",
+                    tp * 100.0,
+                    pos.stop_loss.map(|s| format!("{:.1}%", s*100.0)).unwrap_or_else(|| "none".to_string())));
+            }
+            sections.push(format!("YOUR POSITION\n{}", pos_lines.join("\n")));
+        }
+    }
+
+    // ── Research notes ────────────────────────────────────────────────────────
+    if !app.session.notes.is_empty() {
+        let notes_str = app.session.notes.iter()
+            .map(|n| format!("  {}", n))
+            .collect::<Vec<_>>().join("\n");
+        sections.push(format!("RESEARCH NOTES\n{}", notes_str));
+    }
+
     format!(
-        "[Dashboard context — use this to answer follow-up questions without asking \
-         the user for IDs or prices that are visible on screen]\n{}",
-        lines.join("\n")
+        "╔═══════════════════════════════════════════════════════╗\n\
+         ║  DASHBOARD CONTEXT (live data visible on screen)      ║\n\
+         ╚═══════════════════════════════════════════════════════╝\n\
+         Use this data directly. Do NOT ask the user to repeat IDs, prices, or figures \
+         already shown below. Build your analysis on top of this context.\n\n\
+         {}\n\
+         ═══════════════════════════════════════════════════════",
+        sections.join("\n\n")
     )
 }
 
