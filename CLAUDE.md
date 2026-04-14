@@ -86,7 +86,7 @@ src/
 
 | Command                       | Action                                            |
 |-------------------------------|---------------------------------------------------|
-| `/refresh` or `/r`            | Refresh markets + chart + orderbook               |
+| `/refresh` or `/r` or `^`     | Refresh markets + chart + orderbook               |
 | `/platform` or `/p`           | Cycle platform filter (All → PM → KL → All)       |
 | `/chart` or `/c`              | Cycle chart interval (1h → 6h → 1d → 1w → 1m)    |
 | `/sort` or `/s`               | Cycle sort (~50% → Volume → End Date → A-Z)        |

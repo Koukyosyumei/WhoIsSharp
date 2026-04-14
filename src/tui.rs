@@ -53,7 +53,7 @@ const TIPS: &[&str] = &[
     "Press 1-9 or Tab/Shift+Tab to switch tabs",
     "Press j/k or arrow keys to navigate the market list",
     "Press Enter on a market to load its chart and order book",
-    "Type /refresh to refresh market data now",
+    "Press ^ or type /refresh to refresh market data now",
     "Type /watchlist to add/remove the selected market from your watchlist",
     "Type /platform to cycle the filter: All → PM → KL",
     "Type /chart to cycle chart interval: 1h → 6h → 1d → 1w → 1m",
@@ -2708,11 +2708,11 @@ fn render_sm_legend(f: &mut Frame, area: Rect) {
             Span::styled("  Enter ", yw), Span::styled("wallet drill-down  ", dg),
             Span::styled("Esc ", yw),    Span::styled("back to list  ", dg),
             Span::styled("[ ] ", yw),    Span::styled("adjust coord threshold  ", dg),
-            Span::styled("r ", yw),      Span::styled("refresh", dg),
+            Span::styled("^ ", yw),      Span::styled("refresh", dg),
         ]),
         Line::from(vec![
             Span::styled("  j/k ", yw),  Span::styled("navigate / scroll  ", dg),
-            Span::styled("a ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
+            Span::styled("@ ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
         ]),
     ];
 
@@ -3145,7 +3145,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("Ctrl+C", "Quit (saves session automatically)"),
         Line::from(""),
         h(" Slash commands  —  press / then type and Enter"),
-        kv("/refresh  or  /r", "Refresh markets + chart + orderbook"),
+        kv("/refresh  or  /r  or  ^", "Refresh markets + chart + orderbook"),
         kv("/platform  or  /p", "Cycle platform filter  ALL → PM → KL"),
         kv("/chart  or  /c", "Cycle chart interval  1h → 6h → 1d → 1w → 1m"),
         kv("/sort  or  /s", "Cycle sort  ~50% → Volume → End Date → A-Z"),
@@ -3795,6 +3795,35 @@ pub async fn run_tui(
 
 enum SlashCmd { Handled, NotACommand, Quit }
 
+/// Return (title, id, platform) for the market the user wants to analyze.
+///
+/// Prefers `selected_market_id` (the market explicitly loaded via Enter) over
+/// the list-selection index, which can drift when the search filter changes
+/// while the user is typing a command.
+fn analyze_target(app: &App) -> Option<(String, String, String)> {
+    type AppTab = Tab;
+    // Signals tab: use the highlighted signal's primary market
+    if app.active_tab == AppTab::Signals {
+        return app.selected_signal().map(|s| (
+            s.title.clone(),
+            s.id_a.clone(),
+            s.platform_a.name().to_lowercase(),
+        ));
+    }
+    // Any other tab: prefer the explicitly loaded market (selected_market_id),
+    // fall back to the highlighted row in the market list.
+    if let Some(ref id) = app.selected_market_id {
+        if let Some(m) = app.markets.iter().find(|m| &m.id == id) {
+            return Some((m.title.clone(), m.id.clone(), m.platform.name().to_lowercase()));
+        }
+    }
+    app.selected_market().map(|m| (
+        m.title.clone(),
+        m.id.clone(),
+        m.platform.name().to_lowercase(),
+    ))
+}
+
 /// Dispatch a slash command typed in the command bar.
 ///
 /// `raw` is the text the user typed after pressing `/` (without the leading slash).
@@ -4005,22 +4034,7 @@ async fn dispatch_slash_command(
 
         // ── AI analyze ────────────────────────────────────────────────────────
         "a" | "analyze" => {
-            let info = match app.active_tab {
-                AppTab::Signals => {
-                    app.selected_signal().map(|s| (
-                        s.title.clone(),
-                        s.id_a.clone(),
-                        s.platform_a.name().to_lowercase(),
-                    ))
-                }
-                _ => {
-                    app.selected_market().map(|m| (
-                        m.title.clone(),
-                        m.id.clone(),
-                        m.platform.name().to_lowercase(),
-                    ))
-                }
-            };
+            let info = analyze_target(app);
             if let Some((title, id, plat)) = info {
                 app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
             } else {
@@ -4475,25 +4489,21 @@ async fn handle_key(
             app.show_help = !app.show_help;
         }
 
+        // ── Refresh shortcut ──────────────────────────────────────────────────
+        KC::Char('^') if app.input.is_empty() => {
+            let clients_c = clients.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+            if app.selected_market_id.is_some() {
+                trigger_chart_load(app, clients, event_tx).await;
+                trigger_orderbook_load(app, clients, event_tx).await;
+            }
+            app.status = "Refreshing…".to_string();
+        }
+
         // ── AI analyze shortcut ───────────────────────────────────────────────
         KC::Char('@') if app.input.is_empty() => {
-            let info = match app.active_tab {
-                AppTab::Signals => {
-                    app.selected_signal().map(|s| (
-                        s.title.clone(),
-                        s.id_a.clone(),
-                        s.platform_a.name().to_lowercase(),
-                    ))
-                }
-                _ => {
-                    app.selected_market().map(|m| (
-                        m.title.clone(),
-                        m.id.clone(),
-                        m.platform.name().to_lowercase(),
-                    ))
-                }
-            };
-            if let Some((title, id, plat)) = info {
+            if let Some((title, id, plat)) = analyze_target(app) {
                 app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
             } else {
                 app.status = "Select a market first.".to_string();
