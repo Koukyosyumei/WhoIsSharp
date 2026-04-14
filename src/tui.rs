@@ -618,12 +618,18 @@ impl App {
             Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_add(1); } // k = scroll toward top
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_sub(1); }
             Tab::SmartMoney => {
-                let len = self.sm_wallets.len() + 2;
-                if len <= 2 { return; }
-                let i = self.sm_list.selected()
-                    .map(|i| if i <= 2 { len - 1 } else { i - 1 })
-                    .unwrap_or(2);
-                self.sm_list.select(Some(i));
+                if self.sm_detail.is_some() || self.sm_detail_loading {
+                    // In detail view: scroll up through trade history
+                    self.sm_detail_scroll = self.sm_detail_scroll.saturating_sub(1);
+                } else {
+                    // In list view: navigate wallets
+                    let len = self.sm_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.sm_list.selected()
+                        .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                        .unwrap_or(2);
+                    self.sm_list.select(Some(i));
+                }
             }
             Tab::Trades => {
                 let len = self.trades_data.len();
@@ -1900,7 +1906,7 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
 
     // ── Category exposure (correlation proxy) ─────────────────────────────────
     // Group cost by category keyword to show topic concentration risk.
-    let mut cat_exposure: Vec<(String, f64)> = {
+    let cat_exposure: Vec<(String, f64)> = {
         let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for pos in positions {
             let cat = app.markets.iter()
@@ -2526,10 +2532,23 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let chunks = Layout::default()
+    // When a wallet is selected (or loading), split horizontally: list left, detail right.
+    let show_detail = app.sm_detail.is_some() || app.sm_detail_loading;
+    let (list_area, detail_area_opt) = if show_detail {
+        let horiz = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area);
+        (horiz[0], Some(horiz[1]))
+    } else {
+        (area, None)
+    };
+
+    // ── Vertical split of left side: wallet table + coordination panel ─────
+    let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3)])
-        .split(area);
+        .split(list_area);
 
     // ── Top traders table ──────────────────────────────────────────────────
     let title = format!(" Smart Money — {} ({} traders)  coord≥{:.0}%  [/] adjust ",
@@ -2564,15 +2583,6 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
             Color::White
         };
 
-        // Fresh wallet indicator: 🆕 if fresh, age in days otherwise
-        let age_str = if w.is_fresh {
-            "NEW".to_string()
-        } else {
-            w.wallet_age_days
-                .map(|d| if d >= 365.0 { format!("{:.0}y", d / 365.0) } else { format!("{:.0}d", d) })
-                .unwrap_or_else(|| "?".to_string())
-        };
-
         let vol_pct_str = if w.volume_impact > 0.0 {
             format!("{:.1}%", w.volume_impact * 100.0)
         } else {
@@ -2603,7 +2613,6 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
             )),
             Span::styled(format!(" {:>8.0}/100", w.suspicion), Style::default().fg(suspicion_color)),
         ]);
-        let _ = age_str; // shown via the "N" flag; could add a tooltip later
         items.push(ListItem::new(line));
     }
 
@@ -2613,7 +2622,7 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("▶ ");
 
     let mut state = app.sm_list.clone();
-    f.render_stateful_widget(list, chunks[0], &mut state);
+    f.render_stateful_widget(list, left_chunks[0], &mut state);
 
     // ── Coordination panel ─────────────────────────────────────────────────
     let coord_title = if app.sm_coord_pairs.is_empty() {
@@ -2649,7 +2658,155 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
 
     let coord_p = Paragraph::new(coord_lines)
         .block(Block::default().title(coord_title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-    f.render_widget(coord_p, chunks[1]);
+    f.render_widget(coord_p, left_chunks[1]);
+
+    // ── Wallet detail panel (right side) ───────────────────────────────────
+    if let Some(detail_area) = detail_area_opt {
+        render_sm_wallet_detail(f, detail_area, app);
+    }
+}
+
+/// Render the wallet detail panel (right side of Smart Money split view).
+fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
+    use chrono::{DateTime, Utc};
+
+    if app.sm_detail_loading {
+        let p = Paragraph::new("\n  Fetching wallet history…")
+            .block(Block::default().title(" Wallet Detail ").borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let Some(detail) = &app.sm_detail else { return };
+
+    // ── Stats header (fixed height) ────────────────────────────────────────
+    let stats_height: u16 = 10;
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(stats_height), Constraint::Min(0)])
+        .split(area);
+
+    let age_str = if detail.is_fresh {
+        "fresh / new wallet".to_string()
+    } else {
+        detail.wallet_age_days
+            .map(|d| if d >= 365.0 { format!("{:.1}y old", d / 365.0) } else { format!("{:.0}d old", d) })
+            .unwrap_or_else(|| "age unknown".to_string())
+    };
+    let alpha_str = if detail.alpha_score.is_nan() {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}¢", detail.alpha_score * 100.0)
+    };
+
+    let stats_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Wallet  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(trunc(&detail.wallet, 42), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Name    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&detail.pseudonym as &str, Style::default().fg(Color::White).bold()),
+            Span::styled(format!("  ({})", age_str), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Trades  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} trades  ", detail.recent_trades.len())),
+            Span::styled("Positions  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}", detail.n_positions)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Wins    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}/{}", detail.n_wins, detail.n_positions)),
+            Span::styled("  Win Rate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}%", detail.win_rate * 100.0),
+                Style::default().fg(if detail.win_rate >= 0.7 { Color::Red } else if detail.win_rate >= 0.55 { Color::Yellow } else { Color::White }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Vol $   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("${:.0}", detail.total_vol)),
+            Span::styled("  Alpha   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(alpha_str),
+        ]),
+        Line::from(vec![
+            Span::styled("  Top markets  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                detail.top_markets.iter().take(3)
+                    .map(|(t, v)| format!("{} (${:.0})", trunc(t, 20), v))
+                    .collect::<Vec<_>>().join("  ·  ")
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  j/k scroll  ·  Esc to return",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let stats_p = Paragraph::new(stats_lines)
+        .block(Block::default()
+            .title(format!(" {} ", detail.pseudonym))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)));
+    f.render_widget(stats_p, vert[0]);
+
+    // ── Trade history (scrollable) ─────────────────────────────────────────
+    let trade_header = Line::from(vec![
+        Span::styled(
+            format!("  {:<12} {:<6} {:<7} {:>8} {:>7}  {}", "Date", "Type", "Side", "Size", "Price", "Market"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let mut trade_lines: Vec<Line> = vec![trade_header,
+        Line::from(Span::styled("  ".to_string() + &"─".repeat(70), Style::default().fg(Color::DarkGray)))
+    ];
+
+    for trade in &detail.recent_trades {
+        let dt = DateTime::<Utc>::from_timestamp(trade.timestamp, 0)
+            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let type_col = if trade.trade_type == "REDEEM" {
+            Span::styled(format!("{:<6}", "RDEEM"), Style::default().fg(Color::Green))
+        } else {
+            Span::raw(format!("{:<6}", "TRADE"))
+        };
+        let side_col = match trade.side.as_str() {
+            "BUY"  => Span::styled(format!("{:<7}", "BUY"), Style::default().fg(Color::Green)),
+            "SELL" => Span::styled(format!("{:<7}", "SELL"), Style::default().fg(Color::Red)),
+            _      => Span::styled(format!("{:<7}", "—"), Style::default().fg(Color::DarkGray)),
+        };
+
+        trade_lines.push(Line::from(vec![
+            Span::raw(format!("  {:<12} ", dt)),
+            type_col,
+            Span::raw(" "),
+            side_col,
+            Span::raw(format!(" {:>8.1}", trade.size)),
+            Span::styled(
+                format!(" {:>6.1}¢  ", trade.price * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(trunc(&trade.market_title, 30)),
+        ]));
+    }
+
+    if detail.recent_trades.is_empty() {
+        trade_lines.push(Line::from(Span::styled(
+            "  No recent trades found.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let trade_p = Paragraph::new(trade_lines)
+        .block(Block::default().title(" Trade History ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .scroll((app.sm_detail_scroll, 0));
+    f.render_widget(trade_p, vert[1]);
 }
 
 // ── Help overlay ─────────────────────────────────────────────────────────────
@@ -4093,6 +4250,17 @@ async fn handle_key(
             app.search.clear();
             app.active_tab = AppTab::Markets;
         }
+        // Close wallet detail panel (SmartMoney tab)
+        KC::Esc if app.input.is_empty()
+            && app.active_tab == AppTab::SmartMoney
+            && (app.sm_detail.is_some() || app.sm_detail_loading) =>
+        {
+            app.sm_detail         = None;
+            app.sm_detail_loading = false;
+            app.sm_detail_scroll  = 0;
+            app.status = "Back to wallet list.".to_string();
+        }
+
         KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
             app.search.clear();
             app.status = "Search cleared".to_string();
