@@ -2197,7 +2197,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
     };
     let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
     let header_title = format!(
-        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [/] adjust ",
+        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [ ] adjust ",
         matcher_label,
         app.pairs.len(),
         arb_count,
@@ -2208,7 +2208,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
         let msg = if app.pairs_loading {
             "Matching markets with LLM — please wait…"
         } else {
-            "No matching pairs found. Press L to run LLM matching, or wait for market refresh."
+            "No matching pairs found. Type /pairs to run LLM matching, or press ^ to refresh."
         };
         let block = Block::default()
             .title(header_title)
@@ -2439,7 +2439,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "  [/pairs] re-match with LLM   [Enter] open PM market   [j/k] navigate pairs",
+                "  [/pairs] re-match with LLM   [Enter] open PM market   [j/k] navigate   [[ ]] adjust threshold",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
