@@ -154,6 +154,16 @@ impl MarketSort {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum AlertEditStep { #[default] Above, Below }
 
+// ─── Kelly calculator step ────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KellyStep {
+    #[default]
+    MyProb,    // user types their probability estimate
+    Bankroll,  // user types their bankroll in dollars
+    Result,    // displaying the recommendation
+}
+
 // ─── App state ───────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -258,6 +268,13 @@ pub struct App {
 
     // Startup loading spinner (cycles 0–9)
     pub spinner_tick:      u8,
+
+    // Kelly position sizer modal (k key)
+    pub kelly_mode:        bool,
+    pub kelly_step:        KellyStep,
+    pub kelly_input:       String,
+    pub kelly_my_prob:     Option<f64>,
+    pub kelly_bankroll:    f64,    // remembered across calls
 }
 
 // Position add-flow state machine
@@ -353,6 +370,11 @@ impl App {
             pairs_loading:     false,
             show_risk_view:    false,
             spinner_tick:      0,
+            kelly_mode:        false,
+            kelly_step:        KellyStep::default(),
+            kelly_input:       String::new(),
+            kelly_my_prob:     None,
+            kelly_bankroll:    10_000.0,
         }
     }
 
@@ -758,6 +780,11 @@ fn render(f: &mut Frame, app: &App) {
         render_loading_overlay(f, area, app);
     }
 
+    // Kelly modal renders on top of content, below help
+    if app.kelly_mode {
+        render_kelly_modal(f, area, app);
+    }
+
     // Help overlay renders on top of everything
     if app.show_help {
         render_help_overlay(f, area);
@@ -1144,12 +1171,39 @@ fn render_market_detail(f: &mut Frame, area: Rect, app: &App) {
         Line::from(format!(" Ends:      {}", m.end_date.as_deref().unwrap_or("N/A"))),
         Line::from(format!(" ID:        {}", m.id)),
         Line::from(""),
+    ];
+
+    // ── Time value / theta block ──────────────────────────────────────────────
+    if let Some((days, daily_sig, annual_vol)) = market_time_value(m) {
+        lines.push(Line::from(vec![
+            Span::styled(" ─── TIME VALUE ─────────────────────", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Days left:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", days), Style::default().fg(Color::White).bold()),
+            Span::raw("   "),
+            Span::styled("Daily σ: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.2}pp/day", daily_sig), Style::default().fg(Color::Yellow).bold()),
+            Span::raw("   "),
+            Span::styled("Ann vol: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}%", annual_vol), Style::default().fg(Color::White)),
+        ]));
+        // Theta: edge decay per day assuming constant position
+        // Also show "break-even move needed per day"
+        lines.push(Line::from(vec![
+            Span::styled(" B/E daily:  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:.2}pp move needed/day to change outcome", daily_sig)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.extend([
         Line::from(Span::styled(
-            "  [Enter] load chart/book  [n] add position  [a] ask AI  [/] search",
+            "  [Enter] load chart/book  [k] Kelly sizer  [n] add position  [a] ask AI",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-    ];
+    ]);
 
     if let Some(desc) = &m.description {
         if !desc.is_empty() {
@@ -2461,6 +2515,180 @@ fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+// ── Theta / time-value helper ─────────────────────────────────────────────────
+
+/// Returns `(days_left, daily_sigma_pp, annual_vol_pct)` for a market.
+///
+/// Uses the Brownian-bridge approximation for a binary that settles at {0,1}:
+///   daily σ = sqrt(p*(1-p) / T)  in probability-point units
+///   annualised vol = sqrt(p*(1-p) / T * 365) * 100 as a percentage
+fn market_time_value(market: &Market) -> Option<(i64, f64, f64)> {
+    let end_str = market.end_date.as_deref()?;
+    // Accept "YYYY-MM-DDTHH:MM:SSZ", "YYYY-MM-DD HH:MM:SS", and "YYYY-MM-DD"
+    let end_date = chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%dT%H:%M:%SZ")
+        .or_else(|_| chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d"))
+        .ok()?;
+    let today = chrono::Local::now().date_naive();
+    let days  = (end_date - today).num_days();
+    if days <= 0 { return None; }
+
+    let p = market.yes_price.clamp(0.001, 0.999);
+    let variance   = p * (1.0 - p);
+    let daily_sig  = (variance / days as f64).sqrt() * 100.0; // pp per day
+    let annual_vol = (variance / days as f64 * 365.0_f64).sqrt() * 100.0;
+    Some((days, daily_sig, annual_vol))
+}
+
+// ── Kelly position-sizer modal ────────────────────────────────────────────────
+
+fn render_kelly_modal(f: &mut Frame, area: Rect, app: &App) {
+    let Some(market) = app.selected_market() else { return };
+
+    let popup = centered_rect(56, 60, area);
+    f.render_widget(Clear, popup);
+
+    let p_mkt  = market.yes_price;
+    let title_short: String = market.title.chars().take(52).collect();
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Market: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(title_short, Style::default().fg(Color::White).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("  YES price: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢  ({:.1}%)", p_mkt * 100.0, p_mkt * 100.0),
+                Style::default().fg(Color::Green).bold()),
+        ]),
+        Line::from(""),
+    ];
+
+    match app.kelly_step {
+        KellyStep::MyProb => {
+            lines.push(Line::from(vec![
+                Span::styled("  Your probability estimate: ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}%█", app.kelly_input), Style::default().fg(Color::White).bold()),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Enter 0–100, then press Enter", Style::default().fg(Color::DarkGray))));
+        }
+
+        KellyStep::Bankroll => {
+            let p_mine = app.kelly_my_prob.unwrap_or(p_mkt);
+            let edge = p_mine - p_mkt;
+            let edge_color = if edge > 0.0 { Color::Green } else if edge < 0.0 { Color::Red } else { Color::DarkGray };
+            lines.push(Line::from(vec![
+                Span::styled("  Your estimate:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.1}%", p_mine * 100.0), Style::default().fg(Color::White).bold()),
+                Span::raw("   Edge: "),
+                Span::styled(format!("{:+.1}pp", edge * 100.0), Style::default().fg(edge_color).bold()),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Your bankroll ($): ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}█", app.kelly_input), Style::default().fg(Color::White).bold()),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Enter bankroll in dollars, then press Enter", Style::default().fg(Color::DarkGray))));
+        }
+
+        KellyStep::Result => {
+            let p_mine    = app.kelly_my_prob.unwrap_or(p_mkt);
+            let bankroll  = app.kelly_bankroll;
+            let edge      = p_mine - p_mkt;
+            let edge_color = if edge > 0.0 { Color::Green } else { Color::Red };
+
+            // Kelly fractions
+            let (kelly_frac, side_label) = if edge > 0.0 {
+                ((p_mine - p_mkt) / (1.0 - p_mkt), "YES")   // buy YES
+            } else {
+                ((p_mkt - p_mine) / p_mkt, "NO ")             // buy NO
+            };
+
+            let kelly_frac  = kelly_frac.max(0.0);
+            let full_kelly  = kelly_frac * bankroll;
+            let half_kelly  = full_kelly * 0.5;
+            let qtr_kelly   = full_kelly * 0.25;
+
+            // EV per dollar invested
+            let ev_per_dollar = edge.abs(); // = |p_mine - p_mkt|
+            // Implied daily σ / theta
+            let time_info = market_time_value(market);
+
+            lines.push(Line::from(vec![
+                Span::styled("  Your estimate:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.1}%", p_mine * 100.0), Style::default().fg(Color::White).bold()),
+                Span::raw("   "),
+                Span::styled(format!("Edge {:+.1}pp", edge * 100.0), Style::default().fg(edge_color).bold()),
+                Span::raw(format!("   Side: {}", side_label)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  EV per $1 invested: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:+.3}", ev_per_dollar), Style::default().fg(edge_color).bold()),
+                Span::raw(format!("   Bankroll: ${:.0}", bankroll)),
+            ]));
+
+            if let Some((days, daily_sig, annual_vol)) = time_info {
+                lines.push(Line::from(vec![
+                    Span::styled("  Days to resolution: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}", days), Style::default().fg(Color::White)),
+                    Span::raw(format!("   Daily σ: {:.2}pp   Ann vol: {:.1}%", daily_sig, annual_vol)),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ─────────── KELLY SIZING ───────────",
+                Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(""));
+
+            let fmt_kelly = |label: &str, dollars: f64, frac: f64| {
+                Line::from(vec![
+                    Span::styled(format!("  {:<16}", label), Style::default().fg(Color::Yellow).bold()),
+                    Span::styled(format!("${:>9.0}", dollars), Style::default().fg(Color::White).bold()),
+                    Span::styled(format!("  ({:.2}%)", frac * 100.0), Style::default().fg(Color::DarkGray)),
+                ])
+            };
+
+            lines.push(fmt_kelly("Full Kelly:", full_kelly, kelly_frac));
+            lines.push(fmt_kelly("Half Kelly:", half_kelly, kelly_frac * 0.5));
+            lines.push(fmt_kelly("Quarter Kelly:", qtr_kelly, kelly_frac * 0.25));
+
+            if kelly_frac <= 0.0 {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  No edge — Kelly says: do not bet.",
+                    Style::default().fg(Color::Red).bold(),
+                )));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [n] Add position   [k] Recalculate   [Esc] Close",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let border_color = match app.kelly_step {
+        KellyStep::MyProb | KellyStep::Bankroll => Color::Yellow,
+        KellyStep::Result                        => Color::Cyan,
+    };
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("  Kelly Position Sizer  ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, popup);
+}
+
 fn render_loading_overlay(f: &mut Frame, area: Rect, app: &App) {
     // Braille spinner frames
     const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -3322,6 +3550,51 @@ async fn handle_key(
         return false;
     }
 
+    // ── Kelly position sizer input flow ──────────────────────────────────────
+    if app.kelly_mode {
+        match key.code {
+            KC::Esc => {
+                app.kelly_mode  = false;
+                app.kelly_input = String::new();
+            }
+            KC::Char(c) if c.is_ascii_digit() || c == '.' => {
+                app.kelly_input.push(c);
+            }
+            KC::Backspace => {
+                app.kelly_input.pop();
+            }
+            KC::Enter => {
+                match app.kelly_step {
+                    KellyStep::MyProb => {
+                        if let Ok(v) = app.kelly_input.trim().parse::<f64>() {
+                            let prob = (v / 100.0).clamp(0.001, 0.999);
+                            app.kelly_my_prob = Some(prob);
+                            app.kelly_step    = KellyStep::Bankroll;
+                            app.kelly_input   = format!("{:.0}", app.kelly_bankroll);
+                        }
+                    }
+                    KellyStep::Bankroll => {
+                        if let Ok(v) = app.kelly_input.trim().parse::<f64>() {
+                            if v > 0.0 {
+                                app.kelly_bankroll = v;
+                                app.kelly_step     = KellyStep::Result;
+                                app.kelly_input    = String::new();
+                            }
+                        }
+                    }
+                    KellyStep::Result => {
+                        // Reset to re-enter a new probability
+                        app.kelly_step    = KellyStep::MyProb;
+                        app.kelly_input   = String::new();
+                        app.kelly_my_prob = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     // ── Search mode ───────────────────────────────────────────────────────────
     if app.search_mode {
         match key.code {
@@ -3456,6 +3729,21 @@ async fn handle_key(
                 trigger_orderbook_load(app, clients, event_tx).await;
             }
             app.status = "Refreshing…".to_string();
+        }
+
+        // ── Kelly position sizer ─────────────────────────────────────────────
+        KC::Char('k') if app.input.is_empty() && app.selected_market().is_some() => {
+            if app.kelly_mode {
+                // Already open — recalculate (restart from MyProb step)
+                app.kelly_step  = KellyStep::MyProb;
+                app.kelly_input = String::new();
+                app.kelly_my_prob = None;
+            } else {
+                app.kelly_mode  = true;
+                app.kelly_step  = KellyStep::MyProb;
+                app.kelly_input = String::new();
+                app.kelly_my_prob = None;
+            }
         }
 
         // ── Add position ──────────────────────────────────────────────────────
