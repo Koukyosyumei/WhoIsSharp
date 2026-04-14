@@ -64,9 +64,11 @@ async fn dispatch_inner(
         "search_markets"   => search_markets(clients, args).await,
         "analyze_insider"  => analyze_insider(clients, args).await,
         "find_smart_money" => find_smart_money(clients, args).await,
-        "analyze_wallet"   => analyze_wallet(clients, args).await,
-        "kelly_size"       => kelly_size(clients, args).await,
-        _                  => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
+        "analyze_wallet"      => analyze_wallet(clients, args).await,
+        "scan_smart_money"    => scan_smart_money(clients, args).await,
+        "get_wallet_positions" => get_wallet_positions(clients, args).await,
+        "kelly_size"          => kelly_size(clients, args).await,
+        _                     => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
 
@@ -516,21 +518,118 @@ fn parse_ob_size(line: &str) -> Option<f64> {
     token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok()
 }
 
+// ─── Wallet detail (drill-down from Smart Money tab) ─────────────────────────
+
+/// Full wallet profile fetched on demand when the user presses Enter on a
+/// Smart Money row.  Contains computed stats plus raw trade history for display.
+#[derive(Clone, Debug)]
+pub struct WalletDetail {
+    pub wallet:          String,
+    pub pseudonym:       String,
+    pub n_positions:     usize,
+    pub n_wins:          usize,
+    pub win_rate:        f64,
+    pub alpha_score:     f64,
+    pub total_vol:       f64,
+    pub is_fresh:        bool,
+    pub wallet_age_days: Option<f64>,
+    /// Recent TRADE + REDEEM events, newest first.
+    pub recent_trades:   Vec<crate::markets::polymarket::PolyTrade>,
+    /// Top markets by buy-side dollar exposure (title, $vol), descending.
+    pub top_markets:     Vec<(String, f64)>,
+}
+
+/// Fetch full wallet detail for the Smart Money drill-down view.
+/// Fetches TRADE + REDEEM histories concurrently then builds the profile.
+pub async fn fetch_wallet_detail(
+    clients: &MarketClients,
+    wallet:  &str,
+) -> anyhow::Result<WalletDetail> {
+    use futures_util::future::join;
+    use std::collections::HashMap;
+
+    let (trades_res, redeems_res) = join(
+        clients.polymarket.fetch_user_trades(wallet, 200),
+        clients.polymarket.fetch_user_redeems(wallet, 200),
+    ).await;
+
+    let mut history = trades_res.context("Failed to fetch wallet trade history")?;
+    if let Ok(redeems) = redeems_res {
+        history.extend(redeems);
+    }
+
+    if history.is_empty() {
+        return Ok(WalletDetail {
+            wallet:          wallet.to_string(),
+            pseudonym:       wallet.to_string(),
+            n_positions:     0,
+            n_wins:          0,
+            win_rate:        0.0,
+            alpha_score:     f64::NAN,
+            total_vol:       0.0,
+            is_fresh:        false,
+            wallet_age_days: None,
+            recent_trades:   Vec::new(),
+            top_markets:     Vec::new(),
+        });
+    }
+
+    let pseudonym = history.iter()
+        .find(|t| !t.pseudonym.is_empty())
+        .map(|t| t.pseudonym.clone())
+        .unwrap_or_else(|| wallet.to_string());
+
+    let profile = build_wallet_profile(wallet.to_string(), pseudonym, 0.0, &history);
+
+    // Sort by timestamp descending (newest first) for display
+    history.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Top markets by buy-side dollar exposure
+    let mut by_market: HashMap<String, f64> = HashMap::new();
+    for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
+        *by_market.entry(t.market_title.clone()).or_default() += t.size * t.price;
+    }
+    let mut top_markets: Vec<(String, f64)> = by_market.into_iter().collect();
+    top_markets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_markets.truncate(10);
+
+    Ok(WalletDetail {
+        wallet:          profile.wallet,
+        pseudonym:       profile.pseudonym,
+        n_positions:     profile.n_positions,
+        n_wins:          profile.n_wins,
+        win_rate:        profile.win_rate,
+        alpha_score:     profile.alpha_score,
+        total_vol:       profile.total_vol,
+        is_fresh:        profile.is_fresh,
+        wallet_age_days: profile.wallet_age_days,
+        recent_trades:   history,
+        top_markets,
+    })
+}
+
 // ─── Smart money public types ────────────────────────────────────────────────
 
 /// Wallet summary emitted to the TUI Smart Money tab.
 #[derive(Clone, Debug)]
 pub struct SmartMoneyWallet {
-    pub wallet:      String,
-    pub pseudonym:   String,
-    pub market_size: f64,
-    pub n_positions: usize,
-    pub n_wins:      usize,
-    pub win_rate:    f64,
-    pub alpha_score: f64, // NaN = no winning trades in history
-    pub total_vol:   f64,
-    pub suspicion:   f64, // 0–100 composite
-    pub flagged:     bool,
+    pub wallet:          String,
+    pub pseudonym:       String,
+    pub market_size:     f64,
+    pub n_positions:     usize,
+    pub n_wins:          usize,
+    pub win_rate:        f64,
+    pub alpha_score:     f64,    // NaN = no winning trades in history
+    pub total_vol:       f64,
+    pub suspicion:       f64,    // 0–100 composite
+    pub flagged:         bool,
+    /// True when the wallet has very few lifetime trades and all are recent —
+    /// approximates the "fresh wallet" signal from polymarket-insider-tracker.
+    pub is_fresh:        bool,
+    /// Approx days since the wallet's oldest observed trade (None if unknown).
+    pub wallet_age_days: Option<f64>,
+    /// Wallet's position size in this market / market daily volume (0.0 if vol unknown).
+    pub volume_impact:   f64,
 }
 
 /// Result returned by `smart_money_for_market` for TUI consumption.
@@ -543,17 +642,22 @@ pub struct SmartMoneyResult {
 
 /// Fetch smart money data for a Polymarket market and return structured results.
 /// Intended for the TUI Smart Money tab; the AI tool uses `find_smart_money`.
+///
+/// `market_volume` — the market's daily volume from the Gamma API, used to
+/// compute size-anomaly impact scores (wallet position / market volume).
+///
+/// `coord_threshold` — Jaccard similarity threshold for wallet coordination
+/// detection.  Wallet pairs sharing ≥ this fraction of traded markets are
+/// flagged as possibly coordinated.  Default 0.35.
 pub async fn smart_money_for_market(
-    clients:   &MarketClients,
-    market_id: &str,
-    top_n:     usize,
+    clients:         &MarketClients,
+    market_id:       &str,
+    top_n:           usize,
+    market_volume:   Option<f64>,
+    coord_threshold: f64,
 ) -> anyhow::Result<SmartMoneyResult> {
     use std::collections::HashMap;
     use futures_util::future::join_all;
-
-    const WIN_RATE_THRESHOLD: f64 = 0.55;
-    const MIN_POSITIONS:      usize = 3;
-    const COORD_THRESHOLD:    f64 = 0.35;
 
     let market_trades = clients
         .polymarket
@@ -585,48 +689,63 @@ pub async fn smart_money_for_market(
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(top_n.min(10));
 
-    // Concurrent wallet history fetch
-    let histories: Vec<_> = join_all(
-        ranked.iter().map(|(wallet, _, _)| clients.polymarket.fetch_user_trades(wallet, 100))
+    // Fetch TRADE and REDEEM histories concurrently for every wallet.
+    // REDEEMs must be fetched separately because the data-api requires type=.
+    let trade_hists: Vec<_> = join_all(
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 150))
+    ).await;
+    let redeem_hists: Vec<_> = join_all(
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 150))
     ).await;
 
     let profiles: Vec<WalletProfile> = ranked
         .iter()
-        .zip(histories)
-        .filter_map(|((wallet, market_size, pseudonym), hist_result)| {
-            let hist = hist_result.ok()?;
-            Some(build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &hist))
+        .zip(trade_hists.iter().zip(redeem_hists.iter()))
+        .filter_map(|((wallet, market_size, pseudonym), (trades_res, redeems_res))| {
+            let mut history = trades_res.as_ref().ok()?.clone();
+            if let Ok(redeems) = redeems_res {
+                history.extend(redeems.iter().cloned());
+            }
+            Some(build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &history))
         })
         .collect();
 
-    // Coordination detection
+    // Coordination detection (pairwise Jaccard over traded market sets)
     let mut coord_pairs = Vec::new();
     for i in 0..profiles.len() {
         for j in (i + 1)..profiles.len() {
             let sim = jaccard(&profiles[i].market_set, &profiles[j].market_set);
-            if sim >= COORD_THRESHOLD {
+            if sim >= coord_threshold {
                 coord_pairs.push((profiles[i].pseudonym.clone(), profiles[j].pseudonym.clone(), sim));
             }
         }
     }
 
-    // Convert to public structs
+    // Niche market flag: volume < $50k
+    let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+
+    // Convert to public structs using the improved scoring formula
     let wallets = profiles.iter().map(|p| {
-        let alpha_adv = if p.alpha_score.is_nan() { 0.0 } else { (0.5 - p.alpha_score).max(0.0) * 2.0 };
-        let vol_score = if p.total_vol > 0.0 { (p.total_vol.ln() / 15.0).min(1.0).max(0.0) } else { 0.0 };
-        let suspicion = (p.win_rate * 0.5 + alpha_adv * 0.3 + vol_score * 0.2) * 100.0;
-        let flagged = p.n_positions >= MIN_POSITIONS && p.win_rate > WIN_RATE_THRESHOLD;
+        let volume_impact = match market_volume {
+            Some(vol) if vol > 0.0 => p.market_size / vol,
+            _ => 0.0,
+        };
+        let suspicion = compute_suspicion(p, volume_impact, is_niche);
+        let flagged = suspicion >= 50.0;
         SmartMoneyWallet {
-            wallet:      p.wallet.clone(),
-            pseudonym:   p.pseudonym.clone(),
-            market_size: p.market_size,
-            n_positions: p.n_positions,
-            n_wins:      p.n_wins,
-            win_rate:    p.win_rate,
-            alpha_score: p.alpha_score,
-            total_vol:   p.total_vol,
+            wallet:          p.wallet.clone(),
+            pseudonym:       p.pseudonym.clone(),
+            market_size:     p.market_size,
+            n_positions:     p.n_positions,
+            n_wins:          p.n_wins,
+            win_rate:        p.win_rate,
+            alpha_score:     p.alpha_score,
+            total_vol:       p.total_vol,
             suspicion,
             flagged,
+            is_fresh:        p.is_fresh,
+            wallet_age_days: p.wallet_age_days,
+            volume_impact,
         }
     }).collect();
 
@@ -635,24 +754,30 @@ pub async fn smart_money_for_market(
 
 // ─── Smart money / account analysis ──────────────────────────────────────────
 
-/// Per-wallet analytics bundle, built from trade history.
+/// Per-wallet analytics bundle, built from merged TRADE + REDEEM history.
 struct WalletProfile {
-    wallet:      String,
-    pseudonym:   String,
+    wallet:          String,
+    pseudonym:       String,
     /// Dollar size in the queried market specifically.
-    market_size: f64,
+    market_size:     f64,
     /// Distinct markets traded (proxy for experience).
-    n_positions: usize,
+    n_positions:     usize,
     /// REDEEM events (each = a winning payout).
-    n_wins:      usize,
+    n_wins:          usize,
     /// n_wins / n_positions — meaningful only when n_positions ≥ MIN_POSITIONS.
-    win_rate:    f64,
+    win_rate:        f64,
     /// Mean BUY price on positions that later hit REDEEM (lower = earlier entry).
-    alpha_score: f64,
+    alpha_score:     f64,
     /// Total buy-side dollar volume across history.
-    total_vol:   f64,
+    total_vol:       f64,
     /// Full set of conditionIds traded (for coordination detection).
-    market_set:  std::collections::HashSet<String>,
+    market_set:      std::collections::HashSet<String>,
+    /// Heuristic: wallet has ≤10 lifetime trades and all are within 7 days.
+    is_fresh:        bool,
+    /// Days since oldest observed activity (None if history is empty).
+    wallet_age_days: Option<f64>,
+    /// Recency-weighted win rate (90-day half-life; emphasises recent positions).
+    win_rate_weighted: f64,
 }
 
 fn build_wallet_profile(
@@ -663,7 +788,9 @@ fn build_wallet_profile(
 ) -> WalletProfile {
     use std::collections::{HashMap, HashSet};
 
-    const MIN_POSITIONS: usize = 3;
+    const MIN_POSITIONS:    usize = 3;
+    const FRESH_MAX_TRADES: usize = 10;  // ≤ this many lifetime trades → possibly fresh
+    const FRESH_MAX_DAYS:   f64   = 7.0; // all activity within this window → possibly fresh
 
     // Unique conditionIds where they placed a TRADE
     let market_set: HashSet<String> = history
@@ -673,7 +800,13 @@ fn build_wallet_profile(
         .collect();
     let n_positions = market_set.len();
 
-    // REDEEMs ≈ winning payouts
+    // TRADE-only count for fresh-wallet heuristic
+    let n_total_trades = history
+        .iter()
+        .filter(|t| t.trade_type == "TRADE" || t.trade_type.is_empty())
+        .count();
+
+    // REDEEMs ≈ winning payouts (now fetched separately and merged into history)
     let redeemed: HashSet<&str> = history
         .iter()
         .filter(|t| t.trade_type == "REDEEM")
@@ -682,8 +815,6 @@ fn build_wallet_profile(
     let n_wins = redeemed.len();
 
     // Alpha score: average BUY price on markets that eventually paid out.
-    // Low value (e.g. 0.25) means they entered when the market was at 25¢
-    // and it resolved YES — they were well ahead of consensus.
     let mut winning_entries: HashMap<&str, Vec<f64>> = HashMap::new();
     for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
         if redeemed.contains(t.condition_id.as_str()) {
@@ -713,6 +844,46 @@ fn build_wallet_profile(
         0.0
     };
 
+    // Wallet age from oldest trade timestamp
+    let now_secs = chrono::Utc::now().timestamp();
+    let oldest_ts = history.iter().map(|t| t.timestamp).filter(|&ts| ts > 0).min();
+    let wallet_age_days = oldest_ts.map(|ts| (now_secs - ts).max(0) as f64 / 86_400.0);
+
+    // Fresh wallet heuristic (approximates on-chain nonce check):
+    // few lifetime trades AND all observed activity is very recent.
+    let is_fresh = n_total_trades <= FRESH_MAX_TRADES
+        && wallet_age_days.map(|d| d <= FRESH_MAX_DAYS).unwrap_or(false);
+
+    // Recency-weighted win rate (90-day half-life exponential decay).
+    // Each market contributes a weight = exp(-λ × age_of_last_activity).
+    // Recent wins count proportionally more than wins from months ago.
+    let win_rate_weighted = if n_positions >= MIN_POSITIONS {
+        use std::collections::HashMap as HM;
+        const HALF_LIFE_DAYS: f64 = 90.0;
+        let decay = std::f64::consts::LN_2 / (HALF_LIFE_DAYS * 86_400.0);
+
+        // Latest observed timestamp per market
+        let mut mkt_last_ts: HM<&str, i64> = HM::new();
+        for t in history.iter().filter(|t| t.timestamp > 0) {
+            let e = mkt_last_ts.entry(t.condition_id.as_str()).or_insert(0);
+            *e = (*e).max(t.timestamp);
+        }
+
+        let (mut w_pos, mut w_wins) = (0.0f64, 0.0f64);
+        for (cid, &ts) in &mkt_last_ts {
+            // Only count markets the wallet actually traded (not just redeems on
+            // markets that might be in the merged history from another wallet)
+            if !market_set.contains(*cid) { continue; }
+            let age_s = (now_secs - ts).max(0) as f64;
+            let w = (-decay * age_s).exp();
+            w_pos  += w;
+            if redeemed.contains(*cid) { w_wins += w; }
+        }
+        if w_pos > 0.0 { w_wins / w_pos } else { 0.0 }
+    } else {
+        0.0
+    };
+
     WalletProfile {
         wallet,
         pseudonym,
@@ -723,6 +894,9 @@ fn build_wallet_profile(
         alpha_score,
         total_vol,
         market_set,
+        is_fresh,
+        wallet_age_days,
+        win_rate_weighted,
     }
 }
 
@@ -732,6 +906,42 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
     let inter = a.intersection(b).count();
     let union = a.union(b).count();
     if union == 0 { 0.0 } else { inter as f64 / union as f64 }
+}
+
+/// Composite suspicion score (0–100) combining three signals from the
+/// polymarket-insider-tracker reference tool:
+///
+///   fresh_wallet  weight 0.40  — new wallet placing a large bet
+///   size_anomaly  weight 0.35  — position size vs market volume
+///   win_rate      weight 0.25  — historically elevated win rate
+///
+/// Two-signal bonus ×1.2, three-signal bonus ×1.3.
+/// Niche market multiplier ×1.5 (market volume < $50k).
+fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool) -> f64 {
+    // Fresh wallet signal (0 or 1)
+    let fresh_sig = if p.is_fresh { 1.0_f64 } else { 0.0 };
+
+    // Size anomaly signal: volume_impact / 0.02 threshold, capped at 3×
+    let size_sig = if volume_impact > 0.02 {
+        ((volume_impact / 0.02).min(3.0) / 3.0) * 0.9
+    } else {
+        0.0_f64
+    };
+
+    // Win-rate signal: prefer recency-weighted rate; fall back to raw if not computed.
+    let effective_win_rate = if p.win_rate_weighted > 0.0 { p.win_rate_weighted } else { p.win_rate };
+    let win_sig = if effective_win_rate > 0.55 { effective_win_rate } else { 0.0_f64 };
+
+    let n_triggered = [fresh_sig > 0.5, size_sig > 0.1, win_sig > 0.0]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    let multi_bonus = if n_triggered >= 3 { 1.3 } else if n_triggered >= 2 { 1.2 } else { 1.0_f64 };
+    let niche_mult  = if is_niche { 1.5_f64 } else { 1.0 };
+
+    let base = fresh_sig * 0.40 + size_sig * 0.35 + win_sig * 0.25;
+    (base * multi_bonus * niche_mult * 100.0).min(100.0)
 }
 
 /// Identify wallets trading a market with suspiciously high win rates.
@@ -745,9 +955,10 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     use std::collections::HashMap;
     use futures_util::future::join_all;
 
-    let market_id   = args["market_id"].as_str().unwrap_or("");
-    let top_n       = args["top_n"].as_u64().unwrap_or(5).min(10) as usize;
-    let history_len = args["history_trades"].as_u64().unwrap_or(100).min(200) as u32;
+    let market_id      = args["market_id"].as_str().unwrap_or("");
+    let top_n          = args["top_n"].as_u64().unwrap_or(5).min(10) as usize;
+    let history_len    = args["history_trades"].as_u64().unwrap_or(100).min(200) as u32;
+    let coord_threshold = args["coord_threshold"].as_f64().unwrap_or(0.35).clamp(0.05, 0.95);
 
     if market_id.is_empty() {
         return Ok(ToolOutput::err(
@@ -755,10 +966,6 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
              Use list_markets or search_markets to find a conditionId.",
         ));
     }
-
-    const WIN_RATE_THRESHOLD: f64 = 0.55;
-    const MIN_POSITIONS:      usize = 3;
-    const COORD_THRESHOLD:    f64 = 0.35; // Jaccard ≥ 35% → likely coordinated
 
     let mut report = Vec::new();
     report.push(format!(
@@ -801,36 +1008,45 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(top_n);
 
-    // ── 3. Fetch all wallet histories CONCURRENTLY ─────────────────────────
-    let histories: Vec<_> = join_all(
-        ranked.iter().map(|(wallet, _, _)| {
-            clients.polymarket.fetch_user_trades(wallet, history_len)
-        })
+    // ── 3. Fetch TRADE + REDEEM histories CONCURRENTLY ────────────────────
+    let trade_hists: Vec<_> = join_all(
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, history_len))
+    ).await;
+    let redeem_hists: Vec<_> = join_all(
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, history_len))
     ).await;
 
-    // Build profiles
+    // Build profiles — merge TRADE + REDEEM before handing to build_wallet_profile
     let profiles: Vec<WalletProfile> = ranked
         .iter()
-        .zip(histories)
-        .filter_map(|((wallet, market_size, pseudonym), hist_result)| {
-            let hist = hist_result.ok()?;
-            Some(build_wallet_profile(
-                wallet.clone(),
-                pseudonym.clone(),
-                *market_size,
-                &hist,
-            ))
+        .zip(trade_hists.iter().zip(redeem_hists.iter()))
+        .filter_map(|((wallet, market_size, pseudonym), (trades_res, redeems_res))| {
+            let mut history = trades_res.as_ref().ok()?.clone();
+            if let Ok(redeems) = redeems_res {
+                history.extend(redeems.iter().cloned());
+            }
+            Some(build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &history))
         })
         .collect();
 
+    // Also look up market volume for size-anomaly scoring
+    let market_volume: Option<f64> = clients
+        .polymarket
+        .fetch_market_by_condition_id(market_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.volume);
+    let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+
     // ── 4. Summary table ───────────────────────────────────────────────────
     report.push(format!(
-        "{:<22} {:>8} {:>7} {:>6} {:>9} {:>10} {:>9}",
-        "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "TotalVol$"
+        "{:<22} {:>8} {:>7} {:>6} {:>9} {:>10} {:>6} {:>9}",
+        "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Vol%", "Suspicion"
     ));
-    report.push("─".repeat(78));
+    report.push("─".repeat(87));
 
-    let mut flagged: Vec<&WalletProfile> = Vec::new();
+    let mut flagged: Vec<(&WalletProfile, f64)> = Vec::new();
 
     for p in &profiles {
         let name = if p.pseudonym.chars().count() > 20 {
@@ -846,19 +1062,34 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
             format!("{:>8.1}¢", p.alpha_score * 100.0)
         };
 
+        let volume_impact = match market_volume {
+            Some(vol) if vol > 0.0 => p.market_size / vol,
+            _ => 0.0,
+        };
+        let vol_pct = if volume_impact > 0.0 {
+            format!("{:.1}%", volume_impact * 100.0)
+        } else {
+            "—".to_string()
+        };
+
+        let suspicion = compute_suspicion(p, volume_impact, is_niche);
+        let fresh_flag = if p.is_fresh { "N " } else { "  " };
+
         report.push(format!(
-            "{:<22} {:>8.0} {:>7} {:>6} {:>8.1}% {:>10} {:>9.0}",
+            "{}{:<22} {:>8.0} {:>7} {:>6} {:>8.1}% {:>10} {:>6} {:>8.0}/100",
+            fresh_flag,
             name,
             p.market_size,
             p.n_positions,
             p.n_wins,
             p.win_rate * 100.0,
             alpha_str,
-            p.total_vol,
+            vol_pct,
+            suspicion,
         ));
 
-        if p.n_positions >= MIN_POSITIONS && p.win_rate > WIN_RATE_THRESHOLD {
-            flagged.push(p);
+        if suspicion >= 50.0 {
+            flagged.push((p, suspicion));
         }
     }
 
@@ -867,7 +1098,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     for i in 0..profiles.len() {
         for j in (i + 1)..profiles.len() {
             let sim = jaccard(&profiles[i].market_set, &profiles[j].market_set);
-            if sim >= COORD_THRESHOLD {
+            if sim >= coord_threshold {
                 coord_pairs.push((
                     profiles[i].pseudonym.clone(),
                     profiles[j].pseudonym.clone(),
@@ -879,27 +1110,20 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
 
     // ── 6. Detailed section for flagged wallets ────────────────────────────
     if flagged.is_empty() {
-        report.push(format!(
-            "\nNo accounts above the {:.0}% win-rate threshold (min {} markets).",
-            WIN_RATE_THRESHOLD * 100.0,
-            MIN_POSITIONS,
-        ));
+        report.push("\nNo accounts reached the flagging threshold (suspicion ≥ 50).".to_string());
     } else {
         report.push("\n⚠  FLAGGED ACCOUNTS".to_string());
-        report.push("─".repeat(78));
-        for p in &flagged {
-            // Composite suspicion score (0–100)
-            // Components: win_rate weight 0.5, alpha_advantage weight 0.3, vol weight 0.2
-            let alpha_adv = if p.alpha_score.is_nan() {
-                0.0
-            } else {
-                (0.5 - p.alpha_score).max(0.0) * 2.0 // 0–1: how far below 50¢ entry
-            };
-            let vol_score = (p.total_vol.ln() / 15.0).min(1.0).max(0.0);
-            let suspicion = (p.win_rate * 0.5 + alpha_adv * 0.3 + vol_score * 0.2) * 100.0;
-
+        report.push("─".repeat(87));
+        for (p, suspicion) in &flagged {
             report.push(format!("\n  {} ({}…)", p.pseudonym, &p.wallet[..p.wallet.len().min(10)]));
             report.push(format!("    Suspicion score:  {:.0}/100", suspicion));
+            if p.is_fresh {
+                let age_str = p.wallet_age_days
+                    .map(|d| format!("{:.1} days old", d))
+                    .unwrap_or_else(|| "unknown age".to_string());
+                report.push(format!("    ⚠ Fresh wallet: only {} lifetime trades, {} — high insider signal",
+                    p.market_set.len(), age_str));
+            }
             report.push(format!(
                 "    Win rate:         {:.1}%  ({} wins / {} markets)",
                 p.win_rate * 100.0, p.n_wins, p.n_positions
@@ -956,11 +1180,17 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         ));
     }
 
-    let history = clients
-        .polymarket
-        .fetch_user_trades(wallet, history_len)
-        .await
-        .context("Failed to fetch wallet trade history")?;
+    // ── Fetch TRADE + REDEEM concurrently (REDEEM = winning payouts) ───────
+    let (trades_res, redeems_res) = tokio::join!(
+        clients.polymarket.fetch_user_trades(wallet, history_len),
+        clients.polymarket.fetch_user_redeems(wallet, history_len),
+    );
+    let mut history = trades_res.context("Failed to fetch wallet trade history")?;
+    if let Ok(redeems) = redeems_res {
+        history.extend(redeems);
+    }
+    // Sort newest-first for display
+    history.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     if history.is_empty() {
         return Ok(ToolOutput::ok(format!(
@@ -969,28 +1199,53 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         )));
     }
 
-    let profile = build_wallet_profile(
-        wallet.to_string(),
-        history[0].pseudonym.clone(),
-        0.0,
-        &history,
-    );
+    let pseudonym = history.iter().find(|t| !t.pseudonym.is_empty())
+        .map(|t| t.pseudonym.clone())
+        .unwrap_or_else(|| wallet[..wallet.len().min(10)].to_string());
+
+    let profile = build_wallet_profile(wallet.to_string(), pseudonym, 0.0, &history);
 
     let mut report = Vec::new();
     report.push(format!("=== WALLET PROFILE: {} ===", profile.pseudonym));
     report.push(format!("Address: {}", profile.wallet));
 
-    // ── Overall stats ──────────────────────────────────────────────────────
+    let age_str = profile.wallet_age_days
+        .map(|d| if d >= 365.0 { format!("{:.1}y", d / 365.0) } else { format!("{:.0}d", d) })
+        .unwrap_or_else(|| "unknown".to_string());
+    let fresh_note = if profile.is_fresh { "  ⚠ FRESH WALLET" } else { "" };
+    report.push(format!("Wallet age:  {}{}",  age_str, fresh_note));
+
+    // ── Performance summary ────────────────────────────────────────────────
     report.push("\n--- Performance Summary ---".to_string());
-    report.push(format!("Markets traded:  {}", profile.n_positions));
-    report.push(format!("Winning payouts: {}  (win_rate ≈ {:.1}%)",
-        profile.n_wins, profile.win_rate * 100.0));
-    report.push(format!("Total volume:    ${:.0}", profile.total_vol));
+    report.push(format!("Markets traded (n):    {}", profile.n_positions));
+    report.push(format!("Winning payouts:       {}", profile.n_wins));
+
+    // Win rate with sample-size caveat
+    let win_rate_display = if profile.n_positions < 5 {
+        format!("{:.1}%  (n={}, LOW SAMPLE — treat with caution)",
+            profile.win_rate * 100.0, profile.n_positions)
+    } else if profile.n_positions < 15 {
+        format!("{:.1}%  (n={}, moderate sample)",
+            profile.win_rate * 100.0, profile.n_positions)
+    } else {
+        format!("{:.1}%  (n={}, robust sample)",
+            profile.win_rate * 100.0, profile.n_positions)
+    };
+    report.push(format!("Raw win rate:          {}", win_rate_display));
+    if profile.win_rate_weighted > 0.0 {
+        let delta = profile.win_rate_weighted - profile.win_rate;
+        let trend = if delta > 0.05 { "  → improving recently" }
+                    else if delta < -0.05 { "  → declining recently" }
+                    else { "" };
+        report.push(format!("Recency-weighted (90d half-life):  {:.1}%{}",
+            profile.win_rate_weighted * 100.0, trend));
+    }
+    report.push(format!("Total buy-side volume: ${:.0}", profile.total_vol));
 
     if !profile.alpha_score.is_nan() {
         let advantage = 50.0 - profile.alpha_score * 100.0;
         report.push(format!(
-            "Alpha entry:     {:.1}¢  ({:+.1}¢ ahead of 50¢ baseline)",
+            "Alpha entry:           {:.1}¢  ({:+.1}¢ ahead of 50¢ fair-coin baseline)",
             profile.alpha_score * 100.0, advantage,
         ));
         let label = if advantage > 20.0 {
@@ -1000,37 +1255,79 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         } else if advantage > 0.0 {
             "Weak — slight early-entry advantage"
         } else {
-            "None — buys late on winning positions (possible reactive trader)"
+            "None — buys late on winning positions (reactive trader)"
         };
-        report.push(format!("Alpha quality:   {}", label));
+        report.push(format!("Alpha quality:         {}", label));
     }
 
-    // ── Recent activity breakdown ──────────────────────────────────────────
-    report.push("\n--- Recent Activity (newest first) ---".to_string());
-    report.push(format!("{:<8} {:<8} {:>7} {:>6}  {}", "Type", "Side", "Size", "Price¢", "Market"));
-    report.push("─".repeat(72));
+    // ── Timing-to-resolution for winning positions ─────────────────────────
+    {
+        use std::collections::HashMap;
 
-    for t in history.iter().take(20) {
-        let title_trunc = if t.market_title.chars().count() > 35 {
-            let end = t.market_title.char_indices().nth(34).map(|(i, _)| i).unwrap_or(t.market_title.len());
-            format!("{}…", &t.market_title[..end])
-        } else {
-            t.market_title.clone()
-        };
+        // Collect earliest BUY timestamp per market
+        let mut first_buy: HashMap<&str, (i64, f64)> = HashMap::new(); // cid → (ts, price)
+        for t in history.iter().filter(|t| t.side == "BUY" && t.timestamp > 0) {
+            let e = first_buy.entry(t.condition_id.as_str()).or_insert((i64::MAX, t.price));
+            if t.timestamp < e.0 { *e = (t.timestamp, t.price); }
+        }
+        // REDEEM timestamp per market
+        let mut redeem_ts: HashMap<&str, i64> = HashMap::new();
+        for t in history.iter().filter(|t| t.trade_type == "REDEEM" && t.timestamp > 0) {
+            redeem_ts.insert(t.condition_id.as_str(), t.timestamp);
+        }
+        // Markets that have both a first BUY and a REDEEM
+        let mut wins_timing: Vec<(String, f64, f64)> = first_buy.iter()
+            .filter_map(|(cid, &(buy_ts, buy_price))| {
+                let rdm_ts = redeem_ts.get(cid)?;
+                let days_held = (rdm_ts - buy_ts).max(0) as f64 / 86_400.0;
+                let title = history.iter().find(|t| t.condition_id == *cid)
+                    .map(|t| t.market_title.clone())
+                    .unwrap_or_else(|| cid.to_string());
+                Some((title, buy_price * 100.0, days_held))
+            })
+            .collect();
+        wins_timing.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        if !wins_timing.is_empty() {
+            let avg_days = wins_timing.iter().map(|e| e.2).sum::<f64>() / wins_timing.len() as f64;
+            let avg_entry = wins_timing.iter().map(|e| e.1).sum::<f64>() / wins_timing.len() as f64;
+            report.push(format!("\n--- Winning Position Timing ({} positions) ---", wins_timing.len()));
+            report.push(format!("Avg hold before redemption: {:.0} days  |  Avg first-buy price: {:.1}¢",
+                avg_days, avg_entry));
+            report.push(format!("{:<6} {:>8}  {}", "Days", "Entry¢", "Market"));
+            report.push("─".repeat(70));
+            for (title, entry_p, days) in wins_timing.iter().take(10) {
+                let n = title.chars().count().min(52);
+                let t_trunc: String = title.chars().take(n).collect();
+                report.push(format!("{:>5.0}d {:>8.1}  {}", days, entry_p, t_trunc));
+            }
+            if wins_timing.len() > 10 {
+                report.push(format!("  … and {} more", wins_timing.len() - 10));
+            }
+        }
+    }
+
+    // ── Recent activity (newest first, trades + redeems) ──────────────────
+    report.push("\n--- Recent Activity (newest first, TRADE + REDEEM) ---".to_string());
+    report.push(format!("{:<6}  {:<8} {:<8} {:>7} {:>6}  {}", "Date", "Type", "Side", "Size", "Price¢", "Market"));
+    report.push("─".repeat(80));
+
+    for t in history.iter().take(25) {
+        let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp(t.timestamp, 0)
+            .map(|d| d.format("%m-%d").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let n = t.market_title.chars().count().min(35);
+        let title_trunc: String = t.market_title.chars().take(n).collect();
         report.push(format!(
-            "{:<8} {:<8} {:>7.1} {:>6.1}  {}",
-            t.trade_type,
-            t.side,
-            t.size,
-            t.price * 100.0,
-            title_trunc,
+            "{:<6}  {:<8} {:<8} {:>7.1} {:>6.1}  {}",
+            date_str, t.trade_type, t.side, t.size, t.price * 100.0, title_trunc,
         ));
     }
-    if history.len() > 20 {
-        report.push(format!("  … and {} more events", history.len() - 20));
+    if history.len() > 25 {
+        report.push(format!("  … and {} more events", history.len() - 25));
     }
 
-    // ── Top markets by exposure ────────────────────────────────────────────
+    // ── Top markets by buy-side dollar exposure ────────────────────────────
     {
         use std::collections::HashMap;
         let mut by_market: HashMap<&str, f64> = HashMap::new();
@@ -1042,38 +1339,298 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
 
         report.push("\n--- Top Markets by Buy-Side Exposure ---".to_string());
         for (title, vol) in sorted.iter().take(8) {
-            let title_trunc = if title.chars().count() > 55 {
-                let end = title.char_indices().nth(54).map(|(i, _)| i).unwrap_or(title.len());
-                format!("{}…", &title[..end])
-            } else {
-                title.to_string()
-            };
-            report.push(format!("  ${:>8.0}  {}", vol, title_trunc));
+            let n = title.chars().count().min(55);
+            let t_trunc: String = title.chars().take(n).collect();
+            report.push(format!("  ${:>8.0}  {}", vol, t_trunc));
         }
     }
 
-    // ── Suspicion summary ──────────────────────────────────────────────────
+    // ── Suspicion assessment (unified compute_suspicion formula) ──────────
     report.push("\n--- Suspicion Assessment ---".to_string());
-    let alpha_adv = if profile.alpha_score.is_nan() {
-        0.0
-    } else {
-        (0.5 - profile.alpha_score).max(0.0) * 2.0
-    };
-    let vol_score  = (profile.total_vol.ln() / 15.0).min(1.0).max(0.0);
-    let suspicion  = (profile.win_rate * 0.5 + alpha_adv * 0.3 + vol_score * 0.2) * 100.0;
+    let suspicion = compute_suspicion(&profile, 0.0, false);
     report.push(format!("Composite score: {:.0}/100", suspicion));
-
+    report.push(format!(
+        "Components:  fresh={:.0}  vol_anomaly=n/a (no market context)  \
+         win_rate={:.0}  recency_weighted={:.0}",
+        if profile.is_fresh { 100.0 } else { 0.0 },
+        profile.win_rate * 100.0,
+        profile.win_rate_weighted * 100.0,
+    ));
     let verdict = if suspicion > 70.0 {
         "HIGH — multiple strong insider indicators present"
     } else if suspicion > 45.0 {
         "MODERATE — some indicators; monitor closely"
     } else {
-        "LOW — no strong signals"
+        "LOW — no strong signals at this stage"
     };
     report.push(format!("Verdict:         {}", verdict));
     report.push("\nNote: scores are probabilistic proxies, not evidence of wrongdoing.".to_string());
+    report.push("For full context use find_smart_money on a specific market to get volume-impact scores.".to_string());
 
     Ok(ToolOutput::ok(report.join("\n")))
+}
+
+// ─── Market-wide smart money scanner ─────────────────────────────────────────
+
+/// Light-weight per-market smart-money check used by scan_smart_money.
+/// Fetches top `top_n` wallets with 50-trade histories for speed.
+/// Returns `(market_title, condition_id, max_suspicion, top_wallet_name, top_wallet_addr)`.
+async fn quick_market_scan(
+    clients:       &MarketClients,
+    market_id:     &str,
+    market_title:  &str,
+    market_volume: Option<f64>,
+    top_n:         usize,
+) -> (String, String, f64, String, String) {
+    use std::collections::HashMap;
+    use futures_util::future::join_all;
+
+    let fallback = (market_title.to_string(), market_id.to_string(), 0.0, String::new(), String::new());
+
+    let Ok(trades) = clients.polymarket.fetch_market_trades(market_id, 100).await else {
+        return fallback;
+    };
+    if trades.is_empty() { return fallback; }
+
+    // Top wallets by buy-side size
+    let mut agg: HashMap<String, (f64, String)> = HashMap::new();
+    for t in &trades {
+        if t.side == "BUY" {
+            let e = agg.entry(t.wallet.clone()).or_insert((0.0, t.pseudonym.clone()));
+            e.0 += t.size;
+        }
+    }
+    let mut ranked: Vec<(String, f64, String)> = agg
+        .into_iter().map(|(w, (s, p))| (w, s, p)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_n);
+
+    if ranked.is_empty() { return fallback; }
+
+    // Fetch TRADE + REDEEM histories concurrently (shallow: 50 each)
+    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 50)));
+    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 50)));
+    let (trade_hists, redeem_hists) = tokio::join!(trade_futs, redeem_futs);
+
+    let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+    let mut best = (0.0f64, String::new(), String::new());
+
+    for (i, (wallet, market_size, pseudonym)) in ranked.iter().enumerate() {
+        let mut history = trade_hists[i].as_ref().ok().cloned().unwrap_or_default();
+        if let Ok(r) = &redeem_hists[i] { history.extend(r.iter().cloned()); }
+        let profile = build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &history);
+        let vol_impact = match market_volume {
+            Some(v) if v > 0.0 => market_size / v,
+            _ => 0.0,
+        };
+        let suspicion = compute_suspicion(&profile, vol_impact, is_niche);
+        if suspicion > best.0 {
+            best = (suspicion, profile.pseudonym.clone(), wallet.clone());
+        }
+    }
+
+    (market_title.to_string(), market_id.to_string(), best.0, best.1, best.2)
+}
+
+/// Scan a batch of Polymarket markets and return those with elevated smart-money
+/// suspicion scores, sorted highest-first.  Faster than calling find_smart_money
+/// repeatedly because it uses shallow histories (50 trades/wallet) and returns
+/// only summary rows.  Follow up with find_smart_money or analyze_wallet on the
+/// flagged markets/wallets for full detail.
+async fn scan_smart_money(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    use futures_util::future::join_all;
+
+    let limit         = args["limit"].as_u64().unwrap_or(20).min(30) as u32;
+    let top_n         = args["top_n"].as_u64().unwrap_or(3).min(5) as usize;
+    let min_suspicion = args["min_suspicion"].as_f64().unwrap_or(40.0);
+    let category      = args["category"].as_str();
+
+    let markets = clients.polymarket.fetch_markets(limit, None, category).await
+        .context("Failed to fetch markets for scan")?;
+
+    if markets.is_empty() {
+        return Ok(ToolOutput::ok("No active Polymarket markets found.".to_string()));
+    }
+
+    // Run all market scans concurrently (shallow, fast)
+    let scans = join_all(markets.iter().map(|m| {
+        let cid   = m.id.clone();
+        let title = m.title.clone();
+        let vol   = m.volume;
+        async move { quick_market_scan(clients, &cid, &title, vol, top_n).await }
+    })).await;
+
+    // Filter and sort
+    let mut flagged: Vec<_> = scans.into_iter()
+        .filter(|(_, _, susp, _, _)| *susp >= min_suspicion)
+        .collect();
+    flagged.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    if flagged.is_empty() {
+        return Ok(ToolOutput::ok(format!(
+            "No markets met the minimum suspicion threshold of {:.0} out of {} scanned.",
+            min_suspicion, markets.len()
+        )));
+    }
+
+    let mut report = Vec::new();
+    report.push(format!(
+        "=== SMART MONEY SCAN: {} markets scanned, {} flagged (≥{:.0} suspicion) ===\n",
+        markets.len(), flagged.len(), min_suspicion
+    ));
+    report.push(format!("{:<8}  {:<20}  {}  {}",
+        "Score", "Top Wallet", "ConditionId", "Market"));
+    report.push("─".repeat(100));
+
+    for (title, cid, susp, wallet_name, wallet_addr) in &flagged {
+        let wname = if wallet_name.is_empty() { "—".to_string() } else {
+            let n = wallet_name.chars().count().min(20);
+            wallet_name.chars().take(n).collect()
+        };
+        let mkt_short: String = title.chars().take(52).collect();
+        report.push(format!("{:>6.0}/100  {:<20}  {}…  {}",
+            susp, wname, &cid[..cid.len().min(18)], mkt_short));
+        if !wallet_addr.is_empty() {
+            report.push(format!("             wallet: {}  → call analyze_wallet for detail", wallet_addr));
+        }
+    }
+
+    report.push(format!(
+        "\nNext steps:\n\
+         • find_smart_money market_id=<conditionId>  — full analysis for a specific market\n\
+         • analyze_wallet wallet=<address>            — deep-dive on a specific wallet\n\
+         • get_wallet_positions wallet=<address>      — current open positions for a wallet"
+    ));
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+// ─── Current open positions for a wallet ─────────────────────────────────────
+
+/// Derive open (unresolved) positions from a wallet's TRADE + REDEEM history.
+/// A position is "open" when the wallet has net positive shares in a market
+/// and has not yet received a REDEEM event for it.
+async fn get_wallet_positions(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let wallet      = args["wallet"].as_str().unwrap_or("").trim();
+    let history_len = args["limit"].as_u64().unwrap_or(300).min(500) as u32;
+
+    if wallet.is_empty() {
+        return Ok(ToolOutput::err(
+            "Required: wallet (Polymarket proxy wallet address). \
+             Obtain from find_smart_money or scan_smart_money."
+        ));
+    }
+
+    let (trades_res, redeems_res) = tokio::join!(
+        clients.polymarket.fetch_user_trades(wallet, history_len),
+        clients.polymarket.fetch_user_redeems(wallet, history_len),
+    );
+    let mut history = trades_res.context("Failed to fetch wallet trades")?;
+    if let Ok(r) = redeems_res { history.extend(r); }
+
+    if history.is_empty() {
+        return Ok(ToolOutput::ok(format!(
+            "=== OPEN POSITIONS: {} ===\n\nNo trade history found.", wallet
+        )));
+    }
+
+    let pseudonym = history.iter().find(|t| !t.pseudonym.is_empty())
+        .map(|t| t.pseudonym.clone())
+        .unwrap_or_else(|| wallet[..wallet.len().min(10)].to_string());
+
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Pos {
+        title:    String,
+        net_yes:  f64,   // YES shares held (bought – sold)
+        net_no:   f64,   // NO shares held
+        yes_cost: f64,   // net dollars spent on YES
+        no_cost:  f64,
+        last_ts:  i64,
+        resolved: bool,
+    }
+
+    let mut positions: HashMap<String, Pos> = HashMap::new();
+
+    for t in &history {
+        let e = positions.entry(t.condition_id.clone()).or_default();
+        if t.market_title != e.title && !t.market_title.is_empty() {
+            e.title = t.market_title.clone();
+        }
+        e.last_ts = e.last_ts.max(t.timestamp);
+
+        if t.trade_type == "REDEEM" {
+            e.resolved = true;
+            continue;
+        }
+
+        let is_yes = t.outcome_index == 0;
+        let dollar_val = t.size * t.price;
+        match t.side.as_str() {
+            "BUY"  => { if is_yes { e.net_yes += t.size; e.yes_cost += dollar_val; }
+                         else      { e.net_no  += t.size; e.no_cost  += dollar_val; } }
+            "SELL" => { if is_yes { e.net_yes -= t.size; e.yes_cost -= dollar_val; }
+                         else      { e.net_no  -= t.size; e.no_cost  -= dollar_val; } }
+            _ => {}
+        }
+    }
+
+    // Open = unresolved with net positive shares
+    let mut open: Vec<(String, Pos)> = positions.into_iter()
+        .filter(|(_, p)| !p.resolved && (p.net_yes > 0.5 || p.net_no > 0.5))
+        .collect();
+    // Sort by cost (largest first)
+    open.sort_by(|a, b| {
+        let ca = if a.1.net_yes >= a.1.net_no { a.1.yes_cost } else { a.1.no_cost };
+        let cb = if b.1.net_yes >= b.1.net_no { b.1.yes_cost } else { b.1.no_cost };
+        cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut report = Vec::new();
+    report.push(format!("=== OPEN POSITIONS: {} ===", pseudonym));
+    report.push(format!("Address: {}", wallet));
+    report.push(format!("{} open position(s) out of {} markets in history\n", open.len(), positions_total(&history)));
+
+    if open.is_empty() {
+        report.push("No open positions detected — all positions appear resolved or flat.".to_string());
+        report.push("(History may be truncated; increase limit for a deeper check)".to_string());
+    } else {
+        report.push(format!("{:<5}  {:>9}  {:>9}  {:>9}  {:>11}  {}",
+            "Side", "Shares", "Cost $", "AvgPx¢", "LastActivity", "Market"));
+        report.push("─".repeat(92));
+
+        let now = chrono::Utc::now().timestamp();
+        let mut total_cost = 0.0f64;
+
+        for (_cid, p) in &open {
+            let (side, shares, cost) = if p.net_yes >= p.net_no {
+                ("YES", p.net_yes, p.yes_cost)
+            } else {
+                ("NO", p.net_no, p.no_cost)
+            };
+            let avg_px = if shares > 0.0 { cost / shares * 100.0 } else { 0.0 };
+            let age_days = (now - p.last_ts).max(0) as f64 / 86_400.0;
+            let last_str = if age_days < 1.0 {
+                format!("{:.0}h ago", age_days * 24.0)
+            } else {
+                format!("{:.0}d ago", age_days)
+            };
+            let mkt: String = p.title.chars().take(42).collect();
+            report.push(format!("{:<5}  {:>9.1}  {:>9.2}  {:>9.1}  {:>11}  {}",
+                side, shares, cost, avg_px, last_str, mkt));
+            total_cost += cost;
+        }
+        report.push(format!("\nTotal open exposure:  ${:.2}", total_cost));
+        report.push(format!("kelly_size tip: use each position's avg_px as market_price to size against your view."));
+    }
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+fn positions_total(history: &[crate::markets::polymarket::PolyTrade]) -> usize {
+    use std::collections::HashSet;
+    history.iter().map(|t| t.condition_id.as_str()).collect::<HashSet<_>>().len()
 }
 
 // ─── Kelly criterion position sizing ─────────────────────────────────────────
@@ -1326,13 +1883,13 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "find_smart_money".into(),
-            description: "Identify Polymarket wallets trading a specific market that have \
-                suspiciously high historical win rates. Fetches recent trades for the \
-                market, selects the top traders by position size, then pulls their full \
-                trade history to compute win rate (REDEEM events / markets traded), \
-                average entry price, and total volume. Flags accounts above the win-rate \
-                threshold as potential smart money / insider traders. \
-                Use the conditionId from list_markets or search_markets as market_id.".into(),
+            description: "Deep smart-money analysis for ONE Polymarket market. Fetches recent \
+                trades, profiles the top traders by buy-side size (TRADE + REDEEM histories \
+                fetched concurrently), computes recency-weighted win rate, alpha-entry score, \
+                volume-anomaly, and a composite suspicion score (0–100). Also detects coordinated \
+                wallet pairs via Jaccard market-overlap. Use after scan_smart_money has flagged a \
+                market, or when you already have a conditionId of interest. \
+                Recommended workflow: scan_smart_money → find_smart_money → analyze_wallet.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1350,6 +1907,13 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Number of recent trades to fetch per wallet for \
                             history analysis. Default 100, max 200."
+                    },
+                    "coord_threshold": {
+                        "type": "number",
+                        "description": "Jaccard similarity threshold (0–1) for flagging wallet \
+                            pairs as coordinated — wallets sharing at least this fraction of \
+                            their traded markets are highlighted. Default 0.35. Lower to surface \
+                            more pairs; raise to reduce noise."
                     }
                 },
                 "required": ["market_id"]
@@ -1380,11 +1944,14 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "analyze_wallet".into(),
-            description: "Deep profile of a specific Polymarket wallet: performance history, \
-                alpha-entry score (average BUY price on winning positions — lower means \
-                they buy before the move), top markets by exposure, and a composite \
-                suspicion score. Use after find_smart_money to investigate flagged wallets. \
-                Wallet address comes from find_smart_money output.".into(),
+            description: "Deep profile of a specific Polymarket wallet. Fetches TRADE + REDEEM \
+                histories concurrently to correctly compute win rate (REDEEMs = winning payouts), \
+                recency-weighted win rate (90-day half-life), alpha-entry score, timing-to-resolution \
+                on winning positions (how many days before redemption they first bought), and a \
+                unified suspicion score using the same formula as find_smart_money. \
+                Also shows recent activity with dates and top markets by buy-side exposure. \
+                Use after find_smart_money or scan_smart_money to investigate a flagged wallet. \
+                Wallet address comes from those tools' output.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1396,6 +1963,62 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                     "limit": {
                         "type": "integer",
                         "description": "Max trade events to pull from history. Default 200, max 500."
+                    }
+                },
+                "required": ["wallet"]
+            }),
+        },
+        ToolDefinition {
+            name: "scan_smart_money".into(),
+            description: "Scan multiple Polymarket markets simultaneously for elevated smart-money \
+                activity. Uses shallow per-wallet histories (50 trades) for speed, so it can \
+                process 20–30 markets in one call and rank them by maximum suspicion score. \
+                Use this as your morning book-scan: run it first to find markets worth deep-diving, \
+                then call find_smart_money on flagged conditionIds. \
+                Recommended first step when you don't have a specific market in mind.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of active markets to scan (1–30). Default 20."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Wallets to profile per market (1–5). Default 3."
+                    },
+                    "min_suspicion": {
+                        "type": "number",
+                        "description": "Minimum suspicion score (0–100) to include in results. Default 40."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optionally restrict to a topic category (e.g. 'politics', 'crypto')."
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "get_wallet_positions".into(),
+            description: "Derive the current OPEN positions for a specific Polymarket wallet by \
+                replaying its TRADE + REDEEM history. A position is open when net shares \
+                (bought minus sold) are positive and no REDEEM (winning payout) has occurred. \
+                Returns: side (YES/NO), share count, cost basis, average entry price, and \
+                days since last activity for each open market. \
+                Use this to answer 'what is this wallet currently betting on?' after \
+                find_smart_money or scan_smart_money surfaces a suspicious wallet.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "wallet": {
+                        "type": "string",
+                        "description": "Polymarket proxy wallet address (hex, e.g. '0xabc…'). \
+                            Obtain from find_smart_money or scan_smart_money."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max trade events to pull from history. Default 300, max 500."
                     }
                 },
                 "required": ["wallet"]

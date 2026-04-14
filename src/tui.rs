@@ -223,11 +223,15 @@ pub struct App {
     pub pos_draft:         PosDraft,
 
     // Smart Money tab
-    pub sm_wallets:       Vec<SmartMoneyWallet>,
-    pub sm_market_title:  String,
-    pub sm_coord_pairs:   Vec<(String, String, f64)>,
-    pub sm_loading:       bool,
-    pub sm_list:          ListState,
+    pub sm_wallets:         Vec<SmartMoneyWallet>,
+    pub sm_market_title:    String,
+    pub sm_coord_pairs:     Vec<(String, String, f64)>,
+    pub sm_loading:         bool,
+    pub sm_list:            ListState,
+    // Wallet drill-down detail (Enter on a wallet row)
+    pub sm_detail:          Option<crate::tools::WalletDetail>,
+    pub sm_detail_loading:  bool,
+    pub sm_detail_scroll:   u16,
 
     // Time & Sales tab
     pub trades_data:      Vec<PolyTrade>,
@@ -278,6 +282,12 @@ pub struct App {
     pub target_input_mode: bool,
     pub target_input_step: TargetInputStep,
     pub target_pos_id:     String,   // position being edited
+
+    // Adjustable thresholds (user-configurable in TUI, also settable by AI tools)
+    /// Jaccard market-overlap threshold for wallet coordination detection (0–1).
+    pub coord_threshold:         f64,
+    /// Jaccard word-set threshold for Pairs tab cross-platform matching (0–1).
+    pub pairs_jaccard_threshold: f64,
 
     // Cross-platform pairs (Pairs tab)
     pub pairs:             Vec<crate::pairs::MarketPair>,
@@ -356,11 +366,14 @@ impl App {
             pos_input_mode:    false,
             pos_input_step:    PosInputStep::default(),
             pos_draft:         PosDraft::default(),
-            sm_wallets:        Vec::new(),
-            sm_market_title:   String::new(),
-            sm_coord_pairs:    Vec::new(),
-            sm_loading:        false,
-            sm_list:           ListState::default(),
+            sm_wallets:         Vec::new(),
+            sm_market_title:    String::new(),
+            sm_coord_pairs:     Vec::new(),
+            sm_loading:         false,
+            sm_list:            ListState::default(),
+            sm_detail:          None,
+            sm_detail_loading:  false,
+            sm_detail_scroll:   0,
             trades_data:       Vec::new(),
             trades_list:       ListState::default(),
             chart_candles:     Vec::new(),
@@ -389,6 +402,8 @@ impl App {
             target_input_mode: false,
             target_input_step: TargetInputStep::default(),
             target_pos_id:     String::new(),
+            coord_threshold:         0.35,
+            pairs_jaccard_threshold: 0.35,
             pairs:             Vec::new(),
             pairs_cursor:      0,
             pairs_loading:     false,
@@ -546,11 +561,18 @@ impl App {
             Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_sub(1); } // j = scroll toward bottom
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_add(1); }
             Tab::SmartMoney => {
-                // +2 for header rows
-                let len = self.sm_wallets.len() + 2;
-                if len <= 2 { return; }
-                let i = self.sm_list.selected().map(|i| (i + 1) % len).unwrap_or(2);
-                self.sm_list.select(Some(i));
+                if self.sm_detail.is_some() || self.sm_detail_loading {
+                    // In detail view: scroll down through trade history
+                    self.sm_detail_scroll = self.sm_detail_scroll.saturating_add(1);
+                } else {
+                    // In list view: navigate wallets
+                    let len = self.sm_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.sm_list.selected().map(|i| {
+                        if i + 1 >= len { 2 } else { i + 1 }
+                    }).unwrap_or(2);
+                    self.sm_list.select(Some(i));
+                }
             }
             Tab::Trades => {
                 let len = self.trades_data.len();
@@ -596,12 +618,18 @@ impl App {
             Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_add(1); } // k = scroll toward top
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_sub(1); }
             Tab::SmartMoney => {
-                let len = self.sm_wallets.len() + 2;
-                if len <= 2 { return; }
-                let i = self.sm_list.selected()
-                    .map(|i| if i <= 2 { len - 1 } else { i - 1 })
-                    .unwrap_or(2);
-                self.sm_list.select(Some(i));
+                if self.sm_detail.is_some() || self.sm_detail_loading {
+                    // In detail view: scroll up through trade history
+                    self.sm_detail_scroll = self.sm_detail_scroll.saturating_sub(1);
+                } else {
+                    // In list view: navigate wallets
+                    let len = self.sm_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.sm_list.selected()
+                        .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                        .unwrap_or(2);
+                    self.sm_list.select(Some(i));
+                }
             }
             Tab::Trades => {
                 let len = self.trades_data.len();
@@ -1878,7 +1906,7 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
 
     // ── Category exposure (correlation proxy) ─────────────────────────────────
     // Group cost by category keyword to show topic concentration risk.
-    let mut cat_exposure: Vec<(String, f64)> = {
+    let cat_exposure: Vec<(String, f64)> = {
         let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for pos in positions {
             let cat = app.markets.iter()
@@ -2170,10 +2198,11 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
     };
     let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
     let header_title = format!(
-        " Cross-Platform Pairs  {}  [{} pairs  {} arb] ",
+        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [/] adjust ",
         matcher_label,
         app.pairs.len(),
         arb_count,
+        app.pairs_jaccard_threshold * 100.0,
     );
 
     if app.pairs.is_empty() {
@@ -2503,25 +2532,43 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let chunks = Layout::default()
+    // When a wallet is selected (or loading), split horizontally: list left, detail right.
+    let show_detail = app.sm_detail.is_some() || app.sm_detail_loading;
+    let (list_area, detail_area_opt) = if show_detail {
+        let horiz = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area);
+        (horiz[0], Some(horiz[1]))
+    } else {
+        (area, None)
+    };
+
+    // ── Vertical split of left side: wallet table + coordination panel + legend
+    let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3)])
-        .split(area);
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3),
+            Constraint::Length(13),
+        ])
+        .split(list_area);
 
     // ── Top traders table ──────────────────────────────────────────────────
-    let title = format!(" Smart Money — {} ({} traders) ", app.sm_market_title, app.sm_wallets.len());
+    let title = format!(" Smart Money — {} ({} traders)  coord≥{:.0}%  [/] adjust ",
+        app.sm_market_title, app.sm_wallets.len(), app.coord_threshold * 100.0);
 
     let header = Line::from(vec![
         Span::styled(
-            format!("  {:<22} {:>8} {:>6} {:>5} {:>9} {:>10} {:>9}",
-                "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Suspicion"),
+            format!("  {:<22} {:>8} {:>6} {:>5} {:>9} {:>10} {:>6} {:>9}",
+                "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Vol%", "Suspicion"),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
 
     let mut items: Vec<ListItem> = vec![
         ListItem::new(header),
-        ListItem::new(Line::from(Span::styled("  ".to_string() + &"─".repeat(76), Style::default().fg(Color::DarkGray)))),
+        ListItem::new(Line::from(Span::styled("  ".to_string() + &"─".repeat(84), Style::default().fg(Color::DarkGray)))),
     ];
 
     for w in &app.sm_wallets {
@@ -2540,10 +2587,19 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
             Color::White
         };
 
-        let flag = if w.flagged { "⚠ " } else { "  " };
+        let vol_pct_str = if w.volume_impact > 0.0 {
+            format!("{:.1}%", w.volume_impact * 100.0)
+        } else {
+            "—".to_string()
+        };
+
+        let flags = format!("{}{} ",
+            if w.is_fresh { "N" } else { " " },
+            if w.flagged  { "⚠" } else { " " },
+        );
 
         let line = Line::from(vec![
-            Span::styled(flag, Style::default().fg(Color::Yellow)),
+            Span::styled(flags, Style::default().fg(Color::Yellow)),
             Span::styled(format!("{:<22}", name), Style::default().fg(suspicion_color).bold()),
             Span::raw(format!(" {:>8.0}", w.market_size)),
             Span::raw(format!(" {:>6}", w.n_positions)),
@@ -2554,6 +2610,11 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
                 else { Color::White }
             )),
             Span::raw(format!(" {:>10}", alpha_str)),
+            Span::styled(format!(" {:>6}", vol_pct_str), Style::default().fg(
+                if w.volume_impact > 0.05 { Color::Red }
+                else if w.volume_impact > 0.02 { Color::Yellow }
+                else { Color::DarkGray }
+            )),
             Span::styled(format!(" {:>8.0}/100", w.suspicion), Style::default().fg(suspicion_color)),
         ]);
         items.push(ListItem::new(line));
@@ -2565,13 +2626,13 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("▶ ");
 
     let mut state = app.sm_list.clone();
-    f.render_stateful_widget(list, chunks[0], &mut state);
+    f.render_stateful_widget(list, left_chunks[0], &mut state);
 
     // ── Coordination panel ─────────────────────────────────────────────────
     let coord_title = if app.sm_coord_pairs.is_empty() {
-        " Coordination  (none detected) ".to_string()
+        format!(" Coordination  (none detected, threshold {:.0}%) ", app.coord_threshold * 100.0)
     } else {
-        format!(" Coordination  ({} pair(s) flagged) ", app.sm_coord_pairs.len())
+        format!(" Coordination  ({} pair(s) ≥{:.0}% overlap) ", app.sm_coord_pairs.len(), app.coord_threshold * 100.0)
     };
 
     let mut coord_lines: Vec<Line> = vec![Line::from("")];
@@ -2601,7 +2662,208 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
 
     let coord_p = Paragraph::new(coord_lines)
         .block(Block::default().title(coord_title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-    f.render_widget(coord_p, chunks[1]);
+    f.render_widget(coord_p, left_chunks[1]);
+
+    // ── Legend / quick-reference panel ────────────────────────────────────
+    render_sm_legend(f, left_chunks[2]);
+
+    // ── Wallet detail panel (right side) ───────────────────────────────────
+    if let Some(detail_area) = detail_area_opt {
+        render_sm_wallet_detail(f, detail_area, app);
+    }
+}
+
+/// Notation / usage legend pinned to the bottom-left of the Smart Money tab.
+fn render_sm_legend(f: &mut Frame, area: Rect) {
+    let dg = Style::default().fg(Color::DarkGray);
+    let hi = Style::default().fg(Color::White);
+    let yw = Style::default().fg(Color::Yellow);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  N ", yw),
+            Span::styled("fresh wallet (≤10 lifetime trades, all within 7d)  ", dg),
+            Span::styled("⚠ ", yw),
+            Span::styled("flagged (suspicion ≥ threshold)", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  WinRate ", dg),
+            Span::styled("redeems / total positions  ", hi),
+            Span::styled("AlphaEntry ", dg),
+            Span::styled("avg entry price delta on winning trades", hi),
+        ]),
+        Line::from(vec![
+            Span::styled("  Vol%    ", dg),
+            Span::styled("wallet position / market daily volume  ", hi),
+            Span::styled("Suspicion ", dg),
+            Span::styled("0–100 composite score", hi),
+        ]),
+        Line::from(vec![
+            Span::styled("  Suspicion = ", dg),
+            Span::styled("fresh×0.4 + vol_anomaly×0.35 + win_rate×0.25", hi),
+            Span::styled("  (×1.2/1.3/1.5 for 2/3 signals / niche market)", dg),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter ", yw), Span::styled("wallet drill-down  ", dg),
+            Span::styled("Esc ", yw),    Span::styled("back to list  ", dg),
+            Span::styled("[ ] ", yw),    Span::styled("adjust coord threshold  ", dg),
+            Span::styled("r ", yw),      Span::styled("refresh", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  j/k ", yw),  Span::styled("navigate / scroll  ", dg),
+            Span::styled("a ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Legend & Keys ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+/// Render the wallet detail panel (right side of Smart Money split view).
+fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
+    use chrono::{DateTime, Utc};
+
+    if app.sm_detail_loading {
+        let p = Paragraph::new("\n  Fetching wallet history…")
+            .block(Block::default().title(" Wallet Detail ").borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let Some(detail) = &app.sm_detail else { return };
+
+    // ── Stats header (fixed height) ────────────────────────────────────────
+    let stats_height: u16 = 10;
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(stats_height), Constraint::Min(0)])
+        .split(area);
+
+    let age_str = if detail.is_fresh {
+        "fresh / new wallet".to_string()
+    } else {
+        detail.wallet_age_days
+            .map(|d| if d >= 365.0 { format!("{:.1}y old", d / 365.0) } else { format!("{:.0}d old", d) })
+            .unwrap_or_else(|| "age unknown".to_string())
+    };
+    let alpha_str = if detail.alpha_score.is_nan() {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}¢", detail.alpha_score * 100.0)
+    };
+
+    let stats_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Wallet  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(trunc(&detail.wallet, 42), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Name    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&detail.pseudonym as &str, Style::default().fg(Color::White).bold()),
+            Span::styled(format!("  ({})", age_str), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Trades  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{} trades  ", detail.recent_trades.len())),
+            Span::styled("Positions  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}", detail.n_positions)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Wins    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}/{}", detail.n_wins, detail.n_positions)),
+            Span::styled("  Win Rate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}%", detail.win_rate * 100.0),
+                Style::default().fg(if detail.win_rate >= 0.7 { Color::Red } else if detail.win_rate >= 0.55 { Color::Yellow } else { Color::White }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Vol $   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("${:.0}", detail.total_vol)),
+            Span::styled("  Alpha   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(alpha_str),
+        ]),
+        Line::from(vec![
+            Span::styled("  Top markets  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                detail.top_markets.iter().take(3)
+                    .map(|(t, v)| format!("{} (${:.0})", trunc(t, 20), v))
+                    .collect::<Vec<_>>().join("  ·  ")
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  j/k scroll  ·  Esc to return",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let stats_p = Paragraph::new(stats_lines)
+        .block(Block::default()
+            .title(format!(" {} ", detail.pseudonym))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)));
+    f.render_widget(stats_p, vert[0]);
+
+    // ── Trade history (scrollable) ─────────────────────────────────────────
+    let trade_header = Line::from(vec![
+        Span::styled(
+            format!("  {:<12} {:<6} {:<7} {:>8} {:>7}  {}", "Date", "Type", "Side", "Size", "Price", "Market"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let mut trade_lines: Vec<Line> = vec![trade_header,
+        Line::from(Span::styled("  ".to_string() + &"─".repeat(70), Style::default().fg(Color::DarkGray)))
+    ];
+
+    for trade in &detail.recent_trades {
+        let dt = DateTime::<Utc>::from_timestamp(trade.timestamp, 0)
+            .map(|d| d.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let type_col = if trade.trade_type == "REDEEM" {
+            Span::styled(format!("{:<6}", "RDEEM"), Style::default().fg(Color::Green))
+        } else {
+            Span::raw(format!("{:<6}", "TRADE"))
+        };
+        let side_col = match trade.side.as_str() {
+            "BUY"  => Span::styled(format!("{:<7}", "BUY"), Style::default().fg(Color::Green)),
+            "SELL" => Span::styled(format!("{:<7}", "SELL"), Style::default().fg(Color::Red)),
+            _      => Span::styled(format!("{:<7}", "—"), Style::default().fg(Color::DarkGray)),
+        };
+
+        trade_lines.push(Line::from(vec![
+            Span::raw(format!("  {:<12} ", dt)),
+            type_col,
+            Span::raw(" "),
+            side_col,
+            Span::raw(format!(" {:>8.1}", trade.size)),
+            Span::styled(
+                format!(" {:>6.1}¢  ", trade.price * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(trunc(&trade.market_title, 30)),
+        ]));
+    }
+
+    if detail.recent_trades.is_empty() {
+        trade_lines.push(Line::from(Span::styled(
+            "  No recent trades found.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let trade_p = Paragraph::new(trade_lines)
+        .block(Block::default().title(" Trade History ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .scroll((app.sm_detail_scroll, 0));
+    f.render_widget(trade_p, vert[1]);
 }
 
 // ── Help overlay ─────────────────────────────────────────────────────────────
@@ -3339,7 +3601,7 @@ pub async fn run_tui(
 
                         // Always compute Jaccard pairs immediately on market load.
                         // LLM-enhanced matching happens when user visits the Pairs tab.
-                        let jaccard = crate::pairs::jaccard_pairs(&app.markets);
+                        let jaccard = crate::pairs::jaccard_pairs(&app.markets, Some(app.pairs_jaccard_threshold));
                         let arb_count = jaccard.iter().filter(|p| p.net_gap > 0.0).count();
                         if !jaccard.is_empty() {
                             app.pairs = jaccard;
@@ -3388,15 +3650,27 @@ pub async fn run_tui(
                             app.sm_market_title = result.market_title;
                             app.sm_wallets = result.wallets;
                             app.sm_coord_pairs = result.coord_pairs;
+                            app.sm_detail = None;
                             if !app.sm_wallets.is_empty() {
-                                app.sm_list.select(Some(0));
+                                app.sm_list.select(Some(2)); // skip header rows
                             }
                             let flagged = app.sm_wallets.iter().filter(|w| w.flagged).count();
                             app.status = format!(
-                                "Smart money: {} traders, {} flagged",
+                                "Smart money: {} traders, {} flagged — Enter to drill into a wallet",
                                 app.sm_wallets.len(), flagged
                             );
                         }
+                    }
+                    AppEvent::WalletDetailLoading => {
+                        app.sm_detail_loading = true;
+                        app.sm_detail = None;
+                        app.sm_detail_scroll = 0;
+                        app.status = "Loading wallet detail…".to_string();
+                    }
+                    AppEvent::WalletDetailLoaded(detail) => {
+                        app.sm_detail_loading = false;
+                        app.status = format!("Wallet: {} — {} trades", detail.pseudonym, detail.recent_trades.len());
+                        app.sm_detail = Some(detail);
                     }
                     AppEvent::RefreshStarted => {
                         app.is_loading = true;
@@ -3797,6 +4071,19 @@ async fn handle_key(
                 }
             } else if !app.input.is_empty() {
                 send_chat(app, backend, clients, event_tx, llm_history).await;
+            } else if app.active_tab == AppTab::SmartMoney {
+                // Drill into the selected wallet
+                if let Some(idx) = app.sm_list.selected() {
+                    let wallet_idx = idx.saturating_sub(2); // skip 2 header rows
+                    if let Some(w) = app.sm_wallets.get(wallet_idx) {
+                        let wallet_addr = w.wallet.clone();
+                        let clients_c = clients.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            agent::refresh_wallet_detail(clients_c, wallet_addr, tx).await;
+                        });
+                    }
+                }
             } else {
                 // Load chart + orderbook from selected market (Markets or Signals)
                 let market_id = match app.active_tab {
@@ -3957,6 +4244,53 @@ async fn handle_key(
             trigger_llm_pairs(app, backend, event_tx).await;
         }
 
+        // ── Threshold adjustments ─────────────────────────────────────────────
+        // '[' / ']' lower / raise the active tab's relevant threshold by 0.05.
+        // Smart Money tab → coord_threshold
+        // Pairs tab       → pairs_jaccard_threshold
+        KC::Char('[') if app.input.is_empty()
+            && matches!(app.active_tab, AppTab::SmartMoney | AppTab::Pairs) =>
+        {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {}
+            }
+        }
+        KC::Char(']') if app.input.is_empty()
+            && matches!(app.active_tab, AppTab::SmartMoney | AppTab::Pairs) =>
+        {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // ── Portfolio tab: toggle risk view ───────────────────────────────────
         KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
             app.show_risk_view = !app.show_risk_view;
@@ -3973,6 +4307,17 @@ async fn handle_key(
             app.search.clear();
             app.active_tab = AppTab::Markets;
         }
+        // Close wallet detail panel (SmartMoney tab)
+        KC::Esc if app.input.is_empty()
+            && app.active_tab == AppTab::SmartMoney
+            && (app.sm_detail.is_some() || app.sm_detail_loading) =>
+        {
+            app.sm_detail         = None;
+            app.sm_detail_loading = false;
+            app.sm_detail_scroll  = 0;
+            app.status = "Back to wallet list.".to_string();
+        }
+
         KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
             app.search.clear();
             app.status = "Search cleared".to_string();
@@ -4432,12 +4777,14 @@ async fn trigger_smart_money_load(
     let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
     if market.platform != Platform::Polymarket { return; }
 
-    let clients_c = clients.clone();
-    let tx        = event_tx.clone();
-    let market_id = id.clone();
+    let clients_c       = clients.clone();
+    let tx              = event_tx.clone();
+    let market_id       = id.clone();
+    let market_volume   = market.volume;
+    let coord_threshold = app.coord_threshold;
 
     tokio::spawn(async move {
-        agent::refresh_smart_money(clients_c, market_id, tx).await;
+        agent::refresh_smart_money(clients_c, market_id, market_volume, coord_threshold, tx).await;
     });
 }
 
@@ -4474,15 +4821,16 @@ async fn trigger_llm_pairs(
 
     let markets_snap = app.markets.clone();
     let tx = event_tx.clone();
+    let jaccard_threshold = app.pairs_jaccard_threshold;
 
     if let Some(b) = backend.clone() {
         tokio::spawn(async move {
-            let pairs = crate::pairs::llm_match_pairs(&markets_snap, &b).await;
+            let pairs = crate::pairs::llm_match_pairs(&markets_snap, &b, Some(jaccard_threshold)).await;
             let _ = tx.send(AppEvent::PairsLoaded(pairs));
         });
     } else {
         // No LLM — use Jaccard immediately (synchronous, fast)
-        let pairs = crate::pairs::jaccard_pairs(&markets_snap);
+        let pairs = crate::pairs::jaccard_pairs(&markets_snap, Some(jaccard_threshold));
         let _ = event_tx.send(AppEvent::PairsLoaded(pairs));
     }
 }

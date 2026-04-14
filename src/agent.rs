@@ -44,6 +44,9 @@ pub enum AppEvent {
         result:    crate::tools::SmartMoneyResult,
     },
 
+    WalletDetailLoading,
+    WalletDetailLoaded(crate::tools::WalletDetail),
+
     // ── Time & Sales tape ─────────────────────────────────────────────────────
     TradesLoaded {
         market_id: String,
@@ -425,13 +428,15 @@ pub async fn refresh_price_history(
 }
 
 pub async fn refresh_smart_money(
-    clients:   Arc<MarketClients>,
-    market_id: String,
-    event_tx:  mpsc::UnboundedSender<AppEvent>,
+    clients:         Arc<MarketClients>,
+    market_id:       String,
+    market_volume:   Option<f64>,
+    coord_threshold: f64,
+    event_tx:        mpsc::UnboundedSender<AppEvent>,
 ) {
     let _ = event_tx.send(AppEvent::SmartMoneyLoading);
 
-    match tools::smart_money_for_market(&clients, &market_id, 8).await {
+    match tools::smart_money_for_market(&clients, &market_id, 8, market_volume, coord_threshold).await {
         Ok(result) => {
             let _ = event_tx.send(AppEvent::SmartMoneyLoaded { market_id, result });
         }
@@ -558,5 +563,17 @@ pub async fn stream_polymarket_orderbook(
                 });
             }
         }
+    }
+}
+
+pub async fn refresh_wallet_detail(
+    clients:  Arc<MarketClients>,
+    wallet:   String,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let _ = event_tx.send(AppEvent::WalletDetailLoading);
+    match tools::fetch_wallet_detail(&clients, &wallet).await {
+        Ok(detail) => { let _ = event_tx.send(AppEvent::WalletDetailLoaded(detail)); }
+        Err(e)     => { let _ = event_tx.send(AppEvent::RefreshError(format!("Wallet detail: {}", e))); }
     }
 }

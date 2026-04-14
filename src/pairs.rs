@@ -201,7 +201,11 @@ fn make_pair(
 
 /// Fast local matching using Jaccard word-set similarity.
 /// Always available, no network call needed.
-pub fn jaccard_pairs(markets: &[Market]) -> Vec<MarketPair> {
+///
+/// `accept_threshold` overrides `JACCARD_ACCEPT`.  Pass `None` to use the
+/// compiled-in default (0.35).
+pub fn jaccard_pairs(markets: &[Market], accept_threshold: Option<f64>) -> Vec<MarketPair> {
+    let threshold = accept_threshold.unwrap_or(JACCARD_ACCEPT).clamp(0.05, 0.95);
     let pm: Vec<&Market> = markets
         .iter()
         .filter(|m| m.platform == Platform::Polymarket)
@@ -215,7 +219,7 @@ pub fn jaccard_pairs(markets: &[Market]) -> Vec<MarketPair> {
     for a in &pm {
         for b in &kl {
             let sim = title_similarity(&a.title, &b.title);
-            if sim < JACCARD_ACCEPT {
+            if sim < threshold {
                 continue;
             }
             pairs.push(make_pair(
@@ -238,10 +242,19 @@ pub fn jaccard_pairs(markets: &[Market]) -> Vec<MarketPair> {
 /// LLM-powered pair matching. Pre-filters candidates with a low Jaccard threshold,
 /// then asks the LLM for semantic match type and resolution risk.
 /// Falls back to `jaccard_pairs` on any error.
+///
+/// `accept_threshold` sets the Jaccard pre-filter floor (overrides
+/// `JACCARD_PREFILTER`).  Lowering it widens the candidate set sent to the LLM.
 pub async fn llm_match_pairs(
-    markets: &[Market],
-    backend: &Arc<dyn LlmBackend>,
+    markets:          &[Market],
+    backend:          &Arc<dyn LlmBackend>,
+    accept_threshold: Option<f64>,
 ) -> Vec<MarketPair> {
+    let prefilter = accept_threshold
+        .map(|t| (t * 0.5).max(JACCARD_PREFILTER))  // half of accept, but never below compiled default
+        .unwrap_or(JACCARD_PREFILTER)
+        .clamp(0.05, 0.95);
+
     let pm: Vec<&Market> = markets.iter().filter(|m| m.platform == Platform::Polymarket).collect();
     let kl: Vec<&Market> = markets.iter().filter(|m| m.platform == Platform::Kalshi).collect();
 
@@ -250,7 +263,7 @@ pub async fn llm_match_pairs(
     for a in &pm {
         for b in &kl {
             let sim = title_similarity(&a.title, &b.title);
-            if sim >= JACCARD_PREFILTER {
+            if sim >= prefilter {
                 candidates.push((*a, *b, sim));
             }
         }
@@ -316,7 +329,7 @@ pub async fn llm_match_pairs(
         .await
     {
         Ok(r) => r,
-        Err(_) => return jaccard_pairs(markets),
+        Err(_) => return jaccard_pairs(markets, accept_threshold),
     };
 
     let text: String = response
@@ -329,7 +342,7 @@ pub async fn llm_match_pairs(
     let mut pairs = parse_llm_response(&text, candidates);
     if pairs.is_empty() {
         // LLM parse failed — fall back
-        return jaccard_pairs(markets);
+        return jaccard_pairs(markets, accept_threshold);
     }
 
     sort_pairs(&mut pairs);
@@ -466,7 +479,7 @@ mod tests {
             mkt(Platform::Polymarket, "pm1", "Fed rate cut September 2024", 0.70, 100_000.0),
             mkt(Platform::Kalshi,     "kl1", "Fed September rate cut 2024", 0.62, 80_000.0),
         ];
-        let pairs = jaccard_pairs(&markets);
+        let pairs = jaccard_pairs(&markets, None);
         assert!(!pairs.is_empty(), "should find at least one pair");
         let p = &pairs[0];
         assert!(p.gross_gap > 0.0);
@@ -479,7 +492,7 @@ mod tests {
             mkt(Platform::Polymarket, "pm1", "Super Bowl winner 2025", 0.60, 50_000.0),
             mkt(Platform::Kalshi,     "kl1", "Fed rate decision March", 0.70, 50_000.0),
         ];
-        let pairs = jaccard_pairs(&markets);
+        let pairs = jaccard_pairs(&markets, None);
         assert!(pairs.is_empty(), "unrelated markets should not match");
     }
 
