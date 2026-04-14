@@ -2544,10 +2544,14 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         (area, None)
     };
 
-    // ── Vertical split of left side: wallet table + coordination panel ─────
+    // ── Vertical split of left side: wallet table + coordination panel + legend
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3),
+            Constraint::Length(13),
+        ])
         .split(list_area);
 
     // ── Top traders table ──────────────────────────────────────────────────
@@ -2660,10 +2664,63 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().title(coord_title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(coord_p, left_chunks[1]);
 
+    // ── Legend / quick-reference panel ────────────────────────────────────
+    render_sm_legend(f, left_chunks[2]);
+
     // ── Wallet detail panel (right side) ───────────────────────────────────
     if let Some(detail_area) = detail_area_opt {
         render_sm_wallet_detail(f, detail_area, app);
     }
+}
+
+/// Notation / usage legend pinned to the bottom-left of the Smart Money tab.
+fn render_sm_legend(f: &mut Frame, area: Rect) {
+    let dg = Style::default().fg(Color::DarkGray);
+    let hi = Style::default().fg(Color::White);
+    let yw = Style::default().fg(Color::Yellow);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  N ", yw),
+            Span::styled("fresh wallet (≤10 lifetime trades, all within 7d)  ", dg),
+            Span::styled("⚠ ", yw),
+            Span::styled("flagged (suspicion ≥ threshold)", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  WinRate ", dg),
+            Span::styled("redeems / total positions  ", hi),
+            Span::styled("AlphaEntry ", dg),
+            Span::styled("avg entry price delta on winning trades", hi),
+        ]),
+        Line::from(vec![
+            Span::styled("  Vol%    ", dg),
+            Span::styled("wallet position / market daily volume  ", hi),
+            Span::styled("Suspicion ", dg),
+            Span::styled("0–100 composite score", hi),
+        ]),
+        Line::from(vec![
+            Span::styled("  Suspicion = ", dg),
+            Span::styled("fresh×0.4 + vol_anomaly×0.35 + win_rate×0.25", hi),
+            Span::styled("  (×1.2/1.3/1.5 for 2/3 signals / niche market)", dg),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter ", yw), Span::styled("wallet drill-down  ", dg),
+            Span::styled("Esc ", yw),    Span::styled("back to list  ", dg),
+            Span::styled("[ ] ", yw),    Span::styled("adjust coord threshold  ", dg),
+            Span::styled("r ", yw),      Span::styled("refresh", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  j/k ", yw),  Span::styled("navigate / scroll  ", dg),
+            Span::styled("a ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Legend & Keys ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
 }
 
 /// Render the wallet detail panel (right side of Smart Money split view).
