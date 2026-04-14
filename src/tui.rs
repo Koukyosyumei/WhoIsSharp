@@ -279,6 +279,12 @@ pub struct App {
     pub target_input_step: TargetInputStep,
     pub target_pos_id:     String,   // position being edited
 
+    // Adjustable thresholds (user-configurable in TUI, also settable by AI tools)
+    /// Jaccard market-overlap threshold for wallet coordination detection (0–1).
+    pub coord_threshold:         f64,
+    /// Jaccard word-set threshold for Pairs tab cross-platform matching (0–1).
+    pub pairs_jaccard_threshold: f64,
+
     // Cross-platform pairs (Pairs tab)
     pub pairs:             Vec<crate::pairs::MarketPair>,
     pub pairs_cursor:      usize,
@@ -389,6 +395,8 @@ impl App {
             target_input_mode: false,
             target_input_step: TargetInputStep::default(),
             target_pos_id:     String::new(),
+            coord_threshold:         0.35,
+            pairs_jaccard_threshold: 0.35,
             pairs:             Vec::new(),
             pairs_cursor:      0,
             pairs_loading:     false,
@@ -2170,10 +2178,11 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
     };
     let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
     let header_title = format!(
-        " Cross-Platform Pairs  {}  [{} pairs  {} arb] ",
+        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [/] adjust ",
         matcher_label,
         app.pairs.len(),
         arb_count,
+        app.pairs_jaccard_threshold * 100.0,
     );
 
     if app.pairs.is_empty() {
@@ -2509,7 +2518,8 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // ── Top traders table ──────────────────────────────────────────────────
-    let title = format!(" Smart Money — {} ({} traders) ", app.sm_market_title, app.sm_wallets.len());
+    let title = format!(" Smart Money — {} ({} traders)  coord≥{:.0}%  [/] adjust ",
+        app.sm_market_title, app.sm_wallets.len(), app.coord_threshold * 100.0);
 
     let header = Line::from(vec![
         Span::styled(
@@ -2593,9 +2603,9 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
 
     // ── Coordination panel ─────────────────────────────────────────────────
     let coord_title = if app.sm_coord_pairs.is_empty() {
-        " Coordination  (none detected) ".to_string()
+        format!(" Coordination  (none detected, threshold {:.0}%) ", app.coord_threshold * 100.0)
     } else {
-        format!(" Coordination  ({} pair(s) flagged) ", app.sm_coord_pairs.len())
+        format!(" Coordination  ({} pair(s) ≥{:.0}% overlap) ", app.sm_coord_pairs.len(), app.coord_threshold * 100.0)
     };
 
     let mut coord_lines: Vec<Line> = vec![Line::from("")];
@@ -3363,7 +3373,7 @@ pub async fn run_tui(
 
                         // Always compute Jaccard pairs immediately on market load.
                         // LLM-enhanced matching happens when user visits the Pairs tab.
-                        let jaccard = crate::pairs::jaccard_pairs(&app.markets);
+                        let jaccard = crate::pairs::jaccard_pairs(&app.markets, Some(app.pairs_jaccard_threshold));
                         let arb_count = jaccard.iter().filter(|p| p.net_gap > 0.0).count();
                         if !jaccard.is_empty() {
                             app.pairs = jaccard;
@@ -3981,6 +3991,53 @@ async fn handle_key(
             trigger_llm_pairs(app, backend, event_tx).await;
         }
 
+        // ── Threshold adjustments ─────────────────────────────────────────────
+        // '[' / ']' lower / raise the active tab's relevant threshold by 0.05.
+        // Smart Money tab → coord_threshold
+        // Pairs tab       → pairs_jaccard_threshold
+        KC::Char('[') if app.input.is_empty()
+            && matches!(app.active_tab, AppTab::SmartMoney | AppTab::Pairs) =>
+        {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {}
+            }
+        }
+        KC::Char(']') if app.input.is_empty()
+            && matches!(app.active_tab, AppTab::SmartMoney | AppTab::Pairs) =>
+        {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // ── Portfolio tab: toggle risk view ───────────────────────────────────
         KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
             app.show_risk_view = !app.show_risk_view;
@@ -4456,13 +4513,14 @@ async fn trigger_smart_money_load(
     let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
     if market.platform != Platform::Polymarket { return; }
 
-    let clients_c     = clients.clone();
-    let tx            = event_tx.clone();
-    let market_id     = id.clone();
-    let market_volume = market.volume;
+    let clients_c       = clients.clone();
+    let tx              = event_tx.clone();
+    let market_id       = id.clone();
+    let market_volume   = market.volume;
+    let coord_threshold = app.coord_threshold;
 
     tokio::spawn(async move {
-        agent::refresh_smart_money(clients_c, market_id, market_volume, tx).await;
+        agent::refresh_smart_money(clients_c, market_id, market_volume, coord_threshold, tx).await;
     });
 }
 
@@ -4499,15 +4557,16 @@ async fn trigger_llm_pairs(
 
     let markets_snap = app.markets.clone();
     let tx = event_tx.clone();
+    let jaccard_threshold = app.pairs_jaccard_threshold;
 
     if let Some(b) = backend.clone() {
         tokio::spawn(async move {
-            let pairs = crate::pairs::llm_match_pairs(&markets_snap, &b).await;
+            let pairs = crate::pairs::llm_match_pairs(&markets_snap, &b, Some(jaccard_threshold)).await;
             let _ = tx.send(AppEvent::PairsLoaded(pairs));
         });
     } else {
         // No LLM — use Jaccard immediately (synchronous, fast)
-        let pairs = crate::pairs::jaccard_pairs(&markets_snap);
+        let pairs = crate::pairs::jaccard_pairs(&markets_snap, Some(jaccard_threshold));
         let _ = event_tx.send(AppEvent::PairsLoaded(pairs));
     }
 }

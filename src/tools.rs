@@ -553,16 +553,19 @@ pub struct SmartMoneyResult {
 ///
 /// `market_volume` — the market's daily volume from the Gamma API, used to
 /// compute size-anomaly impact scores (wallet position / market volume).
+///
+/// `coord_threshold` — Jaccard similarity threshold for wallet coordination
+/// detection.  Wallet pairs sharing ≥ this fraction of traded markets are
+/// flagged as possibly coordinated.  Default 0.35.
 pub async fn smart_money_for_market(
-    clients:       &MarketClients,
-    market_id:     &str,
-    top_n:         usize,
-    market_volume: Option<f64>,
+    clients:         &MarketClients,
+    market_id:       &str,
+    top_n:           usize,
+    market_volume:   Option<f64>,
+    coord_threshold: f64,
 ) -> anyhow::Result<SmartMoneyResult> {
     use std::collections::HashMap;
     use futures_util::future::join_all;
-
-    const COORD_THRESHOLD: f64 = 0.35;
 
     let market_trades = clients
         .polymarket
@@ -620,7 +623,7 @@ pub async fn smart_money_for_market(
     for i in 0..profiles.len() {
         for j in (i + 1)..profiles.len() {
             let sim = jaccard(&profiles[i].market_set, &profiles[j].market_set);
-            if sim >= COORD_THRESHOLD {
+            if sim >= coord_threshold {
                 coord_pairs.push((profiles[i].pseudonym.clone(), profiles[j].pseudonym.clone(), sim));
             }
         }
@@ -826,9 +829,10 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     use std::collections::HashMap;
     use futures_util::future::join_all;
 
-    let market_id   = args["market_id"].as_str().unwrap_or("");
-    let top_n       = args["top_n"].as_u64().unwrap_or(5).min(10) as usize;
-    let history_len = args["history_trades"].as_u64().unwrap_or(100).min(200) as u32;
+    let market_id      = args["market_id"].as_str().unwrap_or("");
+    let top_n          = args["top_n"].as_u64().unwrap_or(5).min(10) as usize;
+    let history_len    = args["history_trades"].as_u64().unwrap_or(100).min(200) as u32;
+    let coord_threshold = args["coord_threshold"].as_f64().unwrap_or(0.35).clamp(0.05, 0.95);
 
     if market_id.is_empty() {
         return Ok(ToolOutput::err(
@@ -836,8 +840,6 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
              Use list_markets or search_markets to find a conditionId.",
         ));
     }
-
-    const COORD_THRESHOLD: f64 = 0.35; // Jaccard ≥ 35% → likely coordinated
 
     let mut report = Vec::new();
     report.push(format!(
@@ -970,7 +972,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     for i in 0..profiles.len() {
         for j in (i + 1)..profiles.len() {
             let sim = jaccard(&profiles[i].market_set, &profiles[j].market_set);
-            if sim >= COORD_THRESHOLD {
+            if sim >= coord_threshold {
                 coord_pairs.push((
                     profiles[i].pseudonym.clone(),
                     profiles[j].pseudonym.clone(),
@@ -1446,6 +1448,13 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Number of recent trades to fetch per wallet for \
                             history analysis. Default 100, max 200."
+                    },
+                    "coord_threshold": {
+                        "type": "number",
+                        "description": "Jaccard similarity threshold (0–1) for flagging wallet \
+                            pairs as coordinated — wallets sharing at least this fraction of \
+                            their traded markets are highlighted. Default 0.35. Lower to surface \
+                            more pairs; raise to reduce noise."
                     }
                 },
                 "required": ["market_id"]
