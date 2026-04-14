@@ -213,8 +213,10 @@ impl PolymarketClient {
         wallet: &str,
         limit: u32,
     ) -> Result<Vec<PolyTrade>> {
+        // The data-api /activity endpoint requires &type=TRADE; omitting it
+        // causes HTTP 400 "required query parameter".
         let url = format!(
-            "{}/activity?user={}&limit={}",
+            "{}/activity?user={}&limit={}&type=TRADE",
             DATA_BASE,
             urlencoding::encode(wallet),
             limit,
@@ -244,6 +246,14 @@ impl PolymarketClient {
     }
 
     /// Fetch YES-price history.  `market_id` is the token_id (YES CLOB token).
+    ///
+    /// The CLOB endpoint requires EITHER (`fidelity` + `startTs` + `endTs`) OR an
+    /// `interval` string.  We use the three-parameter form because:
+    ///   - `interval` alone returns different granularity than expected and can be empty.
+    ///   - `fidelity` alone (without timestamps) causes HTTP 400 — range is required.
+    ///
+    /// Keep `fidelity` ≤ 60 (hourly or finer).  `fidelity=1440` (daily) combined
+    /// with a long date range triggers HTTP 400 for many markets.
     pub async fn fetch_price_history(
         &self,
         market_id: &str,
@@ -251,10 +261,6 @@ impl PolymarketClient {
         start_ts:  i64,
         end_ts:    i64,
     ) -> Result<Vec<Candle>> {
-        // The CLOB endpoint takes `fidelity` (minute granularity) and optional
-        // `startTs`/`endTs` timestamps (seconds). The `interval` param is a
-        // human-readable alias for the same granularity and is not required when
-        // `fidelity` is supplied — omitting it avoids sending a redundant param.
         let url = format!(
             "{}/prices-history?market={}&fidelity={}&startTs={}&endTs={}",
             CLOB_BASE, market_id, fidelity, start_ts, end_ts

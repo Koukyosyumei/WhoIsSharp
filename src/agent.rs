@@ -379,10 +379,20 @@ pub async fn refresh_price_history(
 
     let result = match market.platform {
         Platform::Polymarket => {
-            let id = market.token_id.as_deref().unwrap_or(&market.id);
+            // Must use the CLOB token_id, not the condition ID.
+            // If the market has no token_id it isn't actively traded on the CLOB.
+            let id = match market.token_id.as_deref() {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => {
+                    let _ = event_tx.send(AppEvent::RefreshError(
+                        "No CLOB token for this market — price history unavailable".into(),
+                    ));
+                    return;
+                }
+            };
             clients
                 .polymarket
-                .fetch_price_history(id, interval.polymarket_fidelity(), start_ts, now)
+                .fetch_price_history(&id, interval.polymarket_fidelity(), start_ts, now)
                 .await
         }
         Platform::Kalshi => {
@@ -409,7 +419,7 @@ pub async fn refresh_price_history(
             });
         }
         Err(e) => {
-            let _ = event_tx.send(AppEvent::RefreshError(format!("Price history: {}", e)));
+            let _ = event_tx.send(AppEvent::RefreshError(format!("Price history: {:#}", e)));
         }
     }
 }

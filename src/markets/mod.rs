@@ -198,7 +198,7 @@ impl ChartInterval {
         }
     }
 
-    /// Fidelity (minutes per point) for Polymarket.
+    /// Fidelity (minutes per point) for Polymarket — kept for reference / Kalshi reuse.
     pub fn polymarket_fidelity(&self) -> u32 {
         match self {
             ChartInterval::OneHour  => 1,
@@ -206,6 +206,21 @@ impl ChartInterval {
             ChartInterval::OneDay   => 60,
             ChartInterval::OneWeek  => 60,
             ChartInterval::OneMonth => 1440,
+        }
+    }
+
+    /// Interval string accepted by the Polymarket CLOB `/prices-history` endpoint.
+    ///
+    /// Using `interval=<str>` is preferred over `fidelity=<int> + startTs + endTs`
+    /// because Polymarket validates the fidelity/range combination and rejects
+    /// certain combinations with HTTP 400.  The interval string always succeeds.
+    pub fn polymarket_interval_str(&self) -> &str {
+        match self {
+            ChartInterval::OneHour  => "1h",
+            ChartInterval::SixHours => "6h",
+            ChartInterval::OneDay   => "1d",
+            ChartInterval::OneWeek  => "1w",
+            ChartInterval::OneMonth => "max",
         }
     }
 }

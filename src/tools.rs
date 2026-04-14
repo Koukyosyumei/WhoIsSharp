@@ -44,7 +44,9 @@ pub async fn dispatch(
 ) -> ToolOutput {
     match dispatch_inner(clients, name, args).await {
         Ok(out)  => out,
-        Err(err) => ToolOutput::err(err.to_string()),
+        // Use alternate format to include the full anyhow error chain
+        // (e.g. "Polymarket /prices-history request failed: HTTP 404: body…")
+        Err(err) => ToolOutput::err(format!("{:#}", err)),
     }
 }
 
@@ -265,19 +267,30 @@ async fn get_price_history(
 
     let now      = chrono::Utc::now().timestamp();
     let start_ts = now - days * 86_400;
-    let interval = if days <= 1 { ChartInterval::OneDay } else { ChartInterval::OneMonth };
+    // Use fidelity=60 (hourly) for all tool requests — fidelity=1440 causes HTTP 400
+    // on the CLOB for many markets; hourly gives enough resolution for AI analysis.
+    let kalshi_interval = if days <= 1 { ChartInterval::OneDay } else { ChartInterval::OneWeek };
 
     let candles = match platform {
         "polymarket" => {
-            // Price history also uses token_id — resolve conditionIds automatically.
+            // Price history uses token_id — resolve 0x conditionIds automatically.
             let token_id = match resolve_pm_token_id(clients, id).await {
                 Ok(t)  => t,
-                Err(e) => return Ok(ToolOutput::err(e.to_string())),
+                Err(e) => return Ok(ToolOutput::err(format!("{:#}", e))),
             };
-            clients
+            match clients
                 .polymarket
-                .fetch_price_history(&token_id, interval.polymarket_fidelity(), start_ts, now)
-                .await?
+                .fetch_price_history(&token_id, ChartInterval::OneWeek.polymarket_fidelity(), start_ts, now)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(ToolOutput::err(format!(
+                        "Price history unavailable for token {}: {:#}",
+                        &token_id[..token_id.len().min(20)], e
+                    )));
+                }
+            }
         }
         "kalshi" => {
             // Kalshi candlestick endpoint: /series/{series}/markets/{ticker}/candlesticks
@@ -289,7 +302,7 @@ async fn get_price_history(
                 .unwrap_or("");
             clients
                 .kalshi
-                .fetch_candlesticks(series, id, interval.kalshi_period_interval(), start_ts, now)
+                .fetch_candlesticks(series, id, kalshi_interval.kalshi_period_interval(), start_ts, now)
                 .await?
         }
         _ => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),
@@ -1264,7 +1277,7 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                     },
                     "id": {
                         "type": "string",
-                        "description": "Market ID (conditionId for Polymarket, ticker for Kalshi)."
+                        "description": "For Polymarket: the CLOB token_id shown by get_market (long decimal, NOT the 0x conditionId). For Kalshi: market ticker."
                     },
                     "days": {
                         "type": "integer",
