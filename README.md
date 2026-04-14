@@ -2,23 +2,15 @@
 
 > AI-powered prediction market terminal for professional traders.
 
-```
- WhoIsSharp v0.1.0  ·  claude-sonnet-4-6  ·  PM + KL                  14:23:05
- [1]Signals [2]Markets [3]Chart [4]Book [5]Portfolio [6]Chat [7]SM [8]Trades [9]Pairs
-┌─────────────────────────────┬─────────────────────────────────────────────────┐
-│ ★★★ [ARB]  Fed rate cut     │  Will the Fed cut 25bps at September FOMC?      │
-│ ★★☆ [INSDR] Trump election  │  PM 68.2%  ←  4.2pp gap  →  KL 72.4%          │
-│ ★★☆ [MOMT] Gaza ceasefire  │  Gross: 4.2pp  Net after fees: +2.1pp           │
-│ ★☆☆ [50/50] BTC above 80k  │  Strategy: BUY YES@KL  /  NO@PM                 │
-│ ☆☆☆ [THIN] Senate control  │  Est. profit at size: ~$441                     │
-│                             │  Res. risk: MEDIUM — KL requires exact 25bps    │
-│  filter: ALL  sort: ~50%   │  Matched by: LLM  (confidence 91%)              │
-└─────────────────────────────┴─────────────────────────────────────────────────┘
- ● 12 markets  4 signals  2 arb pairs                                  [r]efresh
- > analyze the fed rate cut arb_
-```
+<p align="center">
+  <a href="https://github.com/Koukyosyumei/WhoIsSharp/" target="_blank">
+      <img src="./assets/Who%20is%20Sharp.png" alt="Logo" height="126">
+  </a>
+</p>
 
-WhoIsSharp is a Bloomberg-style terminal for [Polymarket](https://polymarket.com) and [Kalshi](https://kalshi.com) that embeds a full AI analyst. It detects cross-platform arbitrage, spots informed flow before it moves the market, and sizes positions with Kelly criterion — all inside a single `cargo run`.
+![Apache-2.0](https://img.shields.io/github/license/Koukyosyumei/WhoIsSharp?color=blue)
+
+WhoIsSharp is a Bloomberg-style terminal for [Polymarket](https://polymarket.com) and [Kalshi](https://kalshi.com) that embeds a full AI analyst. It detects cross-platform arbitrage, spots informed flow before it moves the market, and sizes positions with the Kelly criterion.
 
 ---
 
