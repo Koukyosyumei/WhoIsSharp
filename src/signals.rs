@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn empty_input_yields_empty_signals() {
-        assert!(compute_signals(&[]).is_empty());
+        assert!(compute_signals(&[], &Default::default(), &Default::default()).is_empty());
     }
 
     #[test]

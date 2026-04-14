@@ -2486,6 +2486,13 @@ pub async fn run_tui(
                     AppEvent::AgentDone => {
                         app.is_loading = false;
                         app.status = "Ready".to_string();
+                        // Record the final assistant message into session log
+                        if let Some(ChatMsg::Assistant(text)) = app.chat_msgs.last() {
+                            app.session.messages.push(portfolio::SessionMessage {
+                                role: "assistant".into(),
+                                content: text.clone(),
+                            });
+                        }
                     }
                     AppEvent::AgentError(e) => {
                         app.is_loading = false;
@@ -2529,6 +2536,11 @@ pub async fn run_tui(
                 }
             }
         }
+    }
+
+    // Save session on clean exit
+    if !app.session.messages.is_empty() || !app.session.notes.is_empty() {
+        let _ = portfolio::save_session(&app.session);
     }
 
     disable_raw_mode()?;
@@ -2853,6 +2865,51 @@ async fn handle_key(
             app.delete_selected_position();
         }
 
+        // ── Set stop/take-profit target ───────────────────────────────────────
+        KC::Char('t') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
+            if let Some(idx) = app.portfolio_list.selected() {
+                if let Some(pos) = app.portfolio.positions.get(idx) {
+                    let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
+                    app.target_pos_id   = pos.id.clone();
+                    app.target_input_mode = true;
+                    app.target_input_step = TargetInputStep::TakeProfit;
+                    app.input.clear();
+                    app.status = format!(
+                        "Set take-profit for '{}' (mark {:.1}¢): enter ¢ or Enter to skip",
+                        trunc(&pos.title, 30), mark
+                    );
+                } else {
+                    app.status = "Select a position first.".to_string();
+                }
+            } else {
+                app.status = "Select a position first.".to_string();
+            }
+        }
+
+        // ── Dismiss signal ────────────────────────────────────────────────────
+        KC::Char('x') if app.input.is_empty() && app.active_tab == AppTab::Signals => {
+            if let Some(sig) = app.selected_signal() {
+                let id = sig.id_a.clone();
+                let title = trunc(&sig.title, 40);
+                app.dismissed_signals.insert(id);
+                // Remove from displayed list immediately
+                if let Some(idx) = app.signal_list.selected() {
+                    let new_len = app.signals.len().saturating_sub(1);
+                    app.signal_list.select(if new_len == 0 { None } else { Some(idx.min(new_len - 1)) });
+                }
+                // Recompute to apply dismissal
+                app.signals = signals::compute_signals(
+                    &app.markets, &app.prev_prices, &app.dismissed_signals
+                );
+                app.status = format!("Dismissed: {}", title);
+            }
+        }
+
+        // ── Markdown report export ────────────────────────────────────────────
+        KC::Char('M') if app.input.is_empty() => {
+            app.status = export_markdown_report(app);
+        }
+
         // ── Search ────────────────────────────────────────────────────────────
         KC::Char('/') if app.input.is_empty() => {
             app.search_mode = true;
@@ -3092,6 +3149,34 @@ async fn send_chat(
     app.sent_cursor = None;
     app.active_tab = Tab::Chat;
 
+    // ── !note shortcut — append to research log without sending to LLM ────────
+    if let Some(note_text) = msg.strip_prefix("!note").map(|s| s.trim()) {
+        if !note_text.is_empty() {
+            let ts  = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            let note = format!("[{}] {}", ts, note_text);
+            app.session.notes.push(note.clone());
+            app.chat_msgs.push(ChatMsg::User(msg.clone()));
+            app.chat_msgs.push(ChatMsg::Assistant(format!("📝 Note saved: {}", note)));
+            app.status = "Note added to research log.".to_string();
+            // Persist note to log file immediately
+            let log_path = {
+                let mut p = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                p.push(".whoissharp");
+                p.push("notes.md");
+                p
+            };
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let line = format!("- {}\n", note);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        return;
+    }
+
     let Some(backend_arc) = backend else {
         app.chat_msgs.push(ChatMsg::User(msg));
         app.chat_msgs.push(ChatMsg::Error(
@@ -3103,6 +3188,7 @@ async fn send_chat(
     };
 
     app.chat_msgs.push(ChatMsg::User(msg.clone()));
+    app.session.messages.push(portfolio::SessionMessage { role: "user".into(), content: msg.clone() });
     app.chat_scroll = 0; // pin to bottom on new message
     app.is_loading = true;
     app.status = "Sending…".to_string();
@@ -3199,6 +3285,173 @@ async fn trigger_trades_load(
     tokio::spawn(async move {
         agent::refresh_market_trades(clients_c, market_id, tx).await;
     });
+}
+
+/// Export a Markdown research report for the selected market.
+fn export_markdown_report(app: &App) -> String {
+    use std::fmt::Write as _;
+
+    let Some(ref sel_id) = app.selected_market_id else {
+        return "Select a market first (press Enter in Markets tab).".to_string();
+    };
+    let Some(m) = app.markets.iter().find(|m| &m.id == sel_id) else {
+        return "Market not found in loaded data.".to_string();
+    };
+
+    let mut md = String::new();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+
+    let _ = writeln!(md, "# {}", m.title);
+    let _ = writeln!(md, "");
+    let _ = writeln!(md, "_Generated by WhoIsSharp on {}_", ts);
+    let _ = writeln!(md, "");
+    let _ = writeln!(md, "## Market Summary");
+    let _ = writeln!(md, "");
+    let _ = writeln!(md, "| Field | Value |");
+    let _ = writeln!(md, "|---|---|");
+    let _ = writeln!(md, "| Platform | {} |", m.platform.label());
+    let _ = writeln!(md, "| Market ID | `{}` |", m.id);
+    let _ = writeln!(md, "| YES Price | {:.1}% |", m.yes_price * 100.0);
+    let _ = writeln!(md, "| NO Price | {:.1}% |", m.no_price * 100.0);
+    let _ = writeln!(md, "| Volume | {} |", format_volume(m.volume));
+    let _ = writeln!(md, "| Liquidity | {} |",
+        m.liquidity.map(|l| format_volume(Some(l))).unwrap_or_else(|| "n/a".into()));
+    let _ = writeln!(md, "| End Date | {} |",
+        m.end_date.as_deref().unwrap_or("n/a"));
+    let _ = writeln!(md, "| Category | {} |",
+        m.category.as_deref().unwrap_or("n/a"));
+    let _ = writeln!(md, "| Status | {} |", m.status);
+    if let Some(ref tok) = m.token_id {
+        let _ = writeln!(md, "| Token ID | `{}` |", tok);
+    }
+    let _ = writeln!(md, "");
+
+    // Description
+    if let Some(ref desc) = m.description {
+        let _ = writeln!(md, "## Description");
+        let _ = writeln!(md, "");
+        let _ = writeln!(md, "{}", desc);
+        let _ = writeln!(md, "");
+    }
+
+    // Orderbook snapshot
+    if let Some(ref ob) = app.orderbook {
+        let _ = writeln!(md, "## Orderbook Snapshot");
+        let _ = writeln!(md, "");
+        if let Some(mid) = ob.mid() {
+            let _ = writeln!(md, "- Mid: {:.1}¢", mid * 100.0);
+        }
+        if let Some(spread) = ob.spread() {
+            let _ = writeln!(md, "- Spread: {:.1}¢", spread * 100.0);
+        }
+        let total_bid: f64 = ob.bids.iter().map(|b| b.size).sum();
+        let total_ask: f64 = ob.asks.iter().map(|a| a.size).sum();
+        let imb = if total_bid + total_ask > 0.0 { (total_bid - total_ask) / (total_bid + total_ask) } else { 0.0 };
+        let _ = writeln!(md, "- Imbalance: {:+.2} (bid {:.0} / ask {:.0})", imb, total_bid, total_ask);
+        let _ = writeln!(md, "");
+    }
+
+    // Price history (ASCII sparkline)
+    if !app.chart_data.is_empty() {
+        let _ = writeln!(md, "## Price History ({})", app.chart_interval.label());
+        let _ = writeln!(md, "");
+        let blocks = "▁▂▃▄▅▆▇█";
+        let min_p = app.chart_data.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
+        let max_p = app.chart_data.iter().map(|(_, y)| *y).fold(f64::NEG_INFINITY, f64::max);
+        let range = (max_p - min_p).max(1.0);
+        let spark: String = app.chart_data.iter().map(|(_, y)| {
+            let idx = (((y - min_p) / range) * 7.0).round() as usize;
+            blocks.chars().nth(idx.min(7)).unwrap_or('▁')
+        }).collect();
+        let _ = writeln!(md, "```");
+        let _ = writeln!(md, "{:.1}%  {}  {:.1}%", min_p, spark, max_p);
+        let _ = writeln!(md, "```");
+        let _ = writeln!(md, "");
+    }
+
+    // Signals for this market
+    let market_signals: Vec<&Signal> = app.signals.iter()
+        .filter(|s| s.id_a == *sel_id || s.id_b.as_deref() == Some(sel_id))
+        .collect();
+    if !market_signals.is_empty() {
+        let _ = writeln!(md, "## Active Signals");
+        let _ = writeln!(md, "");
+        for sig in &market_signals {
+            let _ = writeln!(md, "- **{}** {} — {}", sig.kind.label(),
+                "★".repeat(sig.stars as usize), sig.action);
+        }
+        let _ = writeln!(md, "");
+    }
+
+    // Portfolio position if held
+    let pos_in_portfolio: Vec<&Position> = app.portfolio.positions.iter()
+        .filter(|p| p.market_id == *sel_id).collect();
+    if !pos_in_portfolio.is_empty() {
+        let _ = writeln!(md, "## Portfolio Position");
+        let _ = writeln!(md, "");
+        for pos in &pos_in_portfolio {
+            let _ = writeln!(md, "- {} {} | Entry: {:.1}¢ | Mark: {:.1}¢ | PnL: {:+.2}$ ({:+.1}%)",
+                pos.side.label(), pos.shares,
+                pos.entry_price * 100.0,
+                pos.mark_price.unwrap_or(pos.entry_price) * 100.0,
+                pos.pnl(), pos.pnl_pct());
+            if let Some(ref note) = pos.note {
+                let _ = writeln!(md, "  - Thesis: {}", note);
+            }
+            if let Some(tp) = pos.take_profit {
+                let _ = writeln!(md, "  - Take-profit: {:.1}¢", tp * 100.0);
+            }
+            if let Some(sl) = pos.stop_loss {
+                let _ = writeln!(md, "  - Stop-loss: {:.1}¢", sl * 100.0);
+            }
+        }
+        let _ = writeln!(md, "");
+    }
+
+    // Chat analysis from this session
+    let chat_content: Vec<String> = app.chat_msgs.iter().filter_map(|msg| match msg {
+        ChatMsg::User(t)      => Some(format!("**You:** {}", t)),
+        ChatMsg::Assistant(t) => Some(format!("**AI:** {}", t)),
+        _                     => None,
+    }).collect();
+    if !chat_content.is_empty() {
+        let _ = writeln!(md, "## AI Analysis (this session)");
+        let _ = writeln!(md, "");
+        for line in &chat_content {
+            let _ = writeln!(md, "{}", line);
+            let _ = writeln!(md, "");
+        }
+    }
+
+    // Research notes
+    if !app.session.notes.is_empty() {
+        let _ = writeln!(md, "## Research Notes");
+        let _ = writeln!(md, "");
+        for note in &app.session.notes {
+            let _ = writeln!(md, "- {}", note);
+        }
+        let _ = writeln!(md, "");
+    }
+
+    // Write to file
+    let mut dir = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push(".whoissharp");
+    dir.push("reports");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "Export failed: cannot create reports directory".to_string();
+    }
+    let safe_title: String = m.title.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .take(40)
+        .collect();
+    let filename = format!("{}_{}.md",
+        chrono::Local::now().format("%Y%m%d_%H%M%S"),
+        safe_title);
+    let path = dir.join(&filename);
+    match std::fs::write(&path, &md) {
+        Ok(_)  => format!("Report saved: ~/.whoissharp/reports/{}", filename),
+        Err(e) => format!("Export failed: {}", e),
+    }
 }
 
 fn export_current_tab(app: &App) -> String {
