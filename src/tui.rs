@@ -223,11 +223,15 @@ pub struct App {
     pub pos_draft:         PosDraft,
 
     // Smart Money tab
-    pub sm_wallets:       Vec<SmartMoneyWallet>,
-    pub sm_market_title:  String,
-    pub sm_coord_pairs:   Vec<(String, String, f64)>,
-    pub sm_loading:       bool,
-    pub sm_list:          ListState,
+    pub sm_wallets:         Vec<SmartMoneyWallet>,
+    pub sm_market_title:    String,
+    pub sm_coord_pairs:     Vec<(String, String, f64)>,
+    pub sm_loading:         bool,
+    pub sm_list:            ListState,
+    // Wallet drill-down detail (Enter on a wallet row)
+    pub sm_detail:          Option<crate::tools::WalletDetail>,
+    pub sm_detail_loading:  bool,
+    pub sm_detail_scroll:   u16,
 
     // Time & Sales tab
     pub trades_data:      Vec<PolyTrade>,
@@ -362,11 +366,14 @@ impl App {
             pos_input_mode:    false,
             pos_input_step:    PosInputStep::default(),
             pos_draft:         PosDraft::default(),
-            sm_wallets:        Vec::new(),
-            sm_market_title:   String::new(),
-            sm_coord_pairs:    Vec::new(),
-            sm_loading:        false,
-            sm_list:           ListState::default(),
+            sm_wallets:         Vec::new(),
+            sm_market_title:    String::new(),
+            sm_coord_pairs:     Vec::new(),
+            sm_loading:         false,
+            sm_list:            ListState::default(),
+            sm_detail:          None,
+            sm_detail_loading:  false,
+            sm_detail_scroll:   0,
             trades_data:       Vec::new(),
             trades_list:       ListState::default(),
             chart_candles:     Vec::new(),
@@ -554,11 +561,18 @@ impl App {
             Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_sub(1); } // j = scroll toward bottom
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_add(1); }
             Tab::SmartMoney => {
-                // +2 for header rows
-                let len = self.sm_wallets.len() + 2;
-                if len <= 2 { return; }
-                let i = self.sm_list.selected().map(|i| (i + 1) % len).unwrap_or(2);
-                self.sm_list.select(Some(i));
+                if self.sm_detail.is_some() || self.sm_detail_loading {
+                    // In detail view: scroll down through trade history
+                    self.sm_detail_scroll = self.sm_detail_scroll.saturating_add(1);
+                } else {
+                    // In list view: navigate wallets
+                    let len = self.sm_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.sm_list.selected().map(|i| {
+                        if i + 1 >= len { 2 } else { i + 1 }
+                    }).unwrap_or(2);
+                    self.sm_list.select(Some(i));
+                }
             }
             Tab::Trades => {
                 let len = self.trades_data.len();
@@ -3422,15 +3436,27 @@ pub async fn run_tui(
                             app.sm_market_title = result.market_title;
                             app.sm_wallets = result.wallets;
                             app.sm_coord_pairs = result.coord_pairs;
+                            app.sm_detail = None;
                             if !app.sm_wallets.is_empty() {
-                                app.sm_list.select(Some(0));
+                                app.sm_list.select(Some(2)); // skip header rows
                             }
                             let flagged = app.sm_wallets.iter().filter(|w| w.flagged).count();
                             app.status = format!(
-                                "Smart money: {} traders, {} flagged",
+                                "Smart money: {} traders, {} flagged — Enter to drill into a wallet",
                                 app.sm_wallets.len(), flagged
                             );
                         }
+                    }
+                    AppEvent::WalletDetailLoading => {
+                        app.sm_detail_loading = true;
+                        app.sm_detail = None;
+                        app.sm_detail_scroll = 0;
+                        app.status = "Loading wallet detail…".to_string();
+                    }
+                    AppEvent::WalletDetailLoaded(detail) => {
+                        app.sm_detail_loading = false;
+                        app.status = format!("Wallet: {} — {} trades", detail.pseudonym, detail.recent_trades.len());
+                        app.sm_detail = Some(detail);
                     }
                     AppEvent::RefreshStarted => {
                         app.is_loading = true;
@@ -3831,6 +3857,19 @@ async fn handle_key(
                 }
             } else if !app.input.is_empty() {
                 send_chat(app, backend, clients, event_tx, llm_history).await;
+            } else if app.active_tab == AppTab::SmartMoney {
+                // Drill into the selected wallet
+                if let Some(idx) = app.sm_list.selected() {
+                    let wallet_idx = idx.saturating_sub(2); // skip 2 header rows
+                    if let Some(w) = app.sm_wallets.get(wallet_idx) {
+                        let wallet_addr = w.wallet.clone();
+                        let clients_c = clients.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            agent::refresh_wallet_detail(clients_c, wallet_addr, tx).await;
+                        });
+                    }
+                }
             } else {
                 // Load chart + orderbook from selected market (Markets or Signals)
                 let market_id = match app.active_tab {

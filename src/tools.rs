@@ -516,6 +516,96 @@ fn parse_ob_size(line: &str) -> Option<f64> {
     token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok()
 }
 
+// ─── Wallet detail (drill-down from Smart Money tab) ─────────────────────────
+
+/// Full wallet profile fetched on demand when the user presses Enter on a
+/// Smart Money row.  Contains computed stats plus raw trade history for display.
+#[derive(Clone, Debug)]
+pub struct WalletDetail {
+    pub wallet:          String,
+    pub pseudonym:       String,
+    pub n_positions:     usize,
+    pub n_wins:          usize,
+    pub win_rate:        f64,
+    pub alpha_score:     f64,
+    pub total_vol:       f64,
+    pub is_fresh:        bool,
+    pub wallet_age_days: Option<f64>,
+    /// Recent TRADE + REDEEM events, newest first.
+    pub recent_trades:   Vec<crate::markets::polymarket::PolyTrade>,
+    /// Top markets by buy-side dollar exposure (title, $vol), descending.
+    pub top_markets:     Vec<(String, f64)>,
+}
+
+/// Fetch full wallet detail for the Smart Money drill-down view.
+/// Fetches TRADE + REDEEM histories concurrently then builds the profile.
+pub async fn fetch_wallet_detail(
+    clients: &MarketClients,
+    wallet:  &str,
+) -> anyhow::Result<WalletDetail> {
+    use futures_util::future::join;
+    use std::collections::HashMap;
+
+    let (trades_res, redeems_res) = join(
+        clients.polymarket.fetch_user_trades(wallet, 200),
+        clients.polymarket.fetch_user_redeems(wallet, 200),
+    ).await;
+
+    let mut history = trades_res.context("Failed to fetch wallet trade history")?;
+    if let Ok(redeems) = redeems_res {
+        history.extend(redeems);
+    }
+
+    if history.is_empty() {
+        return Ok(WalletDetail {
+            wallet:          wallet.to_string(),
+            pseudonym:       wallet.to_string(),
+            n_positions:     0,
+            n_wins:          0,
+            win_rate:        0.0,
+            alpha_score:     f64::NAN,
+            total_vol:       0.0,
+            is_fresh:        false,
+            wallet_age_days: None,
+            recent_trades:   Vec::new(),
+            top_markets:     Vec::new(),
+        });
+    }
+
+    let pseudonym = history.iter()
+        .find(|t| !t.pseudonym.is_empty())
+        .map(|t| t.pseudonym.clone())
+        .unwrap_or_else(|| wallet.to_string());
+
+    let profile = build_wallet_profile(wallet.to_string(), pseudonym, 0.0, &history);
+
+    // Sort by timestamp descending (newest first) for display
+    history.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Top markets by buy-side dollar exposure
+    let mut by_market: HashMap<String, f64> = HashMap::new();
+    for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
+        *by_market.entry(t.market_title.clone()).or_default() += t.size * t.price;
+    }
+    let mut top_markets: Vec<(String, f64)> = by_market.into_iter().collect();
+    top_markets.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top_markets.truncate(10);
+
+    Ok(WalletDetail {
+        wallet:          profile.wallet,
+        pseudonym:       profile.pseudonym,
+        n_positions:     profile.n_positions,
+        n_wins:          profile.n_wins,
+        win_rate:        profile.win_rate,
+        alpha_score:     profile.alpha_score,
+        total_vol:       profile.total_vol,
+        is_fresh:        profile.is_fresh,
+        wallet_age_days: profile.wallet_age_days,
+        recent_trades:   history,
+        top_markets,
+    })
+}
+
 // ─── Smart money public types ────────────────────────────────────────────────
 
 /// Wallet summary emitted to the TUI Smart Money tab.
