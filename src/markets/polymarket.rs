@@ -202,14 +202,19 @@ impl PolymarketClient {
         self.fetch_trades_from_url(&url).await
     }
 
-    /// Fetch recent trades for a specific wallet address.
+    /// Fetch recent activity for a specific wallet address.
+    ///
+    /// Uses `/activity?user=` (not `/trades?user=`): the trades endpoint omits
+    /// the `type` field entirely, so REDEEM events are invisible there.
+    /// The activity endpoint returns both TRADE and REDEEM rows with `type`
+    /// populated correctly.
     pub async fn fetch_user_trades(
         &self,
         wallet: &str,
         limit: u32,
     ) -> Result<Vec<PolyTrade>> {
         let url = format!(
-            "{}/trades?user={}&limit={}",
+            "{}/activity?user={}&limit={}",
             DATA_BASE,
             urlencoding::encode(wallet),
             limit,
