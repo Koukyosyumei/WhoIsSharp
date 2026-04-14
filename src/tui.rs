@@ -255,6 +255,9 @@ pub struct App {
 
     // Portfolio risk view toggle (v key in Portfolio tab)
     pub show_risk_view:    bool,
+
+    // Startup loading spinner (cycles 0–9)
+    pub spinner_tick:      u8,
 }
 
 // Position add-flow state machine
@@ -349,6 +352,7 @@ impl App {
             pairs_cursor:      0,
             pairs_loading:     false,
             show_risk_view:    false,
+            spinner_tick:      0,
         }
     }
 
@@ -748,6 +752,11 @@ fn render(f: &mut Frame, app: &App) {
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
+
+    // Startup loading overlay — shown until first market data arrives
+    if app.is_loading && app.markets.is_empty() {
+        render_loading_overlay(f, area, app);
+    }
 
     // Help overlay renders on top of everything
     if app.show_help {
@@ -2452,6 +2461,72 @@ fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+fn render_loading_overlay(f: &mut Frame, area: Rect, app: &App) {
+    // Braille spinner frames
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let frame = SPINNER[(app.spinner_tick as usize) % SPINNER.len()];
+
+    // Indeterminate "knight-rider" progress bar (20 cells wide)
+    const BAR_WIDTH: usize = 20;
+    let pos = (app.spinner_tick as usize / 2) % (BAR_WIDTH * 2);
+    // bounce: 0..BAR_WIDTH forward, BAR_WIDTH..BAR_WIDTH*2 backward
+    let head = if pos < BAR_WIDTH { pos } else { BAR_WIDTH * 2 - 1 - pos };
+    let bar: String = (0..BAR_WIDTH)
+        .map(|i| if i == head { '█' } else if i.abs_diff(head) <= 1 { '▓' } else if i.abs_diff(head) <= 2 { '░' } else { '·' })
+        .collect();
+
+    let step_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("  {}  Connecting to Polymarket & Kalshi…", frame),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("[{}]", bar), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("  {}", app.status),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Fetching live orderbooks, price history, and computing signals…",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  This typically takes 5–15 seconds on first launch.",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    // Use a fixed-size centered popup (50% wide, auto height)
+    let popup = centered_rect(54, 40, area);
+    f.render_widget(Clear, popup);
+
+    let p = Paragraph::new(step_lines)
+        .block(
+            Block::default()
+                .title("  WhoIsSharp — Loading  ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, popup);
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let popup = centered_rect(66, 92, area);
     f.render_widget(Clear, popup);
@@ -2855,12 +2930,21 @@ pub async fn run_tui(
     // WebSocket cancel switch — dropped when switching to a new market's orderbook
     let mut ws_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
 
+    // Spinner ticker — 80 ms interval, only active during initial market load
+    let mut spinner_iv = tokio::time::interval(std::time::Duration::from_millis(80));
+    spinner_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut term_events = EventStream::new();
 
     loop {
         terminal.draw(|f| render(f, &app))?;
 
         tokio::select! {
+            // ── Startup spinner tick (only while markets haven't loaded yet) ──
+            _ = spinner_iv.tick(), if app.markets.is_empty() && app.is_loading => {
+                app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            }
+
             // ── Auto-refresh tick ──────────────────────────────────────────────
             _ = async {
                 match &mut refresh_ticker {
