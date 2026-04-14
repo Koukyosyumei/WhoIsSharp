@@ -16,6 +16,7 @@ mod llm;
 mod markets;
 mod pairs;
 mod portfolio;
+mod risk;
 mod signals;
 mod tools;
 mod tui;

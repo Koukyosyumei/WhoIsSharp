@@ -252,6 +252,9 @@ pub struct App {
     pub pairs:             Vec<crate::pairs::MarketPair>,
     pub pairs_cursor:      usize,
     pub pairs_loading:     bool,
+
+    // Portfolio risk view toggle (v key in Portfolio tab)
+    pub show_risk_view:    bool,
 }
 
 // Position add-flow state machine
@@ -345,6 +348,7 @@ impl App {
             pairs:             Vec::new(),
             pairs_cursor:      0,
             pairs_loading:     false,
+            show_risk_view:    false,
         }
     }
 
@@ -1460,6 +1464,10 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
 // ── Portfolio tab ─────────────────────────────────────────────────────────────
 
 fn render_portfolio(f: &mut Frame, area: Rect, app: &App) {
+    if app.show_risk_view {
+        render_portfolio_risk(f, area, app);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(9), Constraint::Min(0)])
@@ -1467,6 +1475,233 @@ fn render_portfolio(f: &mut Frame, area: Rect, app: &App) {
 
     render_portfolio_summary(f, chunks[0], app);
     render_portfolio_positions(f, chunks[1], app);
+}
+
+// ─── Portfolio risk view ──────────────────────────────────────────────────────
+
+fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
+    use crate::risk;
+
+    if app.portfolio.positions.is_empty() {
+        let p = Paragraph::new("No positions to analyse. Add positions from the Markets tab (n).")
+            .block(Block::default().title(" Portfolio Risk Analysis ").borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let risk = risk::compute(&app.portfolio, &app.markets);
+
+    let outer_block = Block::default()
+        .title(" Portfolio Risk Analysis  [v] back to positions ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = outer_block.inner(area);
+    f.render_widget(outer_block, area);
+
+    // Split vertically: summary row | histogram | scenario table | position breakdown
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // key metrics
+            Constraint::Length(10), // histogram
+            Constraint::Min(0),     // scenario stress + per-position EV
+        ])
+        .split(inner);
+
+    // ── Key metrics ───────────────────────────────────────────────────────────
+    let ep_color = if risk.expected_pnl >= 0.0 { Color::Green } else { Color::Red };
+    let pp_color = if risk.prob_profit >= 0.5   { Color::Green } else { Color::Red };
+
+    let metric_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  E[P&L]: "),
+            Span::styled(format!("{:+.2}", risk.expected_pnl), Style::default().fg(ep_color).bold()),
+            Span::raw("   σ: "),
+            Span::styled(format!("{:.2}", risk.std_dev), Style::default().fg(Color::White).bold()),
+            Span::raw("   P(profit): "),
+            Span::styled(format!("{:.0}%", risk.prob_profit * 100.0), Style::default().fg(pp_color).bold()),
+            Span::raw("   Best: "),
+            Span::styled(format!("{:+.2}", risk.best_case), Style::default().fg(Color::Green)),
+            Span::raw("   Worst: "),
+            Span::styled(format!("{:+.2}", risk.worst_case), Style::default().fg(Color::Red)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(metric_lines), rows[0]);
+
+    // ── Histogram ─────────────────────────────────────────────────────────────
+    let hist_block = Block::default()
+        .title(" P&L Distribution  (normal approx., independent positions) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let hist_inner = hist_block.inner(rows[1]);
+    f.render_widget(hist_block, rows[1]);
+
+    if risk.histogram.is_empty() {
+        f.render_widget(
+            Paragraph::new("  (need ≥ 2 positions with non-zero σ for distribution)"),
+            hist_inner,
+        );
+    } else {
+        // Render as vertical bars inside the inner area.
+        // Height available: hist_inner.height rows; width ÷ HIST_BUCKETS cols per bar.
+        let h = hist_inner.height as usize;
+        let bar_w = (hist_inner.width as usize / risk::HIST_BUCKETS).max(1);
+
+        // Draw rows top→bottom. Row 0 = top (tallest only); row h-2 = bottom bar row.
+        // Row h-1 = axis + labels.
+        let bar_rows = h.saturating_sub(2);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for row in 0..bar_rows {
+            // threshold: what fraction of max height this row represents
+            let threshold = 1.0 - (row as f64 + 0.5) / bar_rows as f64;
+            // Colour: green right of zero, red left, white at zero
+            let zero_bucket = risk.histogram.iter()
+                .position(|(mid, _)| *mid >= 0.0)
+                .unwrap_or(risk::HIST_BUCKETS);
+
+            let spans: Vec<Span> = risk.histogram.iter().enumerate()
+                .map(|(i, (_, height))| {
+                    let filled = *height >= threshold;
+                    let text = if filled {
+                        "█".repeat(bar_w)
+                    } else {
+                        " ".repeat(bar_w)
+                    };
+                    let color = if !filled { Color::Reset }
+                                else if i < zero_bucket { Color::Red }
+                                else { Color::Green };
+                    Span::styled(text, Style::default().fg(color))
+                })
+                .collect();
+            lines.push(Line::from(spans));
+        }
+
+        // Axis line
+        lines.push(Line::from(Span::styled(
+            "─".repeat(hist_inner.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        // Label line: worst / zero / best
+        let total_w = hist_inner.width as usize;
+        let worst_label = format!("{:+.0}", risk.worst_case);
+        let best_label  = format!("{:+.0}", risk.best_case);
+        let zero_label  = "$0";
+        let zero_pos    = (risk::HIST_BUCKETS * bar_w)
+            .saturating_mul(
+                risk.histogram.iter().position(|(m, _)| *m >= 0.0).unwrap_or(0)
+            )
+            / risk::HIST_BUCKETS.max(1);
+
+        let mut label_row = " ".repeat(total_w);
+        // Write worst label at start
+        if worst_label.len() <= total_w {
+            label_row.replace_range(0..worst_label.len(), &worst_label);
+        }
+        // Write zero label near zero position
+        let z_start = zero_pos.min(total_w.saturating_sub(zero_label.len()));
+        label_row.replace_range(z_start..z_start + zero_label.len().min(total_w - z_start), zero_label);
+        // Write best label at end
+        let b_start = total_w.saturating_sub(best_label.len());
+        label_row.replace_range(b_start.., &best_label[..best_label.len().min(total_w - b_start)]);
+
+        lines.push(Line::from(Span::styled(label_row, Style::default().fg(Color::DarkGray))));
+
+        let para = Paragraph::new(lines);
+        f.render_widget(para, hist_inner);
+    }
+
+    // ── Scenario stress + per-position EV ────────────────────────────────────
+    let bottom_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(rows[2]);
+
+    // Left: category stress tests
+    let stress_block = Block::default()
+        .title(" Category Stress Tests ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let stress_inner = stress_block.inner(bottom_cols[0]);
+    f.render_widget(stress_block, bottom_cols[0]);
+
+    if risk.category_stress.is_empty() {
+        f.render_widget(Paragraph::new("  No positions."), stress_inner);
+    } else {
+        let max_abs = risk.category_stress.iter()
+            .map(|s| s.stressed_pnl.abs())
+            .fold(0.0f64, f64::max)
+            .max(1.0);
+
+        let bar_max_w = (stress_inner.width as usize).saturating_sub(32);
+
+        let mut stress_lines = vec![Line::from(vec![
+            Span::styled("  Category             Stress P&L", Style::default().fg(Color::DarkGray)),
+        ])];
+
+        for s in &risk.category_stress {
+            let pnl_color = if s.stressed_pnl >= 0.0 { Color::Green } else { Color::Red };
+            let bar_len = ((s.stressed_pnl.abs() / max_abs) * bar_max_w as f64) as usize;
+            let bar     = "█".repeat(bar_len);
+            let conc_pct = s.concentration * 100.0;
+            stress_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:.<18} {:>3}pos {:>3.0}%  ",
+                        trunc(&s.category, 16), s.n_positions, conc_pct),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("{:+.0}", s.stressed_pnl),
+                    Style::default().fg(pnl_color).bold(),
+                ),
+            ]));
+            stress_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(bar, Style::default().fg(pnl_color)),
+            ]));
+        }
+        stress_lines.push(Line::from(""));
+        stress_lines.push(Line::from(vec![
+            Span::styled(
+                "  All positions in category resolve against you.",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        f.render_widget(Paragraph::new(stress_lines), stress_inner);
+    }
+
+    // Right: per-position EV breakdown
+    let ev_block = Block::default()
+        .title(" Per-Position Expected Value ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let ev_inner = ev_block.inner(bottom_cols[1]);
+    f.render_widget(ev_block, bottom_cols[1]);
+
+    let mut ev_lines = vec![Line::from(vec![
+        Span::styled(
+            "  Title                         P(win)  E[P&L]  Win    Lose  ",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    for pr in &risk.positions {
+        let ev_color = if pr.expected_pnl >= 0.0 { Color::Green } else { Color::Red };
+        let wp_color = if pr.win_prob >= 0.5 { Color::Green } else { Color::Red };
+        ev_lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:.<30} ", trunc(&pr.title, 28)),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(format!("{:>5.0}%  ", pr.win_prob * 100.0), Style::default().fg(wp_color)),
+            Span::styled(format!("{:>+7.2}  ", pr.expected_pnl), Style::default().fg(ev_color)),
+            Span::styled(format!("{:>+6.2}  ", pr.win_pnl),  Style::default().fg(Color::Green)),
+            Span::styled(format!("{:>+6.2}", pr.lose_pnl), Style::default().fg(Color::Red)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(ev_lines), ev_inner);
 }
 
 fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
@@ -3235,6 +3470,16 @@ async fn handle_key(
         // ── Pairs tab: LLM re-match ───────────────────────────────────────────
         KC::Char('L') if app.input.is_empty() && app.active_tab == AppTab::Pairs => {
             trigger_llm_pairs(app, backend, event_tx).await;
+        }
+
+        // ── Portfolio tab: toggle risk view ───────────────────────────────────
+        KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
+            app.show_risk_view = !app.show_risk_view;
+            app.status = if app.show_risk_view {
+                "Risk view — E[P&L], σ, scenario analysis  [v] back to positions".to_string()
+            } else {
+                "Positions view  [v] risk analysis".to_string()
+            };
         }
 
         // ── Search ────────────────────────────────────────────────────────────
