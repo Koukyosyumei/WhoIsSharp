@@ -36,13 +36,14 @@ use tokio::sync::mpsc;
 use crate::agent::{self, AppEvent};
 use crate::llm::{LlmBackend, LlmMessage};
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
+use crate::markets::polymarket::PolyTrade;
 use crate::portfolio::{self, Portfolio, Position, Side, WatchEntry};
 use crate::signals::{Signal, SignalKind};
 use crate::tools::{MarketClients, SmartMoneyWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney"];
+const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -53,6 +54,7 @@ pub enum Tab {
     Portfolio  = 4,
     Chat       = 5,
     SmartMoney = 6,
+    Trades     = 7,
 }
 
 impl Tab {
@@ -65,6 +67,7 @@ impl Tab {
             4 => Some(Tab::Portfolio),
             5 => Some(Tab::Chat),
             6 => Some(Tab::SmartMoney),
+            7 => Some(Tab::Trades),
             _ => None,
         }
     }
@@ -108,6 +111,44 @@ impl PlatformFilter {
         }
     }
 }
+
+// ─── Market sort ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarketSort {
+    /// Closest to 50% first (default — most uncertain / tradeable).
+    YesPrice,
+    /// Highest volume first.
+    Volume,
+    /// Earliest end date first (market calendar view).
+    EndDate,
+    /// Alphabetical by title.
+    Name,
+}
+
+impl MarketSort {
+    pub fn label(&self) -> &str {
+        match self {
+            MarketSort::YesPrice => "~50%",
+            MarketSort::Volume   => "Vol",
+            MarketSort::EndDate  => "End",
+            MarketSort::Name     => "A-Z",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            MarketSort::YesPrice => MarketSort::Volume,
+            MarketSort::Volume   => MarketSort::EndDate,
+            MarketSort::EndDate  => MarketSort::Name,
+            MarketSort::Name     => MarketSort::YesPrice,
+        }
+    }
+}
+
+// ─── Alert edit step ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AlertEditStep { #[default] Above, Below }
 
 // ─── App state ───────────────────────────────────────────────────────────────
 
@@ -153,10 +194,25 @@ pub struct App {
     pub sm_loading:       bool,
     pub sm_list:          ListState,
 
+    // Time & Sales tab
+    pub trades_data:      Vec<PolyTrade>,
+    pub trades_list:      ListState,
+
+    // Chart: full candle data for volume overlay
+    pub chart_candles:    Vec<crate::markets::Candle>,
+
+    // Market sort
+    pub market_sort:      MarketSort,
+
     // Watchlist
     pub watchlist:        Vec<WatchEntry>,
     pub watchlist_only:   bool,
     pub watch_alerts:     Vec<String>,  // recent alert messages
+
+    // Alert threshold editor
+    pub alert_edit_mode:  bool,
+    pub alert_edit_step:  AlertEditStep,
+    pub alert_edit_mkt:   String,   // market_id being edited
 
     // Help overlay
     pub show_help:        bool,
@@ -227,9 +283,16 @@ impl App {
             sm_coord_pairs:    Vec::new(),
             sm_loading:        false,
             sm_list:           ListState::default(),
+            trades_data:       Vec::new(),
+            trades_list:       ListState::default(),
+            chart_candles:     Vec::new(),
+            market_sort:       MarketSort::YesPrice,
             watchlist:         portfolio::load_watchlist(),
             watchlist_only:    false,
             watch_alerts:      Vec::new(),
+            alert_edit_mode:   false,
+            alert_edit_step:   AlertEditStep::default(),
+            alert_edit_mkt:    String::new(),
             show_help:         false,
             refresh_secs:      60,
             next_refresh_at:   None,
@@ -244,7 +307,7 @@ impl App {
     // ── Filtered markets ──────────────────────────────────────────────────────
 
     pub fn filtered_markets(&self) -> Vec<&Market> {
-        self.markets
+        let mut v: Vec<&Market> = self.markets
             .iter()
             .filter(|m| {
                 self.platform_filter.matches(&m.platform)
@@ -252,7 +315,30 @@ impl App {
                     && (self.search.is_empty()
                         || m.title.to_lowercase().contains(&self.search.to_lowercase()))
             })
-            .collect()
+            .collect();
+
+        match self.market_sort {
+            MarketSort::YesPrice => {
+                // Default: closest to 50% first (already sorted this way from refresh)
+            }
+            MarketSort::Volume => {
+                v.sort_by(|a, b| {
+                    b.volume.unwrap_or(0.0)
+                        .partial_cmp(&a.volume.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            MarketSort::EndDate => {
+                v.sort_by(|a, b| {
+                    a.end_date.as_deref().unwrap_or("9999-99-99")
+                        .cmp(b.end_date.as_deref().unwrap_or("9999-99-99"))
+                });
+            }
+            MarketSort::Name => {
+                v.sort_by(|a, b| a.title.cmp(&b.title));
+            }
+        }
+        v
     }
 
     pub fn is_watched(&self, market_id: &str) -> bool {
@@ -337,6 +423,12 @@ impl App {
                 let i = self.sm_list.selected().map(|i| (i + 1) % len).unwrap_or(2);
                 self.sm_list.select(Some(i));
             }
+            Tab::Trades => {
+                let len = self.trades_data.len();
+                if len == 0 { return; }
+                let i = self.trades_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
+                self.trades_list.select(Some(i));
+            }
             _ => {}
         }
     }
@@ -376,6 +468,14 @@ impl App {
                     .map(|i| if i <= 2 { len - 1 } else { i - 1 })
                     .unwrap_or(2);
                 self.sm_list.select(Some(i));
+            }
+            Tab::Trades => {
+                let len = self.trades_data.len();
+                if len == 0 { return; }
+                let i = self.trades_list.selected()
+                    .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                    .unwrap_or(0);
+                self.trades_list.select(Some(i));
             }
             _ => {}
         }
@@ -551,6 +651,7 @@ fn render(f: &mut Frame, app: &App) {
         Tab::Portfolio  => render_portfolio(f, chunks[2], app),
         Tab::Chat       => render_chat(f, chunks[2], app),
         Tab::SmartMoney => render_smart_money(f, chunks[2], app),
+        Tab::Trades     => render_trades(f, chunks[2], app),
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
@@ -731,6 +832,48 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![
             Span::styled(" Gap:      ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{:.1}¢", sig.gap * 100.0), Style::default().fg(gap_color).bold()),
+        ]));
+
+        // ── Arb calculator ────────────────────────────────────────────────────
+        // price_a = buy price (lower), price_b = sell/NO price (higher)
+        // Strategy: buy YES on platform_a + buy NO on platform_b
+        let p_a = sig.price_a;                  // lower YES price
+        let p_b = price_b;                       // higher YES price
+        let no_b = 1.0 - p_b;                   // NO price on platform_b
+        let total_cost = p_a + no_b;             // cost per share pair
+        let profit_per = p_b - p_a;             // guaranteed profit per share
+        let ret_pct = if total_cost > 1e-9 { profit_per / total_cost * 100.0 } else { 0.0 };
+        // At $1,000 bankroll
+        let bankroll = 1000.0;
+        let n_shares = if total_cost > 1e-9 { bankroll / total_cost } else { 0.0 };
+        let cost_yes = n_shares * p_a;
+        let cost_no  = n_shares * no_b;
+        let arb_profit = n_shares * profit_per;
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" ─── ARB CALCULATOR ──────────────────", Style::default().fg(Color::Magenta)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(format!(" Buy YES on {} @ {:.1}¢  +  Buy NO on {} @ {:.1}¢",
+                sig.platform_a.label(), p_a * 100.0,
+                plat_b.label(), no_b * 100.0)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(format!(" Cost/share: {:.1}¢   Payout/share: 100¢   Profit/share: {:.1}¢",
+                total_cost * 100.0, profit_per * 100.0)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(" Guaranteed return:  "),
+            Span::styled(format!("{:.2}%", ret_pct), Style::default().fg(gap_color).bold()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" At $1,000 bankroll:", ), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(format!("   YES @ {}: ${:.0}   NO @ {}: ${:.0}   Profit: ",
+                sig.platform_a.label(), cost_yes, plat_b.label(), cost_no)),
+            Span::styled(format!("${:.0}", arb_profit), Style::default().fg(gap_color).bold()),
         ]));
     } else {
         let gap_label = match sig.kind {
@@ -921,6 +1064,20 @@ fn render_chart(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Determine if we have volume data (Kalshi only)
+    let has_volume = app.chart_candles.iter().any(|c| c.volume.is_some());
+
+    // Split vertically: price chart on top, volume bar on bottom (if available)
+    let (chart_area, vol_area_opt) = if has_volume && area.height > 8 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     let x_min = app.chart_data.first().map(|(x, _)| *x).unwrap_or(0.0);
     let x_max = app.chart_data.last().map(|(x, _)| *x).unwrap_or(1.0);
     let y_min = (app.chart_min - 2.0).max(0.0);
@@ -974,7 +1131,40 @@ fn render_chart(f: &mut Frame, area: Rect, app: &App) {
                 .labels(y_labels),
         );
 
-    f.render_widget(chart, area);
+    f.render_widget(chart, chart_area);
+
+    // Volume overlay (Kalshi only — Polymarket price history has no volume)
+    if let Some(vol_area) = vol_area_opt {
+        let max_vol = app.chart_candles.iter()
+            .filter_map(|c| c.volume)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        if max_vol > 0.0 {
+            let inner_w = vol_area.width.saturating_sub(2) as usize;
+            let n = app.chart_candles.len();
+            let step = if n > 0 { (n as f64 / inner_w as f64).max(1.0) } else { 1.0 };
+            let vol_bar: String = (0..inner_w)
+                .map(|i| {
+                    let idx = ((i as f64 * step) as usize).min(n.saturating_sub(1));
+                    let pct = app.chart_candles.get(idx)
+                        .and_then(|c| c.volume)
+                        .map(|v| v / max_vol)
+                        .unwrap_or(0.0);
+                    match (pct * 8.0) as u8 {
+                        0 => ' ', 1 => '▁', 2 => '▂', 3 => '▃',
+                        4 => '▄', 5 => '▅', 6 => '▆', 7 => '▇', _ => '█',
+                    }
+                })
+                .collect();
+
+            let vol_p = Paragraph::new(Line::from(Span::styled(vol_bar, Style::default().fg(Color::DarkGray))))
+                .block(Block::default()
+                    .title(" Volume ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)));
+            f.render_widget(vol_p, vol_area);
+        }
+    }
 }
 
 // ── Orderbook tab ─────────────────────────────────────────────────────────────
@@ -1071,7 +1261,7 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
 fn render_portfolio(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
         .split(area);
 
     render_portfolio_summary(f, chunks[0], app);
@@ -1084,6 +1274,30 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
     let total_pnl   = app.portfolio.total_pnl();
     let pnl_color   = if total_pnl >= 0.0 { Color::Green } else { Color::Red };
 
+    // ── Risk metrics ──────────────────────────────────────────────────────────
+    let positions = &app.portfolio.positions;
+    let n = positions.len();
+    let winning = positions.iter().filter(|p| p.pnl() > 0.0).count();
+    let win_rate = if n > 0 { winning as f64 / n as f64 * 100.0 } else { 0.0 };
+
+    let concentration = if total_cost > 1e-9 {
+        positions.iter()
+            .map(|p| p.cost() / total_cost * 100.0)
+            .fold(f64::NEG_INFINITY, f64::max)
+    } else { 0.0 };
+
+    let pm_cost: f64 = positions.iter()
+        .filter(|p| p.platform == Platform::Polymarket)
+        .map(|p| p.cost()).sum();
+    let kl_cost: f64 = positions.iter()
+        .filter(|p| p.platform == Platform::Kalshi)
+        .map(|p| p.cost()).sum();
+
+    let best_pnl  = positions.iter().map(|p| p.pnl()).fold(f64::NEG_INFINITY, f64::max);
+    let worst_pnl = positions.iter().map(|p| p.pnl()).fold(f64::INFINITY,     f64::min);
+    let best_color  = if best_pnl  >= 0.0 { Color::Green } else { Color::Red };
+    let worst_color = if worst_pnl >= 0.0 { Color::Green } else { Color::Red };
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -1093,6 +1307,19 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("${:.2}", total_value), Style::default().fg(Color::White).bold()),
             Span::raw("   Unrealised PnL: "),
             Span::styled(format!("{:+.2}$", total_pnl), Style::default().fg(pnl_color).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Positions: "),
+            Span::styled(format!("{}", n), Style::default().fg(Color::White)),
+            Span::raw(format!("   Win rate: {:.0}%", win_rate)),
+            Span::raw(format!("   Top concentration: {:.0}%", concentration)),
+            Span::raw(format!("   PM: ${:.0}  KL: ${:.0}", pm_cost, kl_cost)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Best: "),
+            Span::styled(if n > 0 { format!("{:+.2}$", best_pnl)  } else { "—".into() }, Style::default().fg(best_color)),
+            Span::raw("   Worst: "),
+            Span::styled(if n > 0 { format!("{:+.2}$", worst_pnl) } else { "—".into() }, Style::default().fg(worst_color)),
         ]),
         Line::from(vec![
             Span::styled(
@@ -1267,6 +1494,70 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
+// ── Time & Sales tab ──────────────────────────────────────────────────────────
+
+fn render_trades(f: &mut Frame, area: Rect, app: &App) {
+    let title = app.selected_market_id
+        .as_ref()
+        .and_then(|id| app.markets.iter().find(|m| &m.id == id))
+        .map(|m| format!(" Time & Sales — {} ", trunc(&m.title, 50)))
+        .unwrap_or_else(|| " Time & Sales ".to_string());
+
+    if app.trades_data.is_empty() {
+        let msg = if app.selected_market_id.is_some() {
+            "Loading trades… (Polymarket only; Kalshi trade tape not available)"
+        } else {
+            "Select a Polymarket market and press Enter to load the trade tape."
+        };
+        let p = Paragraph::new(msg)
+            .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!("  {:<20} {:>6} {:>5} {:>8} {:>8}  {}",
+                "Trader", "Type", "Side", "Price", "Size", "Market"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let sep = Line::from(Span::styled("  ".to_string() + &"─".repeat(70), Style::default().fg(Color::DarkGray)));
+
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(header),
+        ListItem::new(sep),
+    ];
+
+    for t in &app.trades_data {
+        let side_color = if t.side == "BUY" { Color::Green } else if t.side == "SELL" { Color::Red } else { Color::DarkGray };
+        let type_color = if t.trade_type == "REDEEM" { Color::Magenta } else { Color::White };
+        let name = trunc(&t.pseudonym, 20);
+        let market_short = trunc(&t.market_title, 30);
+
+        let line = Line::from(vec![
+            Span::raw(format!("  {:<20}", name)),
+            Span::styled(format!(" {:>6}", t.trade_type), Style::default().fg(type_color)),
+            Span::styled(format!(" {:>5}", if t.side.is_empty() { "—" } else { &t.side }), Style::default().fg(side_color)),
+            Span::styled(format!(" {:>8.1}¢", t.price * 100.0), Style::default().fg(price_color(t.price))),
+            Span::raw(format!(" {:>8.0}", t.size)),
+            Span::raw(format!("  {}", market_short)),
+        ]);
+        items.push(ListItem::new(line));
+    }
+
+    let count = app.trades_data.len();
+    let full_title = format!("{} ({} trades) ", title.trim_end(), count);
+    let list = List::new(items)
+        .block(Block::default().title(full_title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("▶ ");
+
+    let mut state = app.trades_list.clone();
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 // ── Smart Money tab ───────────────────────────────────────────────────────────
 
 fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
@@ -1418,21 +1709,23 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(" Navigation", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  1–7 / Tab / Shift+Tab   Switch tabs"),
+        Line::from("  1–8 / Tab / Shift+Tab   Switch tabs"),
         Line::from("  j / ↓  ·  k / ↑         Navigate list / scroll"),
-        Line::from("  Enter                    Select market → load chart+book+smart money"),
+        Line::from("  Enter                    Select market → load chart+book+smart money+trades"),
         Line::from(""),
         Line::from(vec![Span::styled(" Market Data", Style::default().fg(Color::Cyan).bold())]),
         Line::from("  r                        Refresh market data now"),
         Line::from("  p                        Cycle platform filter  ALL → PM → KL"),
         Line::from("  c                        Cycle chart interval   1h→6h→1d→1w→1m"),
+        Line::from("  S (Shift+s)              Cycle sort: ~50% → Volume → EndDate → A-Z"),
         Line::from("  /                        Enter search/filter mode"),
         Line::from("  Esc                      Clear search"),
+        Line::from("  E (Shift+e)              Export current tab data to CSV"),
         Line::from(""),
         Line::from(vec![Span::styled(" Watchlist", Style::default().fg(Color::Yellow).bold())]),
         Line::from("  w                        Toggle watchlist for selected market  (★)"),
         Line::from("  W (Shift+w)              Toggle watchlist-only filter"),
-        Line::from("  Alerts shown in status bar when a watched market crosses a threshold"),
+        Line::from("  e                        Edit alert thresholds for watched market"),
         Line::from(""),
         Line::from(vec![Span::styled(" Portfolio", Style::default().fg(Color::Cyan).bold())]),
         Line::from("  n                        Add position for selected market"),
@@ -1740,15 +2033,17 @@ mod tests {
         assert_eq!(Tab::Orderbook.next(),   Tab::Portfolio);
         assert_eq!(Tab::Portfolio.next(),   Tab::Chat);
         assert_eq!(Tab::Chat.next(),        Tab::SmartMoney);
-        assert_eq!(Tab::SmartMoney.next(),  Tab::Signals); // wraps
+        assert_eq!(Tab::SmartMoney.next(),  Tab::Trades);
+        assert_eq!(Tab::Trades.next(),      Tab::Signals); // wraps
     }
 
     #[test]
     fn tab_prev_cycles_backward() {
-        assert_eq!(Tab::Signals.prev(),     Tab::SmartMoney); // wraps
+        assert_eq!(Tab::Signals.prev(),     Tab::Trades); // wraps
         assert_eq!(Tab::Markets.prev(),     Tab::Signals);
         assert_eq!(Tab::Chat.prev(),        Tab::Portfolio);
         assert_eq!(Tab::SmartMoney.prev(),  Tab::Chat);
+        assert_eq!(Tab::Trades.prev(),      Tab::SmartMoney);
     }
 }
 
@@ -1790,6 +2085,9 @@ pub async fn run_tui(
     } else {
         None
     };
+
+    // WebSocket cancel switch — dropped when switching to a new market's orderbook
+    let mut ws_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     let mut term_events = EventStream::new();
 
@@ -1840,6 +2138,16 @@ pub async fn run_tui(
                                 .collect();
                             app.chart_min = candles.iter().map(|c| c.low * 100.0).fold(f64::INFINITY, f64::min);
                             app.chart_max = candles.iter().map(|c| c.high * 100.0).fold(f64::NEG_INFINITY, f64::max);
+                            app.chart_candles = candles;
+                        }
+                    }
+                    AppEvent::TradesLoaded { market_id, trades } => {
+                        if Some(&market_id) == app.selected_market_id.as_ref() {
+                            app.trades_data = trades;
+                            if !app.trades_data.is_empty() {
+                                app.trades_list.select(Some(0));
+                            }
+                            app.status = format!("Loaded {} trades", app.trades_data.len());
                         }
                     }
                     AppEvent::OrderbookLoaded { market_id, orderbook } => {
@@ -1925,13 +2233,39 @@ pub async fn run_tui(
                         app.chat_msgs.push(ChatMsg::Error(e.clone()));
                         app.status = format!("Error: {}", e);
                     }
+                    AppEvent::HistoryUpdated(hist) => {
+                        llm_history = hist;
+                    }
                 }
             }
 
             Some(Ok(ev)) = term_events.next() => {
                 if let Event::Key(key) = ev {
+                    let prev_market = app.selected_market_id.clone();
+
                     if handle_key(&mut app, key, &backend, &clients, &event_tx, &mut llm_history).await {
                         break;
+                    }
+
+                    // Start/restart Polymarket WS orderbook stream when a new market is selected
+                    if app.selected_market_id != prev_market {
+                        drop(ws_cancel.take()); // signal old WS task to exit
+                        if let Some(id) = &app.selected_market_id {
+                            if let Some(market) = app.markets.iter().find(|m| &m.id == id) {
+                                if market.platform == Platform::Polymarket {
+                                    if let Some(token_id) = &market.token_id {
+                                        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                                        ws_cancel = Some(cancel_tx);
+                                        let token  = token_id.clone();
+                                        let mkt_id = id.clone();
+                                        let tx     = event_tx.clone();
+                                        tokio::spawn(async move {
+                                            agent::stream_polymarket_orderbook(token, mkt_id, tx, cancel_rx).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1970,6 +2304,54 @@ async fn handle_key(
             return false;
         }
         return true;
+    }
+
+    // ── Alert threshold edit flow ─────────────────────────────────────────────
+    if app.alert_edit_mode {
+        match key.code {
+            KC::Esc => {
+                app.alert_edit_mode = false;
+                app.input.clear();
+                app.status = "Alert edit cancelled.".to_string();
+            }
+            KC::Enter => {
+                let val_str = app.input.trim().to_string();
+                app.input.clear();
+                match app.alert_edit_step {
+                    AlertEditStep::Above => {
+                        // Store above threshold (or 1.0 = no alert)
+                        let threshold = if val_str.is_empty() {
+                            1.0
+                        } else {
+                            val_str.parse::<f64>().unwrap_or(1.0) / 100.0
+                        };
+                        if let Some(entry) = app.watchlist.iter_mut().find(|w| w.market_id == app.alert_edit_mkt) {
+                            entry.alert_above = threshold.clamp(0.0, 1.0);
+                        }
+                        app.alert_edit_step = AlertEditStep::Below;
+                        app.status = format!("Alert above set to {:.0}¢. Enter BELOW threshold (¢, or Enter for none):", threshold * 100.0);
+                    }
+                    AlertEditStep::Below => {
+                        let threshold = if val_str.is_empty() {
+                            0.0
+                        } else {
+                            val_str.parse::<f64>().unwrap_or(0.0) / 100.0
+                        };
+                        if let Some(entry) = app.watchlist.iter_mut().find(|w| w.market_id == app.alert_edit_mkt) {
+                            entry.alert_below = threshold.clamp(0.0, 1.0);
+                        }
+                        let _ = portfolio::save_watchlist(&app.watchlist);
+                        app.alert_edit_mode = false;
+                        app.alert_edit_step = AlertEditStep::default();
+                        app.status = format!("Alert thresholds saved for market.");
+                    }
+                }
+            }
+            KC::Backspace => { app.input.pop(); }
+            KC::Char(c)   => { app.input.push(c); }
+            _ => {}
+        }
+        return false;
     }
 
     // ── Position input flow ───────────────────────────────────────────────────
@@ -2036,6 +2418,10 @@ async fn handle_key(
             app.active_tab = AppTab::SmartMoney;
             trigger_smart_money_load(app, clients, event_tx).await;
         }
+        KC::Char('8') if app.input.is_empty() => {
+            app.active_tab = AppTab::Trades;
+            trigger_trades_load(app, clients, event_tx).await;
+        }
 
         KC::Tab => { app.active_tab = app.active_tab.next(); }
         KC::BackTab => { app.active_tab = app.active_tab.prev(); }
@@ -2071,13 +2457,16 @@ async fn handle_key(
                 if let Some(id) = market_id {
                     app.selected_market_id = Some(id.clone());
                     app.chart_data.clear();
+                    app.chart_candles.clear();
                     app.orderbook = None;
                     app.sm_wallets.clear();
                     app.sm_coord_pairs.clear();
+                    app.trades_data.clear();
                     app.status = format!("Loading data for {}", id);
                     trigger_chart_load(app, clients, event_tx).await;
                     trigger_orderbook_load(app, clients, event_tx).await;
                     trigger_smart_money_load(app, clients, event_tx).await;
+                    trigger_trades_load(app, clients, event_tx).await;
                     app.active_tab = AppTab::Chart;
                 }
             }
@@ -2204,6 +2593,39 @@ async fn handle_key(
             };
         }
 
+        // ── Market sort (Shift+S) ─────────────────────────────────────────────
+        KC::Char('S') if app.input.is_empty() => {
+            app.market_sort = app.market_sort.next();
+            app.market_list.select(Some(0));
+            app.status = format!("Sort: {}", app.market_sort.label());
+        }
+
+        // ── CSV export (Shift+E) ──────────────────────────────────────────────
+        KC::Char('E') if app.input.is_empty() => {
+            app.status = export_current_tab(app);
+        }
+
+        // ── Alert threshold editor ────────────────────────────────────────────
+        KC::Char('e') if app.input.is_empty() => {
+            let mkt = match app.active_tab {
+                AppTab::Markets => app.selected_market().map(|m| (m.id.clone(), m.title.clone())),
+                _               => app.selected_market().map(|m| (m.id.clone(), m.title.clone())),
+            };
+            if let Some((id, title)) = mkt {
+                if app.is_watched(&id) {
+                    app.alert_edit_mode = true;
+                    app.alert_edit_step = AlertEditStep::default();
+                    app.alert_edit_mkt  = id;
+                    app.input.clear();
+                    app.status = format!("Alert for '{}': enter ABOVE threshold in ¢ (or Enter for none):", trunc(&title, 30));
+                } else {
+                    app.status = "Market not watched — press 'w' to add to watchlist first.".to_string();
+                }
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+        }
+
         // ── Ask AI ────────────────────────────────────────────────────────────
         KC::Char('a') if app.input.is_empty() => {
             let info = match app.active_tab {
@@ -2240,6 +2662,96 @@ async fn handle_key(
     false
 }
 
+/// Build a context block describing current TUI state.
+///
+/// This is prepended (invisibly to the user) to every LLM message so the model
+/// always knows which market is on screen and can answer follow-ups like
+/// "further analyze the above" without asking for a market ID.
+fn build_context_prefix(app: &App) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Active tab
+    let tab_name = TAB_NAMES[app.active_tab as usize];
+    lines.push(format!("Active tab: {}", tab_name));
+
+    // Selected market details
+    if let Some(ref sel_id) = app.selected_market_id {
+        if let Some(m) = app.markets.iter().find(|m| &m.id == sel_id) {
+            let plat = match m.platform {
+                Platform::Polymarket => "Polymarket",
+                Platform::Kalshi    => "Kalshi",
+            };
+            let yes_pct = m.yes_price * 100.0;
+            let no_pct  = (1.0 - m.yes_price) * 100.0;
+
+            let vol_str = match m.volume {
+                Some(v) if v >= 1_000_000.0 => format!("${:.1}M", v / 1_000_000.0),
+                Some(v) if v >= 1_000.0     => format!("${:.0}K", v / 1_000.0),
+                Some(v)                     => format!("${:.0}", v),
+                None                        => "n/a".to_string(),
+            };
+            let liq_str = match m.liquidity {
+                Some(l) if l >= 1_000.0 => format!("${:.0}K", l / 1_000.0),
+                Some(l)                 => format!("${:.0}", l),
+                None                    => "n/a".to_string(),
+            };
+
+            let mut mkt = format!(
+                "Selected market: \"{title}\" ({plat})\n\
+                 \x20 Market ID: {id}  YES: {yes:.1}%  NO: {no:.1}%  Volume: {vol}  Liquidity: {liq}",
+                title = m.title,
+                plat  = plat,
+                id    = m.id,
+                yes   = yes_pct,
+                no    = no_pct,
+                vol   = vol_str,
+                liq   = liq_str,
+            );
+            if let Some(ref tok) = m.token_id {
+                mkt.push_str(&format!("\n\x20 Token ID (Polymarket CLOB): {}", tok));
+            }
+            if let Some(ref end) = m.end_date {
+                mkt.push_str(&format!("\n\x20 End date: {}", &end[..end.len().min(10)]));
+            }
+            if let Some(ref cat) = m.category {
+                mkt.push_str(&format!("  Category: {}", cat));
+            }
+            lines.push(mkt);
+        }
+    }
+
+    // Live orderbook summary if loaded
+    if let Some(ref ob) = app.orderbook {
+        if let (Some(bid), Some(ask)) = (ob.bids.first(), ob.asks.first()) {
+            let spread_pp = (ask.price - bid.price) * 100.0;
+            lines.push(format!(
+                "Live orderbook: best bid {:.1}%  best ask {:.1}%  spread {:.1}pp",
+                bid.price * 100.0,
+                ask.price * 100.0,
+                spread_pp,
+            ));
+        }
+    }
+
+    // Portfolio summary
+    let n = app.portfolio.positions.len();
+    if n > 0 {
+        let pnl = app.portfolio.total_pnl();
+        lines.push(format!(
+            "Portfolio: {} open position(s), total unrealised PnL: {}{:.2}",
+            n,
+            if pnl >= 0.0 { "+" } else { "" },
+            pnl,
+        ));
+    }
+
+    format!(
+        "[Dashboard context — use this to answer follow-up questions without asking \
+         the user for IDs or prices that are visible on screen]\n{}",
+        lines.join("\n")
+    )
+}
+
 async fn send_chat(
     app:         &mut App,
     backend:     &Option<Arc<dyn LlmBackend>>,
@@ -2270,18 +2782,23 @@ async fn send_chat(
     app.is_loading = true;
     app.status = "Sending…".to_string();
 
+    // Inject TUI context as a hidden preamble so the LLM knows which market is
+    // on screen without the user having to repeat market IDs.
+    let ctx    = build_context_prefix(app);
+    let llm_msg = format!("{}\n\nUser: {}", ctx, msg);
+
     let backend_c  = backend_arc.clone();
     let clients_c  = clients.clone();
     let tx         = event_tx.clone();
     let mut hist   = std::mem::take(llm_history);
 
-    let handle = tokio::spawn(async move {
-        agent::run_turn(backend_c, clients_c, &mut hist, msg, tx).await;
-        hist
+    tokio::spawn(async move {
+        agent::run_turn(backend_c, clients_c, &mut hist, llm_msg, tx.clone()).await;
+        // Return history to the TUI via the event channel so it persists across turns.
+        let _ = tx.send(AppEvent::HistoryUpdated(hist));
     });
-
-    let _ = handle; // detach; history is rebuilt per-turn
-    *llm_history = Vec::new();
+    // llm_history stays empty until HistoryUpdated arrives; a second message
+    // sent before the first turn completes starts a fresh context (rare edge case).
 }
 
 async fn trigger_chart_load(
@@ -2336,4 +2853,103 @@ async fn trigger_smart_money_load(
     tokio::spawn(async move {
         agent::refresh_smart_money(clients_c, market_id, tx).await;
     });
+}
+
+async fn trigger_trades_load(
+    app:      &App,
+    clients:  &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    use crate::markets::Platform;
+
+    let Some(id) = &app.selected_market_id else { return };
+    // Trades tape is Polymarket-only
+    let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
+    if market.platform != Platform::Polymarket { return; }
+
+    let clients_c = clients.clone();
+    let tx        = event_tx.clone();
+    let market_id = id.clone();
+
+    tokio::spawn(async move {
+        agent::refresh_market_trades(clients_c, market_id, tx).await;
+    });
+}
+
+fn export_current_tab(app: &App) -> String {
+    use std::fmt::Write as _;
+
+    let mut dir = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push(".whoissharp");
+    dir.push("exports");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "Export failed: cannot create exports directory".to_string();
+    }
+
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+
+    let (filename, content) = match app.active_tab {
+        Tab::Markets => {
+            let mut csv = "Platform,Title,YES%,Volume,Liquidity,EndDate,ID\n".to_string();
+            for m in app.filtered_markets() {
+                let _ = writeln!(csv, "{},{},{:.1},{},{},{},{}",
+                    m.platform.label(),
+                    m.title.replace(',', ";"),
+                    m.yes_price * 100.0,
+                    m.volume.map(|v| format!("{:.0}", v)).unwrap_or_default(),
+                    m.liquidity.map(|v| format!("{:.0}", v)).unwrap_or_default(),
+                    m.end_date.as_deref().unwrap_or(""),
+                    m.id,
+                );
+            }
+            (format!("markets_{}.csv", ts), csv)
+        }
+        Tab::Signals => {
+            let mut csv = "Kind,Stars,Title,Platform,Price,Gap,Action\n".to_string();
+            for s in &app.signals {
+                let _ = writeln!(csv, "{},{},{},{},{:.1},{:.3},{}",
+                    s.kind.label(), s.stars,
+                    s.title.replace(',', ";"),
+                    s.platform_a.label(),
+                    s.price_a * 100.0, s.gap,
+                    s.action.replace(',', ";"),
+                );
+            }
+            (format!("signals_{}.csv", ts), csv)
+        }
+        Tab::Portfolio => {
+            let mut csv = "Platform,Title,Side,EntryPrice,Mark,Shares,PnL,PnL%,ID\n".to_string();
+            for p in &app.portfolio.positions {
+                let _ = writeln!(csv, "{},{},{},{:.2},{:.2},{:.0},{:.2},{:.1},{}",
+                    p.platform.label(),
+                    p.title.replace(',', ";"),
+                    p.side.label(),
+                    p.entry_price * 100.0,
+                    p.mark_price.unwrap_or(p.entry_price) * 100.0,
+                    p.shares, p.pnl(), p.pnl_pct(), p.id,
+                );
+            }
+            (format!("portfolio_{}.csv", ts), csv)
+        }
+        Tab::Trades => {
+            let mut csv = "Trader,Type,Side,Price,Size,Market,ConditionID\n".to_string();
+            for t in &app.trades_data {
+                let _ = writeln!(csv, "{},{},{},{:.3},{:.0},{},{}",
+                    t.pseudonym.replace(',', ";"),
+                    t.trade_type, t.side,
+                    t.price, t.size,
+                    t.market_title.replace(',', ";"),
+                    t.condition_id,
+                );
+            }
+            (format!("trades_{}.csv", ts), csv)
+        }
+        _ => return "Export not available for this tab. Use Markets, Signals, Portfolio, or Trades.".to_string(),
+    };
+
+    let path = dir.join(&filename);
+    match std::fs::write(&path, &content) {
+        Ok(_) => format!("Exported {} rows → {}", content.lines().count() - 1, path.display()),
+        Err(e) => format!("Export failed: {}", e),
+    }
 }

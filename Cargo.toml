@@ -41,3 +41,6 @@ jsonwebtoken = "9"
 
 # Home-directory resolution (portfolio persistence)
 dirs-next = "2"
+
+# WebSocket client for real-time Polymarket orderbook streaming
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }

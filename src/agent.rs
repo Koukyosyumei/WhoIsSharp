@@ -43,9 +43,20 @@ pub enum AppEvent {
         market_id: String,
         result:    crate::tools::SmartMoneyResult,
     },
+
+    // ── Time & Sales tape ─────────────────────────────────────────────────────
+    TradesLoaded {
+        market_id: String,
+        trades:    Vec<crate::markets::polymarket::PolyTrade>,
+    },
+
     RefreshStarted,
     RefreshDone,
     RefreshError(String),
+
+    /// Carry conversation history back to the TUI after each agent turn so it
+    /// persists across multiple user messages.
+    HistoryUpdated(Vec<crate::llm::LlmMessage>),
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -357,6 +368,22 @@ pub async fn refresh_smart_money(
     }
 }
 
+/// Fetch recent Time & Sales tape for a Polymarket market.
+pub async fn refresh_market_trades(
+    clients:   Arc<MarketClients>,
+    market_id: String,
+    event_tx:  mpsc::UnboundedSender<AppEvent>,
+) {
+    match clients.polymarket.fetch_market_trades(&market_id, 100).await {
+        Ok(trades) => {
+            let _ = event_tx.send(AppEvent::TradesLoaded { market_id, trades });
+        }
+        Err(e) => {
+            let _ = event_tx.send(AppEvent::RefreshError(format!("Trades: {}", e)));
+        }
+    }
+}
+
 pub async fn refresh_orderbook(
     clients:  Arc<MarketClients>,
     market:   crate::markets::Market,
@@ -383,6 +410,80 @@ pub async fn refresh_orderbook(
         }
         Err(e) => {
             let _ = event_tx.send(AppEvent::RefreshError(format!("Orderbook: {}", e)));
+        }
+    }
+}
+
+/// Stream real-time orderbook updates from Polymarket's CLOB WebSocket.
+///
+/// Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/`, subscribes to
+/// `token_id`, and emits `AppEvent::OrderbookLoaded` on each "book" event.
+/// Exits cleanly when `cancel` is dropped (market changes or user leaves the tab).
+pub async fn stream_polymarket_orderbook(
+    token_id:  String,
+    market_id: String,
+    event_tx:  mpsc::UnboundedSender<AppEvent>,
+    cancel:    tokio::sync::oneshot::Receiver<()>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/";
+
+    let Ok((mut ws, _)) = tokio_tungstenite::connect_async(WS_URL).await else {
+        return; // silently fail — REST orderbook is already loaded
+    };
+
+    // Subscribe to the market's token
+    let sub = serde_json::json!([{ "assets_ids": [token_id], "type": "market" }]);
+    if ws.send(Message::Text(sub.to_string())).await.is_err() {
+        return;
+    }
+
+    let mut cancel = cancel;
+
+    loop {
+        tokio::select! {
+            _ = &mut cancel => { break; }
+            msg = ws.next() => {
+                let Some(Ok(Message::Text(text))) = msg else { break; };
+                // Ignore heartbeat pings (empty object `{}`)
+                if text.trim() == "{}" { continue; }
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { continue; };
+
+                let event_type = val.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+                if event_type != "book" && event_type != "price_change" { continue; }
+
+                let parse_levels = |key: &str| -> Vec<crate::markets::PriceLevel> {
+                    val.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter().filter_map(|item| {
+                                let price = item.get("price")?.as_str()?.parse::<f64>().ok()?;
+                                let size  = item.get("size")?.as_str()?.parse::<f64>().ok()?;
+                                Some(crate::markets::PriceLevel { price, size })
+                            }).collect()
+                        })
+                        .unwrap_or_default()
+                };
+
+                let mut bids = parse_levels("buys");
+                if bids.is_empty() { bids = parse_levels("bids"); }
+                let mut asks = parse_levels("sells");
+                if asks.is_empty() { asks = parse_levels("asks"); }
+
+                // Only emit if we got meaningful data
+                if bids.is_empty() && asks.is_empty() { continue; }
+
+                bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+                asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+                let book = crate::markets::Orderbook { bids, asks, last_price: None };
+                let _ = event_tx.send(AppEvent::OrderbookLoaded {
+                    market_id: market_id.clone(),
+                    orderbook: book,
+                });
+            }
         }
     }
 }
