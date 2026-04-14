@@ -70,24 +70,43 @@ src/
 
 ### Key bindings
 
-| Key          | Action                                          |
-|--------------|-------------------------------------------------|
-| `1`–`6`      | Switch tabs directly                            |
-| `Tab`        | Cycle to next tab                               |
-| `Shift+Tab`  | Cycle to previous tab                           |
-| `j` / `↓`   | Move selection down / scroll                    |
-| `k` / `↑`   | Move selection up / scroll                      |
-| `Enter`      | Select market (loads chart+book) / send chat    |
-| `r`          | Refresh market data                             |
-| `w`          | Toggle watchlist for selected market            |
-| `p`          | Cycle platform filter (All → PM → KL → All)    |
-| `c`          | Cycle chart interval (1h → 6h → 1d → 1w → 1m) |
-| `a`          | Pre-fill AI analysis prompt for selected market |
-| `/`          | Enter search/filter mode                        |
-| `Esc`        | Clear search                                    |
-| `?`          | Help (not yet implemented — see CLAUDE.md)      |
-| `Ctrl+C`     | Quit (or clear input if non-empty)              |
-| `q`          | Quit (when input is empty)                      |
+**Navigation (always available)**
+
+| Key              | Action                                            |
+|------------------|---------------------------------------------------|
+| `1`–`9`          | Switch tabs directly                              |
+| `Tab`            | Cycle to next tab                                 |
+| `Shift+Tab`      | Cycle to previous tab                             |
+| `j` / `↓`        | Move selection down / scroll                      |
+| `k` / `↑`        | Move selection up / scroll                        |
+| `Enter`          | Select market (loads chart+book) / send chat      |
+| `Ctrl+C`         | Quit (or clear input if non-empty)                |
+
+**Slash commands** — press `/`, type the command, press `Enter`
+
+| Command                       | Action                                            |
+|-------------------------------|---------------------------------------------------|
+| `/refresh` or `/r`            | Refresh markets + chart + orderbook               |
+| `/platform` or `/p`           | Cycle platform filter (All → PM → KL → All)       |
+| `/chart` or `/c`              | Cycle chart interval (1h → 6h → 1d → 1w → 1m)    |
+| `/sort` or `/s`               | Cycle sort (~50% → Volume → End Date → A-Z)        |
+| `/watchlist` or `/w`          | Toggle watchlist for selected market              |
+| `/wf`                         | Toggle watchlist-only filter                      |
+| `/alert` or `/e`              | Edit price alert thresholds (above / below)       |
+| `/add` or `/n`                | Add position for selected market                  |
+| `/targets` or `/t`            | Set take-profit / stop-loss                       |
+| `/delete` or `/d`             | Delete selected position (Portfolio tab)          |
+| `/dismiss` or `/x`            | Dismiss selected signal (hidden until restart)    |
+| `/analyze` or `/a` or `@`     | Pre-fill AI analysis prompt for selected market   |
+| `/kelly` or `/k`              | Open Kelly position-size calculator               |
+| `/risk` or `/v`               | Toggle risk/exposure view (Portfolio tab)         |
+| `/pairs` or `/l`              | LLM re-match (Pairs tab)                          |
+| `/lower` / `/raise`           | Adjust threshold (also: `[` / `]` keys)           |
+| `/export` or `/csv`           | Export current tab to CSV                         |
+| `/report` or `/m`             | Export Markdown report for selected market        |
+| `/help` or `/?` or `?`        | Toggle help overlay                               |
+| `/<search term>`              | Unrecognised text → filter market list            |
+| `Esc`                         | Cancel / clear command bar or search              |
 
 ## AI tools
 
