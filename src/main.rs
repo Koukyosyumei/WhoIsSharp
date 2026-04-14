@@ -14,6 +14,7 @@ mod config;
 mod http;
 mod llm;
 mod markets;
+mod pairs;
 mod portfolio;
 mod signals;
 mod tools;

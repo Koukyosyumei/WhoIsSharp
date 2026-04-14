@@ -57,6 +57,12 @@ pub enum AppEvent {
     /// Carry conversation history back to the TUI after each agent turn so it
     /// persists across multiple user messages.
     HistoryUpdated(Vec<crate::llm::LlmMessage>),
+
+    // ── Cross-platform pair matching ──────────────────────────────────────────
+    /// Pair matching is in progress (show spinner).
+    PairsMatching,
+    /// Pair matching complete — replace the pairs list.
+    PairsLoaded(Vec<crate::pairs::MarketPair>),
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────

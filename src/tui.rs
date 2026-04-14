@@ -45,7 +45,7 @@ use crate::tools::{MarketClients, SmartMoneyWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades"];
+const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -57,6 +57,7 @@ pub enum Tab {
     Chat       = 5,
     SmartMoney = 6,
     Trades     = 7,
+    Pairs      = 8,
 }
 
 impl Tab {
@@ -70,6 +71,7 @@ impl Tab {
             5 => Some(Tab::Chat),
             6 => Some(Tab::SmartMoney),
             7 => Some(Tab::Trades),
+            8 => Some(Tab::Pairs),
             _ => None,
         }
     }
@@ -245,6 +247,11 @@ pub struct App {
     pub target_input_mode: bool,
     pub target_input_step: TargetInputStep,
     pub target_pos_id:     String,   // position being edited
+
+    // Cross-platform pairs (Pairs tab)
+    pub pairs:             Vec<crate::pairs::MarketPair>,
+    pub pairs_cursor:      usize,
+    pub pairs_loading:     bool,
 }
 
 // Position add-flow state machine
@@ -335,6 +342,9 @@ impl App {
             target_input_mode: false,
             target_input_step: TargetInputStep::default(),
             target_pos_id:     String::new(),
+            pairs:             Vec::new(),
+            pairs_cursor:      0,
+            pairs_loading:     false,
         }
     }
 
@@ -493,6 +503,11 @@ impl App {
                 let i = self.trades_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
                 self.trades_list.select(Some(i));
             }
+            Tab::Pairs => {
+                if !self.pairs.is_empty() {
+                    self.pairs_cursor = (self.pairs_cursor + 1) % self.pairs.len();
+                }
+            }
             _ => {}
         }
     }
@@ -540,6 +555,15 @@ impl App {
                     .map(|i| if i == 0 { len - 1 } else { i - 1 })
                     .unwrap_or(0);
                 self.trades_list.select(Some(i));
+            }
+            Tab::Pairs => {
+                if !self.pairs.is_empty() {
+                    self.pairs_cursor = if self.pairs_cursor == 0 {
+                        self.pairs.len() - 1
+                    } else {
+                        self.pairs_cursor - 1
+                    };
+                }
             }
             _ => {}
         }
@@ -716,6 +740,7 @@ fn render(f: &mut Frame, app: &App) {
         Tab::Chat       => render_chat(f, chunks[2], app),
         Tab::SmartMoney => render_smart_money(f, chunks[2], app),
         Tab::Trades     => render_trades(f, chunks[2], app),
+        Tab::Pairs      => render_pairs(f, chunks[2], app),
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
@@ -1723,6 +1748,269 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
 
 // ── Time & Sales tab ──────────────────────────────────────────────────────────
 
+// ─── Pairs tab ───────────────────────────────────────────────────────────────
+
+fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
+    use crate::pairs::{MatchType, ResolutionRisk};
+
+    let matcher_label = if app.pairs_loading {
+        " ⟳ matching… "
+    } else if app.pairs.iter().any(|p| p.llm_matched) {
+        " LLM "
+    } else {
+        " Jaccard "
+    };
+    let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
+    let header_title = format!(
+        " Cross-Platform Pairs  {}  [{} pairs  {} arb] ",
+        matcher_label,
+        app.pairs.len(),
+        arb_count,
+    );
+
+    if app.pairs.is_empty() {
+        let msg = if app.pairs_loading {
+            "Matching markets with LLM — please wait…"
+        } else {
+            "No matching pairs found. Press L to run LLM matching, or wait for market refresh."
+        };
+        let block = Block::default()
+            .title(header_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let para = Paragraph::new(msg)
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, area);
+        return;
+    }
+
+    // Split: left list (40%) | right detail (60%)
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    // ── Left: pairs list ──────────────────────────────────────────────────────
+    let list_block = Block::default()
+        .title(header_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let items: Vec<ListItem> = app.pairs.iter().enumerate().map(|(i, p)| {
+        let star_str = match p.stars {
+            3 => "★★★",
+            2 => "★★☆",
+            1 => "★☆☆",
+            _ => "☆☆☆",
+        };
+        let net_color = if p.net_gap > 0.02 { Color::Green }
+                        else if p.net_gap > 0.0 { Color::Yellow }
+                        else { Color::Red };
+        let match_char = match p.match_type {
+            MatchType::Identical     => "≡",
+            MatchType::NearIdentical => "≈",
+            MatchType::Related       => "~",
+            MatchType::Different     => "?",
+        };
+        let llm_tag = if p.llm_matched { "⚡" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{} {} ", star_str, match_char),
+                Style::default().fg(if i == app.pairs_cursor { Color::Cyan } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                trunc(&p.pm_market.title, 24),
+                Style::default().fg(if i == app.pairs_cursor { Color::White } else { Color::Gray }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:+.1}pp{}", p.net_gap * 100.0, llm_tag),
+                Style::default().fg(net_color),
+            ),
+        ]);
+        ListItem::new(line)
+    }).collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.pairs_cursor));
+    f.render_stateful_widget(
+        List::new(items)
+            .block(list_block)
+            .highlight_style(Style::default().bg(Color::DarkGray)),
+        cols[0],
+        &mut list_state,
+    );
+
+    // ── Right: detail panel ───────────────────────────────────────────────────
+    let Some(pair) = app.pairs.get(app.pairs_cursor) else { return; };
+
+    let detail_block = Block::default()
+        .title(format!(" {} ", trunc(&pair.pm_market.title, 60)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = detail_block.inner(cols[1]);
+    f.render_widget(detail_block, cols[1]);
+
+    // Layout inside detail: two price rows then analysis rows
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4), // PM + KL price blocks side-by-side
+            Constraint::Length(1), // gap row
+            Constraint::Min(0),    // analysis text
+        ])
+        .split(inner);
+
+    // Price columns
+    let price_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+
+    let pm_price_color = if pair.buy_yes_on == crate::markets::Platform::Polymarket {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    let kl_price_color = if pair.buy_yes_on == crate::markets::Platform::Kalshi {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    let fmt_money = |v: f64| -> String {
+        if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
+        else if v >= 1_000.0 { format!("${:.0}K", v / 1_000.0) }
+        else { format!("${:.0}", v) }
+    };
+
+    let pm_text = vec![
+        Line::from(vec![
+            Span::raw("POLYMARKET  "),
+            Span::styled(
+                format!("YES {:.1}%", pair.pm_market.yes_price * 100.0),
+                Style::default().fg(pm_price_color).bold(),
+            ),
+        ]),
+        Line::from(format!(
+            "Vol: {}   Liq: {}",
+            pair.pm_market.volume.map(|v| fmt_money(v)).unwrap_or_else(|| "n/a".into()),
+            pair.pm_market.liquidity.map(|l| fmt_money(l)).unwrap_or_else(|| "n/a".into()),
+        )),
+        Line::from(trunc(&pair.pm_market.title, 36)),
+    ];
+    f.render_widget(Paragraph::new(pm_text), price_cols[0]);
+
+    let kl_text = vec![
+        Line::from(vec![
+            Span::raw("KALSHI      "),
+            Span::styled(
+                format!("YES {:.1}%", pair.kl_market.yes_price * 100.0),
+                Style::default().fg(kl_price_color).bold(),
+            ),
+        ]),
+        Line::from(format!(
+            "Vol: {}   Liq: {}",
+            pair.kl_market.volume.map(|v| fmt_money(v)).unwrap_or_else(|| "n/a".into()),
+            pair.kl_market.liquidity.map(|l| fmt_money(l)).unwrap_or_else(|| "n/a".into()),
+        )),
+        Line::from(trunc(&pair.kl_market.title, 36)),
+    ];
+    f.render_widget(Paragraph::new(kl_text), price_cols[1]);
+
+    // Gap separator line
+    let gap_color = if pair.net_gap > 0.02 { Color::Green }
+                    else if pair.net_gap > 0.0 { Color::Yellow }
+                    else { Color::Red };
+    let stars_str = match pair.stars {
+        3 => "★★★",
+        2 => "★★☆",
+        1 => "★☆☆",
+        _ => "☆☆☆",
+    };
+    let gap_line = Line::from(vec![
+        Span::styled(
+            format!(
+                "  {}  Gross gap: {:.1}pp  │  Net (after {}%+{}% fees): ",
+                stars_str,
+                pair.gross_gap * 100.0,
+                (crate::pairs::PM_TAKER_FEE * 100.0) as u32,
+                (crate::pairs::KL_TAKER_FEE * 100.0) as u32,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{:+.2}pp", pair.net_gap * 100.0),
+            Style::default().fg(gap_color).bold(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(gap_line), rows[1]);
+
+    // Analysis text
+    let match_type_str = pair.match_type.label();
+    let match_color = match pair.match_type {
+        MatchType::Identical     => Color::Green,
+        MatchType::NearIdentical => Color::Yellow,
+        MatchType::Related       => Color::Magenta,
+        MatchType::Different     => Color::DarkGray,
+    };
+    let risk_color = match pair.res_risk {
+        ResolutionRisk::Low    => Color::Green,
+        ResolutionRisk::Medium => Color::Yellow,
+        ResolutionRisk::High   => Color::Red,
+    };
+    let llm_or_jaccard = if pair.llm_matched {
+        format!("LLM  (confidence {:.0}%)", pair.similarity * 100.0)
+    } else {
+        format!("Jaccard  (score {:.2})", pair.similarity)
+    };
+
+    let analysis_lines = vec![
+        Line::from(vec![
+            Span::raw("  Match type : "),
+            Span::styled(match_type_str, Style::default().fg(match_color).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Res. risk  : "),
+            Span::styled(pair.res_risk.label(), Style::default().fg(risk_color).bold()),
+            Span::styled(
+                format!("  — {}", pair.res_risk_note),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Strategy   : "),
+            Span::styled(pair.direction_label(), Style::default().fg(Color::Cyan).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Est. profit: "),
+            Span::styled(
+                if pair.capturable_usd > 0.0 {
+                    format!("~${:.0} at max liquidity", pair.capturable_usd)
+                } else {
+                    "None (negative net gap)".to_string()
+                },
+                Style::default().fg(if pair.capturable_usd > 0.0 { Color::Green } else { Color::DarkGray }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Matched by : "),
+            Span::styled(llm_or_jaccard, Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  [L] re-match with LLM   [Enter] open PM market   [j/k] navigate pairs",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(analysis_lines), rows[2]);
+}
+
 fn render_trades(f: &mut Frame, area: Rect, app: &App) {
     let title = app.selected_market_id
         .as_ref()
@@ -2275,16 +2563,18 @@ mod tests {
         assert_eq!(Tab::Portfolio.next(),   Tab::Chat);
         assert_eq!(Tab::Chat.next(),        Tab::SmartMoney);
         assert_eq!(Tab::SmartMoney.next(),  Tab::Trades);
-        assert_eq!(Tab::Trades.next(),      Tab::Signals); // wraps
+        assert_eq!(Tab::Trades.next(),      Tab::Pairs);
+        assert_eq!(Tab::Pairs.next(),       Tab::Signals); // wraps
     }
 
     #[test]
     fn tab_prev_cycles_backward() {
-        assert_eq!(Tab::Signals.prev(),     Tab::Trades); // wraps
+        assert_eq!(Tab::Signals.prev(),     Tab::Pairs); // wraps
         assert_eq!(Tab::Markets.prev(),     Tab::Signals);
         assert_eq!(Tab::Chat.prev(),        Tab::Portfolio);
         assert_eq!(Tab::SmartMoney.prev(),  Tab::Chat);
         assert_eq!(Tab::Trades.prev(),      Tab::SmartMoney);
+        assert_eq!(Tab::Pairs.prev(),       Tab::Trades);
     }
 }
 
@@ -2385,6 +2675,18 @@ pub async fn run_tui(
                         app.signals = sigs;
                         if app.signal_list.selected().is_none() && !app.signals.is_empty() {
                             app.signal_list.select(Some(0));
+                        }
+
+                        // Always compute Jaccard pairs immediately on market load.
+                        // LLM-enhanced matching happens when user visits the Pairs tab.
+                        let jaccard = crate::pairs::jaccard_pairs(&app.markets);
+                        let arb_count = jaccard.iter().filter(|p| p.net_gap > 0.0).count();
+                        if !jaccard.is_empty() {
+                            app.pairs = jaccard;
+                            app.pairs_cursor = 0;
+                        }
+                        if arb_count > 0 {
+                            app.status = format!("{} arb pair(s) detected (tab 9)", arb_count);
                         }
                     }
                     AppEvent::EventsLoaded(_) => {}  // Events tab removed; ignore
@@ -2501,6 +2803,20 @@ pub async fn run_tui(
                     }
                     AppEvent::HistoryUpdated(hist) => {
                         llm_history = hist;
+                    }
+                    AppEvent::PairsMatching => {
+                        app.pairs_loading = true;
+                        app.status = "Matching pairs with LLM…".to_string();
+                    }
+                    AppEvent::PairsLoaded(pairs) => {
+                        app.pairs_loading = false;
+                        app.pairs = pairs;
+                        app.pairs_cursor = 0;
+                        let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
+                        app.status = format!(
+                            "{} pairs found  ({} profitable after fees)",
+                            app.pairs.len(), arb_count
+                        );
                     }
                 }
             }
@@ -2736,6 +3052,10 @@ async fn handle_key(
             app.active_tab = AppTab::Trades;
             trigger_trades_load(app, clients, event_tx).await;
         }
+        KC::Char('9') if app.input.is_empty() => {
+            app.active_tab = AppTab::Pairs;
+            trigger_llm_pairs(app, backend, event_tx).await;
+        }
 
         KC::Tab => {
             app.active_tab = app.active_tab.next();
@@ -2744,6 +3064,7 @@ async fn handle_key(
                 AppTab::Orderbook => { trigger_orderbook_load(app, clients, event_tx).await; }
                 AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
                 AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
+                AppTab::Pairs     => { trigger_llm_pairs(app, backend, event_tx).await; }
                 _ => {}
             }
         }
@@ -2754,6 +3075,7 @@ async fn handle_key(
                 AppTab::Orderbook => { trigger_orderbook_load(app, clients, event_tx).await; }
                 AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
                 AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
+                AppTab::Pairs     => { trigger_llm_pairs(app, backend, event_tx).await; }
                 _ => {}
             }
         }
@@ -2908,6 +3230,11 @@ async fn handle_key(
         // ── Markdown report export ────────────────────────────────────────────
         KC::Char('M') if app.input.is_empty() => {
             app.status = export_markdown_report(app);
+        }
+
+        // ── Pairs tab: LLM re-match ───────────────────────────────────────────
+        KC::Char('L') if app.input.is_empty() && app.active_tab == AppTab::Pairs => {
+            trigger_llm_pairs(app, backend, event_tx).await;
         }
 
         // ── Search ────────────────────────────────────────────────────────────
@@ -3403,6 +3730,31 @@ async fn trigger_trades_load(
     tokio::spawn(async move {
         agent::refresh_market_trades(clients_c, market_id, tx).await;
     });
+}
+
+/// Trigger LLM-enhanced pair matching (if backend available) or Jaccard fallback.
+/// Sends `PairsMatching` immediately, then `PairsLoaded` when done.
+async fn trigger_llm_pairs(
+    app:      &App,
+    backend:  &Option<Arc<dyn LlmBackend>>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if app.markets.is_empty() { return; }
+    let _ = event_tx.send(AppEvent::PairsMatching);
+
+    let markets_snap = app.markets.clone();
+    let tx = event_tx.clone();
+
+    if let Some(b) = backend.clone() {
+        tokio::spawn(async move {
+            let pairs = crate::pairs::llm_match_pairs(&markets_snap, &b).await;
+            let _ = tx.send(AppEvent::PairsLoaded(pairs));
+        });
+    } else {
+        // No LLM — use Jaccard immediately (synchronous, fast)
+        let pairs = crate::pairs::jaccard_pairs(&markets_snap);
+        let _ = event_tx.send(AppEvent::PairsLoaded(pairs));
+    }
 }
 
 /// Export a Markdown research report for the selected market.
