@@ -104,6 +104,27 @@ impl PolymarketClient {
         Ok(raw.into_iter().filter_map(gamma_to_market).collect())
     }
 
+    /// Fetch a single market by its conditionId.
+    /// Returns `None` when the conditionId is unknown or the market is unlisted.
+    pub async fn fetch_market_by_condition_id(&self, condition_id: &str) -> Result<Option<Market>> {
+        let url = format!(
+            "{}/markets?conditionId={}&limit=1",
+            GAMMA_BASE,
+            urlencoding::encode(condition_id)
+        );
+        // Use a short cache TTL — we just need the token_id once.
+        let body = self.cached_get(&url, 300).await
+            .context("Polymarket /markets?conditionId lookup failed")?;
+        let raw: Vec<GammaMarket> =
+            serde_json::from_str(&body).context("Failed to parse conditionId lookup")?;
+        // Verify that the returned market actually matches the requested conditionId.
+        // The Gamma API ?conditionId= filter is not always exact — we must check.
+        Ok(raw
+            .into_iter()
+            .filter_map(gamma_to_market)
+            .find(|m| m.id.eq_ignore_ascii_case(condition_id)))
+    }
+
     pub async fn fetch_events(&self, limit: u32) -> Result<Vec<super::Event>> {
         let url = format!(
             "{}/events?active=true&closed=false&limit={}&order=volume&ascending=false",

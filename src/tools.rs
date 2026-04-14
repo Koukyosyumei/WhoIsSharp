@@ -68,6 +68,39 @@ async fn dispatch_inner(
     }
 }
 
+// ─── Polymarket ID resolver ───────────────────────────────────────────────────
+
+/// For Polymarket, `get_orderbook` and `get_price_history` need the YES CLOB
+/// **token_id** (a long decimal), not the **conditionId** (starts with `0x`).
+///
+/// The AI frequently passes the conditionId because that's what `list_markets`
+/// and `get_market` surface as the primary ID.  This helper detects that case
+/// and resolves the token_id via the Gamma API, returning the correct ID to
+/// use for CLOB calls.
+///
+/// If the id doesn't look like a conditionId (i.e. doesn't start with `0x`)
+/// it is returned as-is — it's already a token_id.
+async fn resolve_pm_token_id(clients: &MarketClients, id: &str) -> Result<String> {
+    // conditionIds are 0x-prefixed 32-byte hex strings (66 chars).
+    // token_ids are long decimal numbers (no 0x prefix).
+    if !id.starts_with("0x") {
+        return Ok(id.to_string());
+    }
+
+    let market = clients
+        .polymarket
+        .fetch_market_by_condition_id(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(
+            "conditionId '{}' not found on Polymarket. \
+             Use list_markets or search_markets to confirm the ID.", id
+        ))?;
+
+    market.token_id.ok_or_else(|| anyhow::anyhow!(
+        "Market '{}' has no CLOB token — it may not be actively traded on the CLOB.", market.title
+    ))
+}
+
 // ─── Tool implementations ─────────────────────────────────────────────────────
 
 async fn list_markets(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
@@ -140,19 +173,30 @@ async fn get_market(clients: &MarketClients, args: &serde_json::Value) -> Result
         Some(m) => {
             let vol = m.volume.map(|v| format!("${:.0}", v)).unwrap_or_else(|| "N/A".into());
             let liq = m.liquidity.map(|v| format!("${:.0}", v)).unwrap_or_else(|| "N/A".into());
+            // Emit both IDs clearly so the AI always has the right one for each call:
+            //  • condition_id → use for get_market, find_smart_money, analyze_insider
+            //  • token_id     → use for get_orderbook, get_price_history (Polymarket CLOB)
+            let token_line = if m.platform == crate::markets::Platform::Polymarket {
+                format!(
+                    "\nToken ID (CLOB — use for get_orderbook, get_price_history): {}",
+                    m.token_id.as_deref().unwrap_or("N/A")
+                )
+            } else {
+                String::new()
+            };
             let out = format!(
-                "Market: {}\nPlatform: {}\nID: {}\nStatus: {}\nCategory: {}\nYES: {:.1}%  NO: {:.1}%\nVolume: {}  Liquidity: {}\nEnds: {}\nDescription: {}",
-                m.title,
-                m.platform,
-                m.id,
-                m.status,
-                m.category.as_deref().unwrap_or("N/A"),
-                m.yes_price * 100.0,
-                m.no_price  * 100.0,
-                vol,
-                liq,
-                m.end_date.as_deref().unwrap_or("N/A"),
-                m.description.as_deref().unwrap_or("N/A"),
+                "Market: {title}\nPlatform: {platform}\nCondition ID (use for get_market, find_smart_money, analyze_insider): {id}{token_line}\nStatus: {status}\nCategory: {cat}\nYES: {yes:.1}%  NO: {no:.1}%\nVolume: {vol}  Liquidity: {liq}\nEnds: {end}\nDescription: {desc}",
+                title    = m.title,
+                platform = m.platform,
+                id       = m.id,
+                status   = m.status,
+                cat      = m.category.as_deref().unwrap_or("N/A"),
+                yes      = m.yes_price * 100.0,
+                no       = m.no_price  * 100.0,
+                vol      = vol,
+                liq      = liq,
+                end      = m.end_date.as_deref().unwrap_or("N/A"),
+                desc     = m.description.as_deref().unwrap_or("N/A"),
             );
             Ok(ToolOutput::ok(out))
         }
@@ -169,9 +213,18 @@ async fn get_orderbook(clients: &MarketClients, args: &serde_json::Value) -> Res
     }
 
     let book = match platform {
-        "polymarket" => clients.polymarket.fetch_orderbook(id).await?,
-        "kalshi"     => clients.kalshi.fetch_orderbook(id).await?,
-        _            => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),
+        "polymarket" => {
+            // The CLOB /book endpoint requires a token_id, not a conditionId.
+            // Auto-resolve 0x… conditionIds so the AI doesn't have to remember
+            // to pass the right field.
+            let token_id = match resolve_pm_token_id(clients, id).await {
+                Ok(t)  => t,
+                Err(e) => return Ok(ToolOutput::err(e.to_string())),
+            };
+            clients.polymarket.fetch_orderbook(&token_id).await?
+        }
+        "kalshi" => clients.kalshi.fetch_orderbook(id).await?,
+        _ => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),
     };
 
     let spread = book.spread().map(|s| format!("{:.4}", s)).unwrap_or_else(|| "N/A".into());
@@ -216,9 +269,14 @@ async fn get_price_history(
 
     let candles = match platform {
         "polymarket" => {
+            // Price history also uses token_id — resolve conditionIds automatically.
+            let token_id = match resolve_pm_token_id(clients, id).await {
+                Ok(t)  => t,
+                Err(e) => return Ok(ToolOutput::err(e.to_string())),
+            };
             clients
                 .polymarket
-                .fetch_price_history(id, interval.polymarket_fidelity(), start_ts, now)
+                .fetch_price_history(&token_id, interval.polymarket_fidelity(), start_ts, now)
                 .await?
         }
         "kalshi" => {
@@ -443,6 +501,123 @@ fn parse_ob_size(line: &str) -> Option<f64> {
     let after = line.splitn(2, '×').nth(1)?;
     let token = after.split_whitespace().next()?;
     token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f64>().ok()
+}
+
+// ─── Smart money public types ────────────────────────────────────────────────
+
+/// Wallet summary emitted to the TUI Smart Money tab.
+#[derive(Clone, Debug)]
+pub struct SmartMoneyWallet {
+    pub wallet:      String,
+    pub pseudonym:   String,
+    pub market_size: f64,
+    pub n_positions: usize,
+    pub n_wins:      usize,
+    pub win_rate:    f64,
+    pub alpha_score: f64, // NaN = no winning trades in history
+    pub total_vol:   f64,
+    pub suspicion:   f64, // 0–100 composite
+    pub flagged:     bool,
+}
+
+/// Result returned by `smart_money_for_market` for TUI consumption.
+#[derive(Debug)]
+pub struct SmartMoneyResult {
+    pub market_title: String,
+    pub wallets:      Vec<SmartMoneyWallet>,
+    pub coord_pairs:  Vec<(String, String, f64)>, // (name_a, name_b, jaccard)
+}
+
+/// Fetch smart money data for a Polymarket market and return structured results.
+/// Intended for the TUI Smart Money tab; the AI tool uses `find_smart_money`.
+pub async fn smart_money_for_market(
+    clients:   &MarketClients,
+    market_id: &str,
+    top_n:     usize,
+) -> anyhow::Result<SmartMoneyResult> {
+    use std::collections::HashMap;
+    use futures_util::future::join_all;
+
+    const WIN_RATE_THRESHOLD: f64 = 0.55;
+    const MIN_POSITIONS:      usize = 3;
+    const COORD_THRESHOLD:    f64 = 0.35;
+
+    let market_trades = clients
+        .polymarket
+        .fetch_market_trades(market_id, 200)
+        .await?;
+
+    if market_trades.is_empty() {
+        return Ok(SmartMoneyResult {
+            market_title: market_id.to_string(),
+            wallets:      Vec::new(),
+            coord_pairs:  Vec::new(),
+        });
+    }
+
+    let market_title = market_trades[0].market_title.clone();
+
+    // Rank wallets by buy-side size in this market
+    let mut wallet_agg: HashMap<String, (f64, String)> = HashMap::new();
+    for t in &market_trades {
+        if t.side == "BUY" {
+            let entry = wallet_agg.entry(t.wallet.clone()).or_insert((0.0, t.pseudonym.clone()));
+            entry.0 += t.size;
+        }
+    }
+    let mut ranked: Vec<(String, f64, String)> = wallet_agg
+        .into_iter()
+        .map(|(w, (s, p))| (w, s, p))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_n.min(10));
+
+    // Concurrent wallet history fetch
+    let histories: Vec<_> = join_all(
+        ranked.iter().map(|(wallet, _, _)| clients.polymarket.fetch_user_trades(wallet, 100))
+    ).await;
+
+    let profiles: Vec<WalletProfile> = ranked
+        .iter()
+        .zip(histories)
+        .filter_map(|((wallet, market_size, pseudonym), hist_result)| {
+            let hist = hist_result.ok()?;
+            Some(build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &hist))
+        })
+        .collect();
+
+    // Coordination detection
+    let mut coord_pairs = Vec::new();
+    for i in 0..profiles.len() {
+        for j in (i + 1)..profiles.len() {
+            let sim = jaccard(&profiles[i].market_set, &profiles[j].market_set);
+            if sim >= COORD_THRESHOLD {
+                coord_pairs.push((profiles[i].pseudonym.clone(), profiles[j].pseudonym.clone(), sim));
+            }
+        }
+    }
+
+    // Convert to public structs
+    let wallets = profiles.iter().map(|p| {
+        let alpha_adv = if p.alpha_score.is_nan() { 0.0 } else { (0.5 - p.alpha_score).max(0.0) * 2.0 };
+        let vol_score = if p.total_vol > 0.0 { (p.total_vol.ln() / 15.0).min(1.0).max(0.0) } else { 0.0 };
+        let suspicion = (p.win_rate * 0.5 + alpha_adv * 0.3 + vol_score * 0.2) * 100.0;
+        let flagged = p.n_positions >= MIN_POSITIONS && p.win_rate > WIN_RATE_THRESHOLD;
+        SmartMoneyWallet {
+            wallet:      p.wallet.clone(),
+            pseudonym:   p.pseudonym.clone(),
+            market_size: p.market_size,
+            n_positions: p.n_positions,
+            n_wins:      p.n_wins,
+            win_rate:    p.win_rate,
+            alpha_score: p.alpha_score,
+            total_vol:   p.total_vol,
+            suspicion,
+            flagged,
+        }
+    }).collect();
+
+    Ok(SmartMoneyResult { market_title, wallets, coord_pairs })
 }
 
 // ─── Smart money / account analysis ──────────────────────────────────────────

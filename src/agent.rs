@@ -38,6 +38,11 @@ pub enum AppEvent {
         market_id: String,
         orderbook: crate::markets::Orderbook,
     },
+    SmartMoneyLoading,
+    SmartMoneyLoaded {
+        market_id: String,
+        result:    crate::tools::SmartMoneyResult,
+    },
     RefreshStarted,
     RefreshDone,
     RefreshError(String),
@@ -313,6 +318,23 @@ pub async fn refresh_price_history(
         }
         Err(e) => {
             let _ = event_tx.send(AppEvent::RefreshError(format!("Price history: {}", e)));
+        }
+    }
+}
+
+pub async fn refresh_smart_money(
+    clients:   Arc<MarketClients>,
+    market_id: String,
+    event_tx:  mpsc::UnboundedSender<AppEvent>,
+) {
+    let _ = event_tx.send(AppEvent::SmartMoneyLoading);
+
+    match tools::smart_money_for_market(&clients, &market_id, 8).await {
+        Ok(result) => {
+            let _ = event_tx.send(AppEvent::SmartMoneyLoaded { market_id, result });
+        }
+        Err(e) => {
+            let _ = event_tx.send(AppEvent::RefreshError(format!("Smart money: {}", e)));
         }
     }
 }

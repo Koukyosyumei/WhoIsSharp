@@ -38,20 +38,21 @@ use crate::llm::{LlmBackend, LlmMessage};
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
 use crate::portfolio::{self, Portfolio, Position, Side};
 use crate::signals::{Signal, SignalKind};
-use crate::tools::MarketClients;
+use crate::tools::{MarketClients, SmartMoneyWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat"];
+const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
-    Signals   = 0,
-    Markets   = 1,
-    Chart     = 2,
-    Orderbook = 3,
-    Portfolio = 4,
-    Chat      = 5,
+    Signals    = 0,
+    Markets    = 1,
+    Chart      = 2,
+    Orderbook  = 3,
+    Portfolio  = 4,
+    Chat       = 5,
+    SmartMoney = 6,
 }
 
 impl Tab {
@@ -63,6 +64,7 @@ impl Tab {
             3 => Some(Tab::Orderbook),
             4 => Some(Tab::Portfolio),
             5 => Some(Tab::Chat),
+            6 => Some(Tab::SmartMoney),
             _ => None,
         }
     }
@@ -144,6 +146,13 @@ pub struct App {
     pub pos_input_step:    PosInputStep,
     pub pos_draft:         PosDraft,
 
+    // Smart Money tab
+    pub sm_wallets:       Vec<SmartMoneyWallet>,
+    pub sm_market_title:  String,
+    pub sm_coord_pairs:   Vec<(String, String, f64)>,
+    pub sm_loading:       bool,
+    pub sm_list:          ListState,
+
     // Status
     pub status:            String,
     pub is_loading:        bool,
@@ -201,6 +210,11 @@ impl App {
             pos_input_mode:    false,
             pos_input_step:    PosInputStep::default(),
             pos_draft:         PosDraft::default(),
+            sm_wallets:        Vec::new(),
+            sm_market_title:   String::new(),
+            sm_coord_pairs:    Vec::new(),
+            sm_loading:        false,
+            sm_list:           ListState::default(),
             status:            "Loading market data…".to_string(),
             is_loading:        true,
             backend_name,
@@ -255,8 +269,15 @@ impl App {
                 let i = self.portfolio_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
                 self.portfolio_list.select(Some(i));
             }
-            Tab::Chat      => { self.chat_scroll = self.chat_scroll.saturating_add(1); }
-            Tab::Orderbook => { self.book_scroll = self.book_scroll.saturating_add(1); }
+            Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_sub(1); } // j = scroll toward bottom
+            Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_add(1); }
+            Tab::SmartMoney => {
+                // +2 for header rows
+                let len = self.sm_wallets.len() + 2;
+                if len <= 2 { return; }
+                let i = self.sm_list.selected().map(|i| (i + 1) % len).unwrap_or(2);
+                self.sm_list.select(Some(i));
+            }
             _ => {}
         }
     }
@@ -287,8 +308,16 @@ impl App {
                     .unwrap_or(0);
                 self.portfolio_list.select(Some(i));
             }
-            Tab::Chat      => { self.chat_scroll = self.chat_scroll.saturating_sub(1); }
-            Tab::Orderbook => { self.book_scroll = self.book_scroll.saturating_sub(1); }
+            Tab::Chat       => { self.chat_scroll = self.chat_scroll.saturating_add(1); } // k = scroll toward top
+            Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_sub(1); }
+            Tab::SmartMoney => {
+                let len = self.sm_wallets.len() + 2;
+                if len <= 2 { return; }
+                let i = self.sm_list.selected()
+                    .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                    .unwrap_or(2);
+                self.sm_list.select(Some(i));
+            }
             _ => {}
         }
     }
@@ -456,12 +485,13 @@ fn render(f: &mut Frame, app: &App) {
     render_header(f, chunks[0], app);
     render_tabs(f, chunks[1], app);
     match app.active_tab {
-        Tab::Signals   => render_signals(f, chunks[2], app),
-        Tab::Markets   => render_markets(f, chunks[2], app),
-        Tab::Chart     => render_chart(f, chunks[2], app),
-        Tab::Orderbook => render_orderbook(f, chunks[2], app),
-        Tab::Portfolio => render_portfolio(f, chunks[2], app),
-        Tab::Chat      => render_chat(f, chunks[2], app),
+        Tab::Signals    => render_signals(f, chunks[2], app),
+        Tab::Markets    => render_markets(f, chunks[2], app),
+        Tab::Chart      => render_chart(f, chunks[2], app),
+        Tab::Orderbook  => render_orderbook(f, chunks[2], app),
+        Tab::Portfolio  => render_portfolio(f, chunks[2], app),
+        Tab::Chat       => render_chat(f, chunks[2], app),
+        Tab::SmartMoney => render_smart_money(f, chunks[2], app),
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
@@ -1062,6 +1092,11 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
 // ── Chat tab ──────────────────────────────────────────────────────────────────
 
 fn render_chat(f: &mut Frame, area: Rect, app: &App) {
+    // Pre-wrap all text at the known inner width so line counts are exact.
+    // This avoids the Paragraph Wrap widget whose visual-line count we can't
+    // predict, which caused auto-scroll to cut off the last visible rows.
+    let inner_width = (area.width as usize).saturating_sub(4); // 2 border + 2 indent
+
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &app.chat_msgs {
@@ -1072,22 +1107,42 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
                     " You",
                     Style::default().fg(Color::Cyan).bold(),
                 )));
-                for l in text.lines() {
-                    lines.push(Line::from(format!("  {}", l)));
+                for raw_line in text.lines() {
+                    let wrapped = textwrap(raw_line, inner_width.saturating_sub(2));
+                    if wrapped.is_empty() {
+                        lines.push(Line::from(""));
+                    } else {
+                        for w in wrapped {
+                            lines.push(Line::from(format!("  {}", w)));
+                        }
+                    }
                 }
             }
             ChatMsg::Assistant(text) => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    " Claude",
+                    " AI",
                     Style::default().fg(Color::Green).bold(),
                 )));
-                for l in text.lines() {
-                    lines.push(Line::from(format!("  {}", l)));
+                for raw_line in text.lines() {
+                    let wrapped = textwrap(raw_line, inner_width.saturating_sub(2));
+                    if wrapped.is_empty() {
+                        lines.push(Line::from(""));
+                    } else {
+                        for w in wrapped {
+                            lines.push(Line::from(format!("  {}", w)));
+                        }
+                    }
                 }
             }
             ChatMsg::ToolCall { name, args } => {
-                let preview = if args.len() > 60 { format!("{}…", &args[..60]) } else { args.clone() };
+                let max_args = inner_width.saturating_sub(name.len() + 8);
+                let preview = if args.chars().count() > max_args {
+                    let end = args.char_indices().nth(max_args).map(|(i,_)| i).unwrap_or(args.len());
+                    format!("{}…", &args[..end])
+                } else {
+                    args.clone()
+                };
                 lines.push(Line::from(vec![
                     Span::styled("  ⟳ ", Style::default().fg(Color::Yellow)),
                     Span::styled(name, Style::default().fg(Color::Yellow)),
@@ -1095,7 +1150,13 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
             ChatMsg::ToolResult { name, preview } => {
-                let p = if preview.len() > 80 { format!("{}…", &preview[..80]) } else { preview.clone() };
+                let max_p = inner_width.saturating_sub(name.len() + 4);
+                let p = if preview.chars().count() > max_p {
+                    let end = preview.char_indices().nth(max_p).map(|(i,_)| i).unwrap_or(preview.len());
+                    format!("{}…", &preview[..end])
+                } else {
+                    preview.clone()
+                };
                 lines.push(Line::from(vec![
                     Span::styled("  ✓ ", Style::default().fg(Color::DarkGray)),
                     Span::styled(name, Style::default().fg(Color::DarkGray)),
@@ -1103,10 +1164,12 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
             ChatMsg::Error(e) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  Error: {}", e),
-                    Style::default().fg(Color::Red),
-                )));
+                for wrapped in textwrap(e, inner_width.saturating_sub(10)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  Error: {}", wrapped),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
             }
         }
     }
@@ -1119,21 +1182,142 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
+    // chat_scroll = 0 → pinned to bottom (newest messages).
+    // k/↑ increments chat_scroll (scroll up to older content).
+    // j/↓ decrements chat_scroll (scroll back down to newer content).
     let total_lines = lines.len() as u16;
     let visible_height = area.height.saturating_sub(2);
-    let scroll = if total_lines > visible_height {
-        total_lines - visible_height
-    } else {
-        0
-    };
-    let effective_scroll = scroll.saturating_sub(app.chat_scroll);
+    let bottom_offset = total_lines.saturating_sub(visible_height);
+    let effective_scroll = bottom_offset.saturating_sub(app.chat_scroll);
 
     let p = Paragraph::new(lines)
         .block(Block::default().title(" Chat ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-        .wrap(Wrap { trim: false })
         .scroll((effective_scroll, 0));
 
     f.render_widget(p, area);
+}
+
+// ── Smart Money tab ───────────────────────────────────────────────────────────
+
+fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
+    if app.sm_loading {
+        let p = Paragraph::new("\n  Fetching top traders…  (this may take a few seconds)")
+            .block(Block::default().title(" Smart Money ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    if app.sm_wallets.is_empty() {
+        let msg = if app.selected_market_id.is_some() {
+            "No trade history found for this market, or market is on Kalshi (Polymarket only).\nSelect a Polymarket market and press Enter to load Smart Money data."
+        } else {
+            "Select a Polymarket market in the Markets tab, then press Enter to load Smart Money data."
+        };
+        let p = Paragraph::new(msg)
+            .block(Block::default().title(" Smart Money ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3)])
+        .split(area);
+
+    // ── Top traders table ──────────────────────────────────────────────────
+    let title = format!(" Smart Money — {} ({} traders) ", app.sm_market_title, app.sm_wallets.len());
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!("  {:<22} {:>8} {:>6} {:>5} {:>9} {:>10} {:>9}",
+                "Name", "Pos($)", "Mkts", "Wins", "WinRate", "AlphaEntry", "Suspicion"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(header),
+        ListItem::new(Line::from(Span::styled("  ".to_string() + &"─".repeat(76), Style::default().fg(Color::DarkGray)))),
+    ];
+
+    for w in &app.sm_wallets {
+        let name = trunc(&w.pseudonym, 22);
+        let alpha_str = if w.alpha_score.is_nan() {
+            "  n/a    ".to_string()
+        } else {
+            format!("{:>8.1}¢", w.alpha_score * 100.0)
+        };
+
+        let suspicion_color = if w.flagged && w.suspicion > 70.0 {
+            Color::Red
+        } else if w.flagged {
+            Color::Yellow
+        } else {
+            Color::White
+        };
+
+        let flag = if w.flagged { "⚠ " } else { "  " };
+
+        let line = Line::from(vec![
+            Span::styled(flag, Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:<22}", name), Style::default().fg(suspicion_color).bold()),
+            Span::raw(format!(" {:>8.0}", w.market_size)),
+            Span::raw(format!(" {:>6}", w.n_positions)),
+            Span::raw(format!(" {:>5}", w.n_wins)),
+            Span::styled(format!(" {:>8.1}%", w.win_rate * 100.0), Style::default().fg(
+                if w.win_rate >= 0.7 { Color::Red }
+                else if w.win_rate >= 0.55 { Color::Yellow }
+                else { Color::White }
+            )),
+            Span::raw(format!(" {:>10}", alpha_str)),
+            Span::styled(format!(" {:>8.0}/100", w.suspicion), Style::default().fg(suspicion_color)),
+        ]);
+        items.push(ListItem::new(line));
+    }
+
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("▶ ");
+
+    let mut state = app.sm_list.clone();
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    // ── Coordination panel ─────────────────────────────────────────────────
+    let coord_title = if app.sm_coord_pairs.is_empty() {
+        " Coordination  (none detected) ".to_string()
+    } else {
+        format!(" Coordination  ({} pair(s) flagged) ", app.sm_coord_pairs.len())
+    };
+
+    let mut coord_lines: Vec<Line> = vec![Line::from("")];
+    if app.sm_coord_pairs.is_empty() {
+        coord_lines.push(Line::from(Span::styled(
+            "  No wallet pairs share ≥35% of traded markets.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (a, b, sim) in &app.sm_coord_pairs {
+            coord_lines.push(Line::from(vec![
+                Span::styled("  ⚠ ", Style::default().fg(Color::Yellow)),
+                Span::styled(trunc(a, 18), Style::default().fg(Color::Yellow)),
+                Span::raw("  ↔  "),
+                Span::styled(trunc(b, 18), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  ({:.0}% market overlap)", sim * 100.0),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+    coord_lines.push(Line::from(Span::styled(
+        "  Press 'a' to ask AI for a deep-dive  |  [a] ask AI",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let coord_p = Paragraph::new(coord_lines)
+        .block(Block::default().title(coord_title).borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(coord_p, chunks[1]);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -1375,19 +1559,21 @@ mod tests {
 
     #[test]
     fn tab_next_cycles_forward() {
-        assert_eq!(Tab::Signals.next(),   Tab::Markets);
-        assert_eq!(Tab::Markets.next(),   Tab::Chart);
-        assert_eq!(Tab::Chart.next(),     Tab::Orderbook);
-        assert_eq!(Tab::Orderbook.next(), Tab::Portfolio);
-        assert_eq!(Tab::Portfolio.next(), Tab::Chat);
-        assert_eq!(Tab::Chat.next(),      Tab::Signals); // wraps
+        assert_eq!(Tab::Signals.next(),     Tab::Markets);
+        assert_eq!(Tab::Markets.next(),     Tab::Chart);
+        assert_eq!(Tab::Chart.next(),       Tab::Orderbook);
+        assert_eq!(Tab::Orderbook.next(),   Tab::Portfolio);
+        assert_eq!(Tab::Portfolio.next(),   Tab::Chat);
+        assert_eq!(Tab::Chat.next(),        Tab::SmartMoney);
+        assert_eq!(Tab::SmartMoney.next(),  Tab::Signals); // wraps
     }
 
     #[test]
     fn tab_prev_cycles_backward() {
-        assert_eq!(Tab::Signals.prev(),   Tab::Chat); // wraps
-        assert_eq!(Tab::Markets.prev(),   Tab::Signals);
-        assert_eq!(Tab::Chat.prev(),      Tab::Portfolio);
+        assert_eq!(Tab::Signals.prev(),     Tab::SmartMoney); // wraps
+        assert_eq!(Tab::Markets.prev(),     Tab::Signals);
+        assert_eq!(Tab::Chat.prev(),        Tab::Portfolio);
+        assert_eq!(Tab::SmartMoney.prev(),  Tab::Chat);
     }
 }
 
@@ -1450,6 +1636,28 @@ pub async fn run_tui(
                     AppEvent::OrderbookLoaded { market_id, orderbook } => {
                         if Some(&market_id) == app.selected_market_id.as_ref() {
                             app.orderbook = Some(orderbook);
+                        }
+                    }
+                    AppEvent::SmartMoneyLoading => {
+                        app.sm_loading = true;
+                        app.sm_wallets.clear();
+                        app.sm_coord_pairs.clear();
+                        app.status = "Loading smart money data…".to_string();
+                    }
+                    AppEvent::SmartMoneyLoaded { market_id, result } => {
+                        app.sm_loading = false;
+                        if Some(&market_id) == app.selected_market_id.as_ref() {
+                            app.sm_market_title = result.market_title;
+                            app.sm_wallets = result.wallets;
+                            app.sm_coord_pairs = result.coord_pairs;
+                            if !app.sm_wallets.is_empty() {
+                                app.sm_list.select(Some(0));
+                            }
+                            let flagged = app.sm_wallets.iter().filter(|w| w.flagged).count();
+                            app.status = format!(
+                                "Smart money: {} traders, {} flagged",
+                                app.sm_wallets.len(), flagged
+                            );
                         }
                     }
                     AppEvent::RefreshStarted => {
@@ -1615,6 +1823,10 @@ async fn handle_key(
         }
         KC::Char('5') if app.input.is_empty() => { app.active_tab = AppTab::Portfolio; }
         KC::Char('6') if app.input.is_empty() => { app.active_tab = AppTab::Chat; }
+        KC::Char('7') if app.input.is_empty() => {
+            app.active_tab = AppTab::SmartMoney;
+            trigger_smart_money_load(app, clients, event_tx).await;
+        }
 
         KC::Tab => { app.active_tab = app.active_tab.next(); }
         KC::BackTab => { app.active_tab = app.active_tab.prev(); }
@@ -1651,9 +1863,12 @@ async fn handle_key(
                     app.selected_market_id = Some(id.clone());
                     app.chart_data.clear();
                     app.orderbook = None;
+                    app.sm_wallets.clear();
+                    app.sm_coord_pairs.clear();
                     app.status = format!("Loading data for {}", id);
                     trigger_chart_load(app, clients, event_tx).await;
                     trigger_orderbook_load(app, clients, event_tx).await;
+                    trigger_smart_money_load(app, clients, event_tx).await;
                     app.active_tab = AppTab::Chart;
                 }
             }
@@ -1807,6 +2022,7 @@ async fn send_chat(
     };
 
     app.chat_msgs.push(ChatMsg::User(msg.clone()));
+    app.chat_scroll = 0; // pin to bottom on new message
     app.is_loading = true;
     app.status = "Sending…".to_string();
 
@@ -1854,5 +2070,26 @@ async fn trigger_orderbook_load(
 
     tokio::spawn(async move {
         agent::refresh_orderbook(clients_c, market, tx).await;
+    });
+}
+
+async fn trigger_smart_money_load(
+    app:      &App,
+    clients:  &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    use crate::markets::Platform;
+
+    let Some(id) = &app.selected_market_id else { return };
+    // Smart Money analysis is Polymarket-only
+    let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
+    if market.platform != Platform::Polymarket { return; }
+
+    let clients_c = clients.clone();
+    let tx        = event_tx.clone();
+    let market_id = id.clone();
+
+    tokio::spawn(async move {
+        agent::refresh_smart_money(clients_c, market_id, tx).await;
     });
 }
