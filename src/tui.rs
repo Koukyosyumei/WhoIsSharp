@@ -48,23 +48,24 @@ use crate::tools::{MarketClients, SmartMoneyWallet};
 const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs"];
 
 const TIPS: &[&str] = &[
-    "Press ? to open the help overlay",
+    "Press / to open the command bar — type a command and press Enter",
+    "Try /help to see all available commands",
     "Press 1-9 or Tab/Shift+Tab to switch tabs",
     "Press j/k or arrow keys to navigate the market list",
     "Press Enter on a market to load its chart and order book",
-    "Press r to refresh market data",
-    "Press w to add/remove a market from your watchlist",
-    "Press p to cycle platform filter: All → PM → KL",
-    "Press c to cycle chart interval: 1h → 6h → 1d → 1w → 1m",
-    "Press / to search and filter markets by keyword",
-    "Press a to pre-fill an AI analysis prompt for the selected market",
-    "Press s to cycle market sort: ~50% → Volume → End date → A-Z",
-    "Press k to open the Kelly position-size calculator",
+    "Press ^ or type /refresh to refresh market data now",
+    "Type /watchlist to add/remove the selected market from your watchlist",
+    "Type /platform to cycle the filter: All → PM → KL",
+    "Type /chart to cycle chart interval: 1h → 6h → 1d → 1w → 1m",
+    "Type a search term after / to filter markets by keyword",
+    "Type /analyze to pre-fill an AI analysis prompt for the selected market",
+    "Type /sort to cycle market sort: ~50% → Volume → End date → A-Z",
+    "Type /kelly to open the Kelly position-size calculator",
     "In Chat (tab 6), type a question and press Enter to ask the AI",
-    "Press Ctrl+C or q (when input is empty) to quit",
-    "Use the Watchlist tab filter (w toggle) to focus on starred markets",
-    "Press x on a signal to dismiss it for the current session",
-    "Press v in Portfolio to toggle the risk/exposure view",
+    "Press Ctrl+C to quit (saves session automatically)",
+    "Type /wf to focus on starred markets only",
+    "Type /dismiss on a signal to hide it for the current session",
+    "Type /risk in Portfolio to toggle the risk/exposure view",
 ];
 
 
@@ -974,7 +975,7 @@ fn render_signal_list(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
     let Some(sig) = app.selected_signal() else {
-        let p = Paragraph::new("\n  Select a signal with j/k\n\n  Press Enter to open the primary market.\n  Press 'a' to ask AI about it.")
+        let p = Paragraph::new("\n  Select a signal with j/k\n\n  Press Enter to open the primary market.\n  Press @ to ask AI about it.")
             .block(Block::default().title(" Signal Detail ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
         f.render_widget(p, area);
         return;
@@ -1099,7 +1100,7 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [Enter] open market  [a] ask AI  [n] add position",
+        "  [Enter] open market  [@] ask AI  [/add] add position  [/dismiss] dismiss",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1137,15 +1138,13 @@ fn render_signal_quickguide(f: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  j/k", Style::default().fg(Color::Cyan)),
-            Span::raw(" navigate   "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::styled("  Enter", Style::default().fg(Color::Cyan)),
             Span::raw(" open market   "),
-            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::styled("@", Style::default().fg(Color::Cyan)),
             Span::raw(" AI analysis   "),
-            Span::styled("n", Style::default().fg(Color::Cyan)),
+            Span::styled("/add", Style::default().fg(Color::Cyan)),
             Span::raw(" add position   "),
-            Span::styled("x", Style::default().fg(Color::Cyan)),
+            Span::styled("/dismiss", Style::default().fg(Color::Cyan)),
             Span::raw(" dismiss"),
         ]),
     ];
@@ -1306,7 +1305,7 @@ fn render_market_detail(f: &mut Frame, area: Rect, app: &App) {
 
     lines.extend([
         Line::from(Span::styled(
-            "  [Enter] load chart/book  [k] Kelly sizer  [n] add position  [a] ask AI",
+            "  [Enter] load chart/book  [/kelly] Kelly sizer  [/add] add position  [@] ask AI",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -1964,7 +1963,7 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled(
-                "  [n] Add  [t] Set target  [d] Delete  [Enter] Load chart",
+                "  [/add] Add  [/targets] Set target  [/delete] Delete  [Enter] Load chart",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -1980,7 +1979,7 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
         let msg = if app.pos_input_mode {
             "Adding position — follow the prompts in the status bar."
         } else {
-            "No positions. Navigate to Markets tab, select a market, press 'n' to add a position."
+            "No positions. Navigate to Markets tab, select a market, type /add to add a position."
         };
         let p = Paragraph::new(msg)
             .block(Block::default().title(" Positions ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
@@ -2079,7 +2078,7 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Press 'a' on any market to pre-fill an analysis prompt.",
+            "  Press @ on any market to pre-fill an analysis prompt.",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -2198,7 +2197,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
     };
     let arb_count = app.pairs.iter().filter(|p| p.net_gap > 0.0).count();
     let header_title = format!(
-        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [/] adjust ",
+        " Cross-Platform Pairs  {}  [{} pairs  {} arb]  match≥{:.0}%  [ ] adjust ",
         matcher_label,
         app.pairs.len(),
         arb_count,
@@ -2209,7 +2208,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
         let msg = if app.pairs_loading {
             "Matching markets with LLM — please wait…"
         } else {
-            "No matching pairs found. Press L to run LLM matching, or wait for market refresh."
+            "No matching pairs found. Type /pairs to run LLM matching, or press ^ to refresh."
         };
         let block = Block::default()
             .title(header_title)
@@ -2440,7 +2439,7 @@ fn render_pairs(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "  [L] re-match with LLM   [Enter] open PM market   [j/k] navigate pairs",
+                "  [/pairs] re-match with LLM   [Enter] open PM market   [j/k] navigate   [[ ]] adjust threshold",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -2709,11 +2708,11 @@ fn render_sm_legend(f: &mut Frame, area: Rect) {
             Span::styled("  Enter ", yw), Span::styled("wallet drill-down  ", dg),
             Span::styled("Esc ", yw),    Span::styled("back to list  ", dg),
             Span::styled("[ ] ", yw),    Span::styled("adjust coord threshold  ", dg),
-            Span::styled("r ", yw),      Span::styled("refresh", dg),
+            Span::styled("^ ", yw),      Span::styled("refresh", dg),
         ]),
         Line::from(vec![
             Span::styled("  j/k ", yw),  Span::styled("navigate / scroll  ", dg),
-            Span::styled("a ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
+            Span::styled("@ ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
         ]),
     ];
 
@@ -3039,7 +3038,7 @@ fn render_kelly_modal(f: &mut Frame, area: Rect, app: &App) {
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  [n] Add position   [k] Recalculate   [Esc] Close",
+                "  [/add] Add position   [/kelly] Recalculate   [Esc] Close",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -3140,50 +3139,43 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
         h(" Navigation"),
-        kv("1–8 / Tab / Shift+Tab", "Switch tabs directly"),
-        kv("j / ↓  ·  k / ↑", "Navigate list / scroll chat"),
+        kv("1–9 / Tab / Shift+Tab", "Switch tabs directly"),
+        kv("j / ↓  ·  k / ↑", "Navigate list / scroll"),
         kv("Enter", "Select market → load chart + book + trades"),
+        kv("Ctrl+C", "Quit (saves session automatically)"),
         Line::from(""),
-        h(" Market Data"),
-        kv("r", "Refresh markets + chart + orderbook now"),
-        kv("p", "Cycle platform filter  ALL → PM → KL"),
-        kv("c", "Cycle chart interval  1h → 6h → 1d → 1w → 1m"),
-        kv("S", "Cycle sort  ~50% → Volume → End Date → A-Z"),
-        kv("/", "Enter search / filter mode"),
-        kv("Esc", "Clear search"),
+        h(" Slash commands  —  press / then type and Enter"),
+        kv("/refresh  or  /r  or  ^", "Refresh markets + chart + orderbook"),
+        kv("/platform  or  /p", "Cycle platform filter  ALL → PM → KL"),
+        kv("/chart  or  /c", "Cycle chart interval  1h → 6h → 1d → 1w → 1m"),
+        kv("/sort  or  /s", "Cycle sort  ~50% → Volume → End Date → A-Z"),
+        kv("/watchlist  or  /w", "Toggle watchlist for selected market  (★)"),
+        kv("/wf", "Toggle watchlist-only filter"),
+        kv("/alert  or  /e", "Edit price alert thresholds (above / below)"),
+        kv("/add  or  /n", "Add position for selected market"),
+        kv("/targets  or  /t", "Set take-profit / stop-loss"),
+        kv("/delete  or  /d", "Delete selected position  (Portfolio tab)"),
+        kv("/dismiss  or  /x", "Dismiss selected signal (hidden until restart)"),
+        kv("/analyze  or  /a  or  @", "Pre-fill AI analysis prompt"),
+        kv("/kelly  or  /k", "Open Kelly position-size calculator"),
+        kv("/risk  or  /v", "Toggle risk/exposure view  (Portfolio tab)"),
+        kv("/pairs  or  /l", "LLM re-match  (Pairs tab)"),
+        kv("/lower  /  /raise", "Adjust threshold  (also: [ / ] keys)"),
+        kv("/export  or  /csv", "Export current tab to CSV"),
+        kv("/report  or  /m", "Export Markdown report for selected market"),
+        kv("/help  or  /?  or  ?", "Toggle this help overlay"),
         Line::from(""),
-        h(" Signals"),
-        kv("x", "Dismiss selected signal (hidden until restart)"),
-        Line::from(""),
-        h(" Watchlist"),
-        kv("w", "Toggle watchlist for selected market  (★)"),
-        kv("W", "Toggle watchlist-only filter"),
-        kv("e", "Edit price alert thresholds (above / below)"),
-        Line::from(""),
-        h(" Portfolio"),
-        kv("n", "Add position for selected market"),
-        kv("t", "Set take-profit / stop-loss on selected position"),
-        kv("d", "Delete selected position  (Portfolio tab)"),
-        kv("Enter  (Portfolio tab)", "Load chart for that position's market"),
-        Line::from(""),
-        h(" Export & Research"),
-        kv("E", "Export current tab to CSV  (~/.whoissharp/exports/)"),
-        kv("M", "Export Markdown report for selected market"),
-        kv("!note <text>", "Append timestamped note to research log"),
+        h(" Search / filter"),
+        kv("/", "Open command bar — unrecognised terms search markets"),
+        kv("Esc", "Close command bar / clear filter"),
         Line::from(""),
         h(" Chat / AI"),
-        kv("a", "Pre-fill AI analysis prompt for selected market"),
         kv("Enter", "Send chat message"),
         kv("↑ / ↓", "Scroll input history"),
-        kv("k / j  (Chat tab)", "Scroll chat history up / down"),
-        Line::from(""),
-        h(" Other"),
-        kv("?", "Toggle this help overlay"),
-        kv("q", "Quit  (saves session automatically)"),
-        kv("Ctrl+C", "Quit / clear current input"),
+        kv("!note <text>", "Append timestamped note to research log"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Press ? or Esc to close                   WhoIsSharp v0.1.0",
+            "  Press /help or Esc to close               WhoIsSharp v0.1.0",
             Style::default().fg(Color::DarkGray),
         )]),
     ];
@@ -3253,22 +3245,22 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 // ── Input box ────────────────────────────────────────────────────────────────
 
 fn render_input(f: &mut Frame, area: Rect, app: &App) {
-    let prompt = if app.search_mode {
-        "/search: "
+    let (prompt, content): (&str, &str) = if app.search_mode {
+        ("/ ", &app.search)
     } else if app.pos_input_mode {
-        "pos> "
+        ("pos> ", &app.input)
     } else {
-        "> "
+        ("> ", &app.input)
     };
     let line = Line::from(vec![
         Span::styled(prompt, Style::default().fg(Color::Cyan)),
-        Span::raw(&app.input),
+        Span::raw(content),
     ]);
     let p = Paragraph::new(line);
     f.render_widget(p, area);
 
     // Show cursor
-    let x = area.x + prompt.len() as u16 + app.input.len() as u16;
+    let x = area.x + prompt.len() as u16 + content.len() as u16;
     if x < area.x + area.width {
         f.set_cursor_position((x, area.y));
     }
@@ -3801,6 +3793,344 @@ pub async fn run_tui(
 
 // ─── Key handling ─────────────────────────────────────────────────────────────
 
+enum SlashCmd { Handled, NotACommand, Quit }
+
+/// Return (title, id, platform) for the market the user wants to analyze.
+///
+/// Prefers `selected_market_id` (the market explicitly loaded via Enter) over
+/// the list-selection index, which can drift when the search filter changes
+/// while the user is typing a command.
+fn analyze_target(app: &App) -> Option<(String, String, String)> {
+    type AppTab = Tab;
+    // Signals tab: use the highlighted signal's primary market
+    if app.active_tab == AppTab::Signals {
+        return app.selected_signal().map(|s| (
+            s.title.clone(),
+            s.id_a.clone(),
+            s.platform_a.name().to_lowercase(),
+        ));
+    }
+    // Any other tab: prefer the explicitly loaded market (selected_market_id),
+    // fall back to the highlighted row in the market list.
+    if let Some(ref id) = app.selected_market_id {
+        if let Some(m) = app.markets.iter().find(|m| &m.id == id) {
+            return Some((m.title.clone(), m.id.clone(), m.platform.name().to_lowercase()));
+        }
+    }
+    app.selected_market().map(|m| (
+        m.title.clone(),
+        m.id.clone(),
+        m.platform.name().to_lowercase(),
+    ))
+}
+
+/// Dispatch a slash command typed in the command bar.
+///
+/// `raw` is the text the user typed after pressing `/` (without the leading slash).
+/// Returns `SlashCmd::Handled` if the command was recognised and executed,
+/// `SlashCmd::Quit` if the user wants to exit, or `SlashCmd::NotACommand` if the
+/// text should be treated as a search/filter term instead.
+async fn dispatch_slash_command(
+    raw: &str,
+    app: &mut App,
+    backend: &Option<Arc<dyn LlmBackend>>,
+    clients: &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) -> SlashCmd {
+    type AppTab = Tab;
+    let cmd = raw.trim().to_lowercase();
+    match cmd.as_str() {
+        // ── quit ─────────────────────────────────────────────────────────────
+        "q" | "quit" => SlashCmd::Quit,
+
+        // ── refresh ──────────────────────────────────────────────────────────
+        "r" | "refresh" => {
+            let clients_c = clients.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+            if app.selected_market_id.is_some() {
+                trigger_chart_load(app, clients, event_tx).await;
+                trigger_orderbook_load(app, clients, event_tx).await;
+            }
+            app.status = "Refreshing…".to_string();
+            SlashCmd::Handled
+        }
+
+        // ── platform filter ───────────────────────────────────────────────────
+        "p" | "platform" | "filter" => {
+            app.platform_filter = match app.platform_filter {
+                PlatformFilter::All        => PlatformFilter::Polymarket,
+                PlatformFilter::Polymarket => PlatformFilter::Kalshi,
+                PlatformFilter::Kalshi     => PlatformFilter::All,
+            };
+            app.market_list.select(Some(0));
+            app.status = format!("Filter: {}", app.platform_filter.label());
+            SlashCmd::Handled
+        }
+
+        // ── chart interval ────────────────────────────────────────────────────
+        "c" | "chart" | "interval" => {
+            app.chart_interval = app.chart_interval.next();
+            app.chart_data.clear();
+            app.status = format!("Chart interval: {}", app.chart_interval.label());
+            trigger_chart_load(app, clients, event_tx).await;
+            SlashCmd::Handled
+        }
+
+        // ── sort ──────────────────────────────────────────────────────────────
+        "s" | "sort" => {
+            app.market_sort = app.market_sort.next();
+            app.market_list.select(Some(0));
+            app.status = format!("Sort: {}", app.market_sort.label());
+            SlashCmd::Handled
+        }
+
+        // ── dismiss signal ────────────────────────────────────────────────────
+        "x" | "dismiss" => {
+            if let Some(sig) = app.selected_signal() {
+                let id    = sig.id_a.clone();
+                let title = trunc(&sig.title, 40);
+                app.dismissed_signals.insert(id);
+                if let Some(idx) = app.signal_list.selected() {
+                    let new_len = app.signals.len().saturating_sub(1);
+                    app.signal_list.select(if new_len == 0 { None } else { Some(idx.min(new_len - 1)) });
+                }
+                app.signals = signals::compute_signals(
+                    &app.markets, &app.prev_prices, &app.dismissed_signals
+                );
+                app.status = format!("Dismissed: {}", title);
+            } else {
+                app.status = "No signal selected.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── watchlist toggle ──────────────────────────────────────────────────
+        "w" | "watchlist" => {
+            let market_info = match app.active_tab {
+                AppTab::Markets => app.selected_market().map(|m| m.clone()),
+                AppTab::Signals => app.selected_signal()
+                    .and_then(|s| app.markets.iter().find(|m| m.id == s.id_a))
+                    .cloned(),
+                _ => app.selected_market().map(|m| m.clone()),
+            };
+            if let Some(m) = market_info {
+                app.toggle_watchlist(&m);
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── watchlist-only filter ─────────────────────────────────────────────
+        "wf" => {
+            app.watchlist_only = !app.watchlist_only;
+            app.market_list.select(Some(0));
+            app.status = if app.watchlist_only {
+                format!("Watchlist filter ON  ({} markets)", app.watchlist.len())
+            } else {
+                "Watchlist filter OFF".to_string()
+            };
+            SlashCmd::Handled
+        }
+
+        // ── alert threshold editor ────────────────────────────────────────────
+        "e" | "alert" => {
+            let mkt = app.selected_market().map(|m| (m.id.clone(), m.title.clone()));
+            if let Some((id, title)) = mkt {
+                if app.is_watched(&id) {
+                    app.alert_edit_mode = true;
+                    app.alert_edit_step = AlertEditStep::default();
+                    app.alert_edit_mkt  = id;
+                    app.input.clear();
+                    app.status = format!(
+                        "Alert for '{}': enter ABOVE threshold in ¢ (or Enter for none):",
+                        trunc(&title, 30)
+                    );
+                } else {
+                    app.status = "Market not watched — use /watchlist to add first.".to_string();
+                }
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── add position ──────────────────────────────────────────────────────
+        "n" | "add" | "position" => {
+            if app.active_tab == AppTab::Signals {
+                if let Some(sig) = app.selected_signal() {
+                    let id    = sig.id_a.clone();
+                    let plat  = sig.platform_a.clone();
+                    let title = sig.title.clone();
+                    let price = sig.price_a;
+                    if app.markets.iter().any(|m| m.id == id && m.platform == plat) {
+                        let prev_tab = app.active_tab;
+                        app.active_tab = AppTab::Markets;
+                        app.pos_draft = PosDraft {
+                            market_id: id,
+                            title,
+                            platform: Some(plat),
+                            entry_price: None,
+                            shares: None,
+                            side: None,
+                        };
+                        app.pos_input_mode = true;
+                        app.pos_input_step = PosInputStep::EntryPrice;
+                        app.input.clear();
+                        app.active_tab = prev_tab;
+                        app.status = format!("Add position [{:.1}¢] — Enter entry price (¢):", price * 100.0);
+                    } else {
+                        app.start_add_position();
+                    }
+                }
+            } else {
+                app.start_add_position();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── set stop / take-profit targets ────────────────────────────────────
+        "t" | "targets" => {
+            if let Some(idx) = app.portfolio_list.selected() {
+                if let Some(pos) = app.portfolio.positions.get(idx) {
+                    let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
+                    app.target_pos_id     = pos.id.clone();
+                    app.target_input_mode = true;
+                    app.target_input_step = TargetInputStep::TakeProfit;
+                    app.input.clear();
+                    app.status = format!(
+                        "Set take-profit for '{}' (mark {:.1}¢): enter ¢ or Enter to skip",
+                        trunc(&pos.title, 30), mark
+                    );
+                } else {
+                    app.status = "Select a position first.".to_string();
+                }
+            } else {
+                app.status = "Select a position first.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── delete position ───────────────────────────────────────────────────
+        "d" | "delete" => {
+            app.delete_selected_position();
+            SlashCmd::Handled
+        }
+
+        // ── CSV export ────────────────────────────────────────────────────────
+        "export" | "csv" => {
+            app.status = export_current_tab(app);
+            SlashCmd::Handled
+        }
+
+        // ── Markdown report ───────────────────────────────────────────────────
+        "m" | "report" | "md" => {
+            app.status = export_markdown_report(app);
+            SlashCmd::Handled
+        }
+
+        // ── AI analyze ────────────────────────────────────────────────────────
+        "a" | "analyze" => {
+            let info = analyze_target(app);
+            if let Some((title, id, plat)) = info {
+                app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        // ── help overlay ──────────────────────────────────────────────────────
+        "?" | "help" | "h" => {
+            app.show_help = !app.show_help;
+            SlashCmd::Handled
+        }
+
+        // ── Kelly position sizer ──────────────────────────────────────────────
+        "k" | "kelly" => {
+            if app.kelly_mode {
+                app.kelly_step    = KellyStep::MyProb;
+                app.kelly_input   = String::new();
+                app.kelly_my_prob = None;
+            } else {
+                app.kelly_mode    = true;
+                app.kelly_step    = KellyStep::MyProb;
+                app.kelly_input   = String::new();
+                app.kelly_my_prob = None;
+            }
+            SlashCmd::Handled
+        }
+
+        // ── LLM pairs re-match ────────────────────────────────────────────────
+        "l" | "pairs" => {
+            trigger_llm_pairs(app, backend, event_tx).await;
+            SlashCmd::Handled
+        }
+
+        // ── risk view toggle ──────────────────────────────────────────────────
+        "v" | "risk" => {
+            app.show_risk_view = !app.show_risk_view;
+            app.status = if app.show_risk_view {
+                "Risk view — E[P&L], σ, scenario analysis  (use /risk to toggle back)".to_string()
+            } else {
+                "Positions view  (use /risk for risk analysis)".to_string()
+            };
+            SlashCmd::Handled
+        }
+
+        // ── threshold lower ───────────────────────────────────────────────────
+        "lower" => {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold - 0.05).max(0.05);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (use /pairs to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {
+                    app.status = "Switch to SmartMoney or Pairs tab to use /lower".to_string();
+                }
+            }
+            SlashCmd::Handled
+        }
+
+        // ── threshold raise ───────────────────────────────────────────────────
+        "raise" => {
+            match app.active_tab {
+                AppTab::SmartMoney => {
+                    app.coord_threshold = (app.coord_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                        app.coord_threshold * 100.0,
+                    );
+                }
+                AppTab::Pairs => {
+                    app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold + 0.05).min(0.95);
+                    app.status = format!(
+                        "Pairs Jaccard threshold → {:.0}%  (use /pairs to re-match)",
+                        app.pairs_jaccard_threshold * 100.0,
+                    );
+                }
+                _ => {
+                    app.status = "Switch to SmartMoney or Pairs tab to use /raise".to_string();
+                }
+            }
+            SlashCmd::Handled
+        }
+
+        _ => SlashCmd::NotACommand,
+    }
+}
+
 /// Returns `true` if the user requested to quit.
 async fn handle_key(
     app:         &mut App,
@@ -3813,14 +4143,26 @@ async fn handle_key(
     use crossterm::event::KeyCode as KC;
     type AppTab = Tab;
 
-    // Ctrl+C always quits (or clears input)
+    // Ctrl+C always quits (or cancels any active input mode)
     if key.modifiers == KeyModifiers::CONTROL && key.code == KC::Char('c') {
-        if !app.input.is_empty() || app.pos_input_mode {
+        let any_mode = !app.input.is_empty()
+            || app.search_mode
+            || app.pos_input_mode
+            || app.alert_edit_mode
+            || app.target_input_mode
+            || app.kelly_mode;
+        if any_mode {
             app.input.clear();
+            app.search.clear();
             app.sent_cursor = None;
-            app.pos_input_mode = false;
-            app.pos_input_step = PosInputStep::EntryPrice;
-            app.pos_draft = PosDraft::default();
+            app.search_mode       = false;
+            app.pos_input_mode    = false;
+            app.alert_edit_mode   = false;
+            app.target_input_mode = false;
+            app.kelly_mode        = false;
+            app.pos_input_step    = PosInputStep::EntryPrice;
+            app.alert_edit_step   = AlertEditStep::default();
+            app.pos_draft         = PosDraft::default();
             app.status = "Cancelled.".to_string();
             return false;
         }
@@ -3982,22 +4324,33 @@ async fn handle_key(
         return false;
     }
 
-    // ── Search mode ───────────────────────────────────────────────────────────
+    // ── Command / search mode (activated by /) ────────────────────────────────
     if app.search_mode {
         match key.code {
             KC::Esc => {
                 app.search_mode = false;
                 app.search.clear();
-                app.status = "Search cleared".to_string();
+                app.status = "Cancelled.".to_string();
             }
             KC::Enter => {
+                let typed = app.search.clone();
                 app.search_mode = false;
-                app.status = if app.search.is_empty() {
-                    "Search cleared".to_string()
-                } else {
-                    format!("Filtering: '{}'", app.search)
-                };
-                app.market_list.select(Some(0));
+                app.search.clear();
+                if typed.is_empty() {
+                    app.status = "Cancelled.".to_string();
+                    return false;
+                }
+                match dispatch_slash_command(&typed, app, backend, clients, event_tx).await {
+                    SlashCmd::Quit    => return true,
+                    SlashCmd::Handled => {}
+                    SlashCmd::NotACommand => {
+                        // Treat as a search/filter term
+                        app.search = typed.clone();
+                        app.active_tab = AppTab::Markets;
+                        app.market_list.select(Some(0));
+                        app.status = format!("Filtering: '{}'", typed);
+                    }
+                }
             }
             KC::Backspace => { app.search.pop(); }
             KC::Char(c) => { app.search.push(c); }
@@ -4008,8 +4361,6 @@ async fn handle_key(
 
     // ── Normal mode ───────────────────────────────────────────────────────────
     match key.code {
-        KC::Char('q') if app.input.is_empty() => return true,
-
         // ── Tab switching ─────────────────────────────────────────────────────
         KC::Char('1') if app.input.is_empty() => { app.active_tab = AppTab::Signals; }
         KC::Char('2') if app.input.is_empty() => { app.active_tab = AppTab::Markets; }
@@ -4118,12 +4469,41 @@ async fn handle_key(
             }
         }
 
-        // ── Refresh ───────────────────────────────────────────────────────────
-        KC::Char('r') if app.input.is_empty() => {
+        // ── Command bar ───────────────────────────────────────────────────────────
+        KC::Char('/') if app.input.is_empty() => {
+            app.search_mode = true;
+            app.search.clear();
+        }
+        // Close wallet detail panel (SmartMoney tab)
+        KC::Esc if app.input.is_empty()
+            && app.active_tab == AppTab::SmartMoney
+            && (app.sm_detail.is_some() || app.sm_detail_loading) =>
+        {
+            app.sm_detail         = None;
+            app.sm_detail_loading = false;
+            app.sm_detail_scroll  = 0;
+            app.status = "Back to wallet list.".to_string();
+        }
+
+        KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
+            app.search.clear();
+            app.status = "Search cleared".to_string();
+        }
+
+        KC::Esc if app.show_help => {
+            app.show_help = false;
+        }
+
+        // ── Help overlay ──────────────────────────────────────────────────────
+        KC::Char('?') if app.input.is_empty() => {
+            app.show_help = !app.show_help;
+        }
+
+        // ── Refresh shortcut ──────────────────────────────────────────────────
+        KC::Char('^') if app.input.is_empty() => {
             let clients_c = clients.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
-            // Also refresh chart and orderbook for the selected market
             if app.selected_market_id.is_some() {
                 trigger_chart_load(app, clients, event_tx).await;
                 trigger_orderbook_load(app, clients, event_tx).await;
@@ -4131,123 +4511,16 @@ async fn handle_key(
             app.status = "Refreshing…".to_string();
         }
 
-        // ── Kelly position sizer ─────────────────────────────────────────────
-        KC::Char('k') if app.input.is_empty() && app.selected_market().is_some() => {
-            if app.kelly_mode {
-                // Already open — recalculate (restart from MyProb step)
-                app.kelly_step  = KellyStep::MyProb;
-                app.kelly_input = String::new();
-                app.kelly_my_prob = None;
+        // ── AI analyze shortcut ───────────────────────────────────────────────
+        KC::Char('@') if app.input.is_empty() => {
+            if let Some((title, id, plat)) = analyze_target(app) {
+                app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
             } else {
-                app.kelly_mode  = true;
-                app.kelly_step  = KellyStep::MyProb;
-                app.kelly_input = String::new();
-                app.kelly_my_prob = None;
+                app.status = "Select a market first.".to_string();
             }
-        }
-
-        // ── Add position ──────────────────────────────────────────────────────
-        KC::Char('n') if app.input.is_empty() => {
-            // Works from Markets tab (picks selected market) or Signals tab (picks primary market)
-            if app.active_tab == AppTab::Signals {
-                if let Some(sig) = app.selected_signal() {
-                    let id  = sig.id_a.clone();
-                    let plat = sig.platform_a.clone();
-                    let title = sig.title.clone();
-                    let price = sig.price_a;
-                    // Synthesise a dummy market entry to reuse start_add_position flow
-                    if let Some(m) = app.markets.iter().find(|m| m.id == id && m.platform == plat) {
-                        let idx = app.markets.iter().position(|m| m.id == id && m.platform == plat).unwrap();
-                        app.market_list.select(Some(idx));
-                        // Temporarily switch to Markets so start_add_position works
-                        let prev_tab = app.active_tab;
-                        app.active_tab = AppTab::Markets;
-                        // Filter might hide it — just inline
-                        let _ = m;
-                        app.pos_draft = crate::tui::PosDraft {
-                            market_id: id,
-                            title,
-                            platform: Some(plat),
-                            entry_price: None,
-                            shares: None,
-                            side: None,
-                        };
-                        app.pos_input_mode = true;
-                        app.pos_input_step = PosInputStep::EntryPrice;
-                        app.input.clear();
-                        app.active_tab = prev_tab;
-                        let pct = price * 100.0;
-                        app.status = format!(
-                            "Add position [{:.1}¢] — Enter entry price (¢):", pct
-                        );
-                    } else {
-                        app.start_add_position();
-                    }
-                }
-            } else {
-                app.start_add_position();
-            }
-        }
-
-        // ── Delete portfolio position ─────────────────────────────────────────
-        KC::Char('d') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
-            app.delete_selected_position();
-        }
-
-        // ── Set stop/take-profit target ───────────────────────────────────────
-        KC::Char('t') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
-            if let Some(idx) = app.portfolio_list.selected() {
-                if let Some(pos) = app.portfolio.positions.get(idx) {
-                    let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
-                    app.target_pos_id   = pos.id.clone();
-                    app.target_input_mode = true;
-                    app.target_input_step = TargetInputStep::TakeProfit;
-                    app.input.clear();
-                    app.status = format!(
-                        "Set take-profit for '{}' (mark {:.1}¢): enter ¢ or Enter to skip",
-                        trunc(&pos.title, 30), mark
-                    );
-                } else {
-                    app.status = "Select a position first.".to_string();
-                }
-            } else {
-                app.status = "Select a position first.".to_string();
-            }
-        }
-
-        // ── Dismiss signal ────────────────────────────────────────────────────
-        KC::Char('x') if app.input.is_empty() && app.active_tab == AppTab::Signals => {
-            if let Some(sig) = app.selected_signal() {
-                let id = sig.id_a.clone();
-                let title = trunc(&sig.title, 40);
-                app.dismissed_signals.insert(id);
-                // Remove from displayed list immediately
-                if let Some(idx) = app.signal_list.selected() {
-                    let new_len = app.signals.len().saturating_sub(1);
-                    app.signal_list.select(if new_len == 0 { None } else { Some(idx.min(new_len - 1)) });
-                }
-                // Recompute to apply dismissal
-                app.signals = signals::compute_signals(
-                    &app.markets, &app.prev_prices, &app.dismissed_signals
-                );
-                app.status = format!("Dismissed: {}", title);
-            }
-        }
-
-        // ── Markdown report export ────────────────────────────────────────────
-        KC::Char('M') if app.input.is_empty() => {
-            app.status = export_markdown_report(app);
-        }
-
-        // ── Pairs tab: LLM re-match ───────────────────────────────────────────
-        KC::Char('L') if app.input.is_empty() && app.active_tab == AppTab::Pairs => {
-            trigger_llm_pairs(app, backend, event_tx).await;
         }
 
         // ── Threshold adjustments ─────────────────────────────────────────────
-        // '[' / ']' lower / raise the active tab's relevant threshold by 0.05.
-        // Smart Money tab → coord_threshold
-        // Pairs tab       → pairs_jaccard_threshold
         KC::Char('[') if app.input.is_empty()
             && matches!(app.active_tab, AppTab::SmartMoney | AppTab::Pairs) =>
         {
@@ -4262,7 +4535,7 @@ async fn handle_key(
                 AppTab::Pairs => {
                     app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold - 0.05).max(0.05);
                     app.status = format!(
-                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        "Pairs Jaccard threshold → {:.0}%  (use /pairs to re-match)",
                         app.pairs_jaccard_threshold * 100.0,
                     );
                 }
@@ -4283,153 +4556,11 @@ async fn handle_key(
                 AppTab::Pairs => {
                     app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold + 0.05).min(0.95);
                     app.status = format!(
-                        "Pairs Jaccard threshold → {:.0}%  (press L to re-match)",
+                        "Pairs Jaccard threshold → {:.0}%  (use /pairs to re-match)",
                         app.pairs_jaccard_threshold * 100.0,
                     );
                 }
                 _ => {}
-            }
-        }
-
-        // ── Portfolio tab: toggle risk view ───────────────────────────────────
-        KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
-            app.show_risk_view = !app.show_risk_view;
-            app.status = if app.show_risk_view {
-                "Risk view — E[P&L], σ, scenario analysis  [v] back to positions".to_string()
-            } else {
-                "Positions view  [v] risk analysis".to_string()
-            };
-        }
-
-        // ── Search ────────────────────────────────────────────────────────────
-        KC::Char('/') if app.input.is_empty() => {
-            app.search_mode = true;
-            app.search.clear();
-            app.active_tab = AppTab::Markets;
-        }
-        // Close wallet detail panel (SmartMoney tab)
-        KC::Esc if app.input.is_empty()
-            && app.active_tab == AppTab::SmartMoney
-            && (app.sm_detail.is_some() || app.sm_detail_loading) =>
-        {
-            app.sm_detail         = None;
-            app.sm_detail_loading = false;
-            app.sm_detail_scroll  = 0;
-            app.status = "Back to wallet list.".to_string();
-        }
-
-        KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
-            app.search.clear();
-            app.status = "Search cleared".to_string();
-        }
-
-        // ── Platform filter ───────────────────────────────────────────────────
-        KC::Char('p') if app.input.is_empty() => {
-            app.platform_filter = match app.platform_filter {
-                PlatformFilter::All        => PlatformFilter::Polymarket,
-                PlatformFilter::Polymarket => PlatformFilter::Kalshi,
-                PlatformFilter::Kalshi     => PlatformFilter::All,
-            };
-            app.market_list.select(Some(0));
-            app.status = format!("Filter: {}", app.platform_filter.label());
-        }
-
-        // ── Chart interval ────────────────────────────────────────────────────
-        KC::Char('c') if app.input.is_empty() => {
-            app.chart_interval = app.chart_interval.next();
-            app.chart_data.clear();
-            app.status = format!("Chart interval: {}", app.chart_interval.label());
-            trigger_chart_load(app, clients, event_tx).await;
-        }
-
-        // ── Help overlay ─────────────────────────────────────────────────────
-        KC::Char('?') if app.input.is_empty() => {
-            app.show_help = !app.show_help;
-        }
-        KC::Esc if app.show_help => {
-            app.show_help = false;
-        }
-
-        // ── Watchlist toggle ──────────────────────────────────────────────────
-        KC::Char('w') if app.input.is_empty() => {
-            let market_info = match app.active_tab {
-                AppTab::Markets   => app.selected_market().map(|m| m.clone()),
-                AppTab::Signals   => app.selected_signal()
-                    .and_then(|s| app.markets.iter().find(|m| m.id == s.id_a))
-                    .cloned(),
-                _ => app.selected_market().map(|m| m.clone()),
-            };
-            if let Some(m) = market_info {
-                app.toggle_watchlist(&m);
-            } else {
-                app.status = "Select a market first.".to_string();
-            }
-        }
-
-        // ── Watchlist-only filter (Shift+W) ───────────────────────────────────
-        KC::Char('W') if app.input.is_empty() => {
-            app.watchlist_only = !app.watchlist_only;
-            app.market_list.select(Some(0));
-            app.status = if app.watchlist_only {
-                format!("Watchlist filter ON  ({} markets)", app.watchlist.len())
-            } else {
-                "Watchlist filter OFF".to_string()
-            };
-        }
-
-        // ── Market sort (Shift+S) ─────────────────────────────────────────────
-        KC::Char('S') if app.input.is_empty() => {
-            app.market_sort = app.market_sort.next();
-            app.market_list.select(Some(0));
-            app.status = format!("Sort: {}", app.market_sort.label());
-        }
-
-        // ── CSV export (Shift+E) ──────────────────────────────────────────────
-        KC::Char('E') if app.input.is_empty() => {
-            app.status = export_current_tab(app);
-        }
-
-        // ── Alert threshold editor ────────────────────────────────────────────
-        KC::Char('e') if app.input.is_empty() => {
-            let mkt = match app.active_tab {
-                AppTab::Markets => app.selected_market().map(|m| (m.id.clone(), m.title.clone())),
-                _               => app.selected_market().map(|m| (m.id.clone(), m.title.clone())),
-            };
-            if let Some((id, title)) = mkt {
-                if app.is_watched(&id) {
-                    app.alert_edit_mode = true;
-                    app.alert_edit_step = AlertEditStep::default();
-                    app.alert_edit_mkt  = id;
-                    app.input.clear();
-                    app.status = format!("Alert for '{}': enter ABOVE threshold in ¢ (or Enter for none):", trunc(&title, 30));
-                } else {
-                    app.status = "Market not watched — press 'w' to add to watchlist first.".to_string();
-                }
-            } else {
-                app.status = "Select a market first.".to_string();
-            }
-        }
-
-        // ── Ask AI ────────────────────────────────────────────────────────────
-        KC::Char('a') if app.input.is_empty() => {
-            let info = match app.active_tab {
-                AppTab::Signals => {
-                    app.selected_signal().map(|s| (
-                        s.title.clone(),
-                        s.id_a.clone(),
-                        s.platform_a.name().to_lowercase(),
-                    ))
-                }
-                _ => {
-                    app.selected_market().map(|m| (
-                        m.title.clone(),
-                        m.id.clone(),
-                        m.platform.name().to_lowercase(),
-                    ))
-                }
-            };
-            if let Some((title, id, plat)) = info {
-                app.input = format!("Analyze the market: '{}' (platform: {}, id: {})", title, plat, id);
             }
         }
 
