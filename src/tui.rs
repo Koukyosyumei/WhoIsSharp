@@ -47,6 +47,27 @@ use crate::tools::{MarketClients, SmartMoneyWallet};
 
 const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs"];
 
+const TIPS: &[&str] = &[
+    "Press ? to open the help overlay",
+    "Press 1-9 or Tab/Shift+Tab to switch tabs",
+    "Press j/k or arrow keys to navigate the market list",
+    "Press Enter on a market to load its chart and order book",
+    "Press r to refresh market data",
+    "Press w to add/remove a market from your watchlist",
+    "Press p to cycle platform filter: All → PM → KL",
+    "Press c to cycle chart interval: 1h → 6h → 1d → 1w → 1m",
+    "Press / to search and filter markets by keyword",
+    "Press a to pre-fill an AI analysis prompt for the selected market",
+    "Press s to cycle market sort: ~50% → Volume → End date → A-Z",
+    "Press k to open the Kelly position-size calculator",
+    "In Chat (tab 6), type a question and press Enter to ask the AI",
+    "Press Ctrl+C or q (when input is empty) to quit",
+    "Use the Watchlist tab filter (w toggle) to focus on starred markets",
+    "Press x on a signal to dismiss it for the current session",
+    "Press v in Portfolio to toggle the risk/exposure view",
+];
+
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Signals    = 0,
@@ -269,6 +290,9 @@ pub struct App {
     // Startup loading spinner (cycles 0–9)
     pub spinner_tick:      u8,
 
+    // Rotating tips index (cycles through TIPS on each auto-refresh)
+    pub tip_index:         usize,
+
     // Kelly position sizer modal (k key)
     pub kelly_mode:        bool,
     pub kelly_step:        KellyStep,
@@ -370,6 +394,7 @@ impl App {
             pairs_loading:     false,
             show_risk_view:    false,
             spinner_tick:      0,
+            tip_index:         0,
             kelly_mode:        false,
             kelly_step:        KellyStep::default(),
             kelly_input:       String::new(),
@@ -848,7 +873,15 @@ fn render_signals(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     render_signal_list(f, chunks[0], app);
-    render_signal_detail(f, chunks[1], app);
+
+    // Split right panel: detail on top, quick-guide at bottom
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(11)])
+        .split(chunks[1]);
+
+    render_signal_detail(f, right_chunks[0], app);
+    render_signal_quickguide(f, right_chunks[1]);
 }
 
 fn signal_kind_color(kind: &SignalKind) -> Color {
@@ -1045,6 +1078,52 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
     let p = Paragraph::new(lines)
         .block(Block::default().title(" Signal Detail ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
         .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_signal_quickguide(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  [ARB]   ", Style::default().fg(Color::Magenta).bold()),
+            Span::styled("Cross-platform price gap — guaranteed profit if gap holds", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [NEAR50]", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" Price near 50¢ — high uncertainty, good two-sided entry", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [VOLSPK]", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(" Volume spike — unusual activity vs. average", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [INSDR] ", Style::default().fg(Color::Red).bold()),
+            Span::styled(" Insider alert — vol/liquidity ratio exceeds threshold", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [THIN]  ", Style::default().fg(Color::DarkGray).bold()),
+            Span::styled(" Thin liquidity — price may move on small orders", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  [MOMNTM]", Style::default().fg(Color::Green).bold()),
+            Span::styled(" Momentum — significant price drift since last refresh", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  j/k", Style::default().fg(Color::Cyan)),
+            Span::raw(" navigate   "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" open market   "),
+            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::raw(" AI analysis   "),
+            Span::styled("n", Style::default().fg(Color::Cyan)),
+            Span::raw(" add position   "),
+            Span::styled("x", Style::default().fg(Color::Cyan)),
+            Span::raw(" dismiss"),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Signal Types ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(p, area);
 }
 
@@ -1945,6 +2024,37 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
     let inner_width = (area.width as usize).saturating_sub(4); // 2 border + 2 indent
 
     let mut lines: Vec<Line> = Vec::new();
+
+    if app.chat_msgs.is_empty() && !app.is_loading {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  WhoIsSharp AI Assistant",
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Ask anything about prediction markets. Try:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        for prompt in &[
+            "\"Which markets have the highest uncertainty right now?\"",
+            "\"Analyze the order book for [market name]\"",
+            "\"What's the price history trend for [market]?\"",
+            "\"Search for markets related to elections\"",
+            "\"List the top markets by volume\"",
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled("  › ", Style::default().fg(Color::Yellow)),
+                Span::styled(*prompt, Style::default().fg(Color::White)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Press 'a' on any market to pre-fill an analysis prompt.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     for msg in &app.chat_msgs {
         match msg {
@@ -2850,13 +2960,15 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     };
     let wl_color = if app.watchlist_only { Color::Yellow } else { Color::DarkGray };
 
-    // Alert or status text
-    let status_text = if !app.watch_alerts.is_empty() {
-        app.watch_alerts.join("  ")
+    // Alert or status text; when idle show a rotating tip
+    let (status_text, status_color) = if !app.watch_alerts.is_empty() {
+        (app.watch_alerts.join("  "), Color::Yellow)
+    } else if app.status == "Ready" || app.status.is_empty() {
+        let tip = TIPS[app.tip_index % TIPS.len()];
+        (format!("Tip: {}", tip), Color::DarkGray)
     } else {
-        app.status.clone()
+        (app.status.clone(), Color::White)
     };
-    let status_color = if !app.watch_alerts.is_empty() { Color::Yellow } else { Color::White };
 
     let line = Line::from(vec![
         Span::styled(
@@ -3180,6 +3292,7 @@ pub async fn run_tui(
                     None     => { std::future::pending::<tokio::time::Instant>().await }
                 }
             } => {
+                app.tip_index = app.tip_index.wrapping_add(1);
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
