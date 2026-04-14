@@ -54,6 +54,12 @@ pub struct Position {
     /// Optional note / thesis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note:         Option<String>,
+    /// Take-profit price threshold (YES price), 0.0–1.0. Alert fires when mark ≥ this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take_profit:  Option<f64>,
+    /// Stop-loss price threshold (YES price), 0.0–1.0. Alert fires when mark ≤ this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss:    Option<f64>,
 }
 
 impl Position {
@@ -84,8 +90,10 @@ impl Position {
             shares,
             side,
             opened_at: Utc::now(),
-            mark_price: None,
+            mark_price:  None,
             note,
+            take_profit: None,
+            stop_loss:   None,
         }
     }
 
@@ -249,6 +257,63 @@ pub fn save_watchlist(watchlist: &[WatchEntry]) -> Result<()> {
     std::fs::write(&path, data)
         .with_context(|| format!("Cannot write watchlist to '{}'", path.display()))?;
     Ok(())
+}
+
+// ─── Session persistence ──────────────────────────────────────────────────────
+//
+// A session captures the chat history and research notes for one working session.
+// Saved to ~/.whoissharp/sessions/<YYYY-MM-DD_HH-MM-SS>.json on exit and loadable
+// on the next startup.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessage {
+    /// "user" | "assistant" | "tool_call" | "tool_result" | "error"
+    pub role:    String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Session {
+    /// ISO-8601 timestamp when the session was started.
+    pub started_at: String,
+    pub messages:   Vec<SessionMessage>,
+    /// Free-form research notes appended via `!note`.
+    pub notes:      Vec<String>,
+}
+
+fn sessions_dir() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".whoissharp");
+    p.push("sessions");
+    p
+}
+
+/// Save a session to `~/.whoissharp/sessions/<timestamp>.json`.
+/// Returns the path on success.
+pub fn save_session(session: &Session) -> Result<PathBuf> {
+    let dir = sessions_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Cannot create sessions directory '{}'", dir.display()))?;
+    let filename = format!("{}.json", session.started_at.replace([':', ' '], "-"));
+    let path = dir.join(&filename);
+    let data = serde_json::to_string_pretty(session)?;
+    std::fs::write(&path, &data)
+        .with_context(|| format!("Cannot write session to '{}'", path.display()))?;
+    Ok(path)
+}
+
+/// Load the most recent session from `~/.whoissharp/sessions/`, if any.
+pub fn load_last_session() -> Option<Session> {
+    let dir = sessions_dir();
+    if !dir.exists() { return None; }
+    let mut entries: Vec<_> = std::fs::read_dir(&dir).ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    let last = entries.last()?;
+    let data = std::fs::read_to_string(last.path()).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

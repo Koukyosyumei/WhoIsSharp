@@ -23,6 +23,8 @@ pub enum SignalKind {
     VolSpike,
     NearFifty,
     Thin,
+    /// Price moved sharply in a short window — possible catalyst or news.
+    Momentum,
 }
 
 impl SignalKind {
@@ -33,6 +35,7 @@ impl SignalKind {
             SignalKind::VolSpike     => "VOL",
             SignalKind::NearFifty    => "50/50",
             SignalKind::Thin         => "THIN",
+            SignalKind::Momentum     => "MOMT",
         }
     }
 }
@@ -80,14 +83,26 @@ impl Signal {
 // ─── Top-level entry point ────────────────────────────────────────────────────
 
 /// Recompute all signals from the current market snapshot.
+///
+/// `prev_prices`: previous YES prices keyed by market ID — used for momentum
+/// detection.  Pass an empty map on the first call.
+///
+/// `dismissed`: set of signal market IDs the user has explicitly dismissed —
+/// filtered out of results.
+///
 /// Returns at most 30 signals, sorted by stars desc → ev_score desc.
-pub fn compute_signals(markets: &[Market]) -> Vec<Signal> {
+pub fn compute_signals(
+    markets:   &[Market],
+    prev_prices: &std::collections::HashMap<String, f64>,
+    dismissed:   &std::collections::HashSet<String>,
+) -> Vec<Signal> {
     let mut signals = Vec::new();
     signals.extend(find_arb_pairs(markets));
     signals.extend(find_insider_alerts(markets));
     signals.extend(find_near_fifty(markets));
     signals.extend(find_vol_spikes(markets));
     signals.extend(find_thin_markets(markets));
+    signals.extend(find_momentum(markets, prev_prices));
 
     signals.sort_by(|a, b| {
         b.stars
@@ -95,6 +110,7 @@ pub fn compute_signals(markets: &[Market]) -> Vec<Signal> {
             .then_with(|| b.ev_score.partial_cmp(&a.ev_score).unwrap_or(std::cmp::Ordering::Equal))
     });
     signals.dedup_by_key(|s| s.id_a.clone());
+    signals.retain(|s| !dismissed.contains(&s.id_a));
     signals.truncate(30);
     signals
 }
@@ -342,6 +358,50 @@ fn find_thin_markets(markets: &[Market]) -> Vec<Signal> {
         .collect()
 }
 
+// ─── Momentum / price velocity ───────────────────────────────────────────────
+//
+// Compare current YES price to the previous snapshot (from the last refresh).
+// A move of ≥ MOMENTUM_THRESHOLD percentage points in either direction is flagged.
+
+const MOMENTUM_THRESHOLD: f64 = 0.04; // 4 percentage points per refresh cycle
+
+fn find_momentum(
+    markets:     &[Market],
+    prev_prices: &std::collections::HashMap<String, f64>,
+) -> Vec<Signal> {
+    markets
+        .iter()
+        .filter_map(|m| {
+            let prev = *prev_prices.get(&m.id)?;
+            let delta = m.yes_price - prev;
+            if delta.abs() < MOMENTUM_THRESHOLD { return None; }
+
+            let pct_move = delta * 100.0;
+            let direction = if delta > 0.0 { "▲ UP" } else { "▼ DOWN" };
+            let stars = if delta.abs() >= 0.12 { 3 } else if delta.abs() >= 0.07 { 2 } else { 1 };
+            let ev_score = delta.abs() * 100.0 * m.volume.unwrap_or(1.0).ln();
+
+            Some(Signal {
+                kind:       SignalKind::Momentum,
+                stars,
+                title:      m.title.clone(),
+                platform_a: m.platform.clone(),
+                id_a:       m.id.clone(),
+                price_a:    m.yes_price,
+                platform_b: None,
+                id_b:       None,
+                price_b:    None,
+                gap:        delta.abs(),
+                ev_score,
+                action: format!(
+                    "{} {:.1}pp since last refresh → now {:.1}% YES — check for news catalyst",
+                    direction, pct_move.abs(), m.yes_price * 100.0,
+                ),
+            })
+        })
+        .collect()
+}
+
 // ─── Title similarity ─────────────────────────────────────────────────────────
 
 static STOP_WORDS: &[&str] = &[
@@ -442,7 +502,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.60,
                    Some(100_000.0), Some(50_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         let arb = sigs.iter().find(|s| s.kind == SignalKind::Arb).expect("arb signal");
         assert!((arb.gap - 0.10).abs() < 1e-9);
         // gap 0.10 ≥ 0.08 threshold → 3 stars
@@ -458,7 +518,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.60,
                    Some(100_000.0), Some(50_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         let arb = sigs.iter().find(|s| s.kind == SignalKind::Arb).unwrap();
         assert_eq!(arb.stars, 3);
     }
@@ -471,7 +531,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.585,
                    Some(100_000.0), Some(50_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::Arb),
                 "gap < 2.5% should not surface");
     }
@@ -484,7 +544,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Trump wins 2024 presidential election", 0.50,
                    Some(100_000.0), Some(50_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::Arb));
     }
 
@@ -495,7 +555,7 @@ mod tests {
         let mkts = vec![
             market(Platform::Polymarket, "pm1", "Coin flip event", 0.50, Some(100_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         let s = sigs.iter().find(|s| s.kind == SignalKind::NearFifty).expect("near-50");
         assert_eq!(s.stars, 3); // dist = 0.0 < 0.01 → 3 stars
     }
@@ -505,7 +565,7 @@ mod tests {
         let mkts = vec![
             market(Platform::Polymarket, "pm1", "One-sided event", 0.80, Some(100_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::NearFifty));
     }
 
@@ -515,7 +575,7 @@ mod tests {
             // vol = 5000 < 10000 threshold
             market(Platform::Polymarket, "pm1", "Low volume coin flip", 0.50, Some(5_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::NearFifty));
     }
 
@@ -531,7 +591,7 @@ mod tests {
                             &format!("Baseline event {}", i), 0.60, Some(10_000.0), None))
             .collect();
         mkts.push(market(Platform::Polymarket, "spike", "High vol spike", 0.55, Some(1_000_000.0), None));
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(sigs.iter().any(|s| s.kind == SignalKind::VolSpike && s.id_a == "spike"));
     }
 
@@ -541,7 +601,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Event A", 0.60, Some(10_000.0), None),
             market(Platform::Polymarket, "pm2", "Event B", 0.40, Some(10_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::VolSpike));
     }
 
@@ -552,7 +612,7 @@ mod tests {
         let mkts = vec![
             market(Platform::Kalshi, "kl1", "Illiquid event", 0.50, None, Some(500.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(sigs.iter().any(|s| s.kind == SignalKind::Thin && s.id_a == "kl1"));
     }
 
@@ -562,7 +622,7 @@ mod tests {
         let mkts = vec![
             market(Platform::Kalshi, "kl1", "Near-certain event", 0.97, None, Some(500.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::Thin));
     }
 
@@ -572,7 +632,7 @@ mod tests {
         let mkts = vec![
             market(Platform::Kalshi, "kl1", "Well-funded market", 0.50, None, Some(50_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::Thin));
     }
 
@@ -585,7 +645,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Suspicious directional market",
                    0.80, Some(200_000.0), Some(5_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         let s = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert)
             .expect("insider alert should be present");
         assert!((s.gap - 40.0).abs() < 1e-6, "ratio should be ~40×");
@@ -599,7 +659,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Smart money shorting this one",
                    0.15, Some(300_000.0), Some(5_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         let s = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert)
             .expect("insider alert should be present");
         assert!(s.gap >= 50.0);
@@ -613,7 +673,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Uncertain market with heavy trading",
                    0.52, Some(200_000.0), Some(5_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert),
                 "near-50% price should not trigger insider alert");
     }
@@ -625,7 +685,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Normal high-confidence market",
                    0.85, Some(50_000.0), Some(100_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert),
                 "low vol/liq ratio should not trigger insider alert");
     }
@@ -637,7 +697,7 @@ mod tests {
             market(Platform::Kalshi, "kl1", "Tiny market barely trading",
                    0.80, Some(500.0), Some(10.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert));
     }
 
@@ -648,7 +708,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Zero liquidity market",
                    0.80, Some(50_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(!sigs.iter().any(|s| s.kind == SignalKind::InsiderAlert));
     }
 
@@ -658,7 +718,7 @@ mod tests {
             market(Platform::Polymarket, "pm1", "Suspicious directional market",
                    0.80, Some(200_000.0), Some(5_000.0)),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         if let Some(s) = sigs.iter().find(|s| s.kind == SignalKind::InsiderAlert) {
             assert!(s.action.contains("analyze_insider"),
                     "action should mention the AI tool");
@@ -679,7 +739,7 @@ mod tests {
             market(Platform::Polymarket, "pm2", "Another uncertain event happens", 0.56,
                    Some(100_000.0), None),
         ];
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         for i in 0..sigs.len().saturating_sub(1) {
             assert!(sigs[i].stars >= sigs[i + 1].stars,
                     "signal {} (stars={}) before {} (stars={})",
@@ -699,7 +759,7 @@ mod tests {
             market(Platform::Polymarket, &format!("pm{}", i),
                    &format!("Uncertain event number {}", i), 0.50, Some(100_000.0), None)
         }).collect();
-        let sigs = compute_signals(&mkts);
+        let sigs = compute_signals(&mkts, &Default::default(), &Default::default());
         assert!(sigs.len() <= 30);
     }
 }

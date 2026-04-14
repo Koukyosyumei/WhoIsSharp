@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::llm::{LlmBackend, LlmMessage, MessageContent, ToolResult};
-use crate::signals::{self, Signal};
+use crate::signals::Signal;
 use crate::tools::{self, MarketClients};
 
 // ─── Events sent to the TUI ──────────────────────────────────────────────────
@@ -295,11 +295,9 @@ pub async fn refresh_markets(
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Compute signals synchronously before emitting events
-    let computed_signals = signals::compute_signals(&all);
-
+    // Signal computation requires prev_prices and dismissed state from the TUI;
+    // send raw market data and let the TUI recompute signals after MarketsLoaded.
     let _ = event_tx.send(AppEvent::MarketsLoaded(all));
-    let _ = event_tx.send(AppEvent::SignalsComputed(computed_signals));
     let _ = event_tx.send(AppEvent::RefreshDone);
 }
 

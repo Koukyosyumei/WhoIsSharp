@@ -33,12 +33,14 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
+use std::collections::{HashMap, HashSet};
+
 use crate::agent::{self, AppEvent};
 use crate::llm::{LlmBackend, LlmMessage};
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
 use crate::markets::polymarket::PolyTrade;
-use crate::portfolio::{self, Portfolio, Position, Side, WatchEntry};
-use crate::signals::{Signal, SignalKind};
+use crate::portfolio::{self, Portfolio, Position, Session, Side, WatchEntry};
+use crate::signals::{self, Signal, SignalKind};
 use crate::tools::{MarketClients, SmartMoneyWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
@@ -229,6 +231,20 @@ pub struct App {
 
     // Selected market ID (for chart / orderbook loading)
     pub selected_market_id: Option<String>,
+
+    // Price velocity: previous YES prices from the last refresh cycle (for momentum signals)
+    pub prev_prices:      HashMap<String, f64>,
+
+    // Dismissed signal IDs (persisted in session; `x` key)
+    pub dismissed_signals: HashSet<String>,
+
+    // Session (chat persistence)
+    pub session:           Session,
+
+    // Stop/take-profit target input mode for portfolio positions
+    pub target_input_mode: bool,
+    pub target_input_step: TargetInputStep,
+    pub target_pos_id:     String,   // position being edited
 }
 
 // Position add-flow state machine
@@ -239,6 +255,14 @@ pub enum PosInputStep {
     Shares,
     Side,
     Note,
+}
+
+// Stop / take-profit target input state machine
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub enum TargetInputStep {
+    #[default]
+    TakeProfit,
+    StopLoss,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -301,6 +325,16 @@ impl App {
             backend_name,
             last_updated:      None,
             selected_market_id: None,
+            prev_prices:        HashMap::new(),
+            dismissed_signals:  HashSet::new(),
+            session:            Session {
+                started_at: chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string(),
+                messages:   Vec::new(),
+                notes:      Vec::new(),
+            },
+            target_input_mode: false,
+            target_input_step: TargetInputStep::default(),
+            target_pos_id:     String::new(),
         }
     }
 
@@ -375,6 +409,36 @@ impl App {
                         &m.title[..m.title.len().min(30)],
                         entry.alert_below * 100.0,
                         m.yes_price * 100.0,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Check portfolio positions against stop-loss / take-profit thresholds.
+    /// Fires alerts into `watch_alerts` alongside watchlist alerts.
+    pub fn check_position_alerts(&mut self) {
+        for pos in &self.portfolio.positions {
+            let mark = match pos.mark_price {
+                Some(m) => m,
+                None    => continue,
+            };
+            let title_short = &pos.title[..pos.title.len().min(28)];
+            if let Some(tp) = pos.take_profit {
+                if mark >= tp {
+                    self.watch_alerts.push(format!(
+                        "🎯 {} {} hit TAKE-PROFIT @ {:.0}¢ (mark {:.0}¢)",
+                        pos.side.label(), title_short,
+                        tp * 100.0, mark * 100.0,
+                    ));
+                }
+            }
+            if let Some(sl) = pos.stop_loss {
+                if mark <= sl {
+                    self.watch_alerts.push(format!(
+                        "🛑 {} {} hit STOP-LOSS @ {:.0}¢ (mark {:.0}¢)",
+                        pos.side.label(), title_short,
+                        sl * 100.0, mark * 100.0,
                     ));
                 }
             }
@@ -729,6 +793,7 @@ fn signal_kind_color(kind: &SignalKind) -> Color {
         SignalKind::VolSpike     => Color::Yellow,
         SignalKind::NearFifty    => Color::Cyan,
         SignalKind::Thin         => Color::DarkGray,
+        SignalKind::Momentum     => Color::Green,
     }
 }
 
@@ -882,6 +947,7 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
             SignalKind::Thin         => "Liquidity ($)",
             SignalKind::Arb          => "Gap",
             SignalKind::InsiderAlert => "Vol/Liq ratio",
+            SignalKind::Momentum     => "Δ Price",
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:>10}: ", gap_label), Style::default().fg(Color::DarkGray)),
@@ -891,6 +957,7 @@ fn render_signal_detail(f: &mut Frame, area: Rect, app: &App) {
                 SignalKind::Thin         => format!("${:.0}K", sig.gap / 1000.0),
                 SignalKind::Arb          => format!("{:.1}¢", sig.gap * 100.0),
                 SignalKind::InsiderAlert => format!("{:.0}×", sig.gap),
+                SignalKind::Momentum     => format!("{:+.1}pp", sig.gap * 100.0),
             }),
         ]));
     }
@@ -954,8 +1021,21 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
             let pct_color = price_color(m.yes_price);
             let vol = format_volume(m.volume);
 
-            let title_str = trunc(&m.title, 30);
+            let title_str = trunc(&m.title, 28);
             let watch_star = if app.is_watched(&m.id) { "★" } else { " " };
+
+            // Price velocity indicator vs previous snapshot
+            let (vel_str, vel_color) = if let Some(&prev) = app.prev_prices.get(&m.id) {
+                let delta = m.yes_price - prev;
+                if delta.abs() >= 0.01 {
+                    let sign = if delta > 0.0 { "▲" } else { "▼" };
+                    (format!("{}{:.1}pp", sign, delta.abs() * 100.0), if delta > 0.0 { Color::Green } else { Color::Red })
+                } else {
+                    ("  —  ".to_string(), Color::DarkGray)
+                }
+            } else {
+                ("     ".to_string(), Color::DarkGray)
+            };
 
             let line = Line::from(vec![
                 Span::styled(watch_star, Style::default().fg(Color::Yellow)),
@@ -963,6 +1043,7 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(" "),
                 Span::styled(format!("{:5.1}%", pct), Style::default().fg(pct_color).bold()),
                 Span::raw(format!(" {:>7} ", vol)),
+                Span::styled(format!("{:<7}", vel_str), Style::default().fg(vel_color)),
                 Span::raw(title_str),
             ]);
             ListItem::new(line)
@@ -1133,6 +1214,50 @@ fn render_chart(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(chart, chart_area);
 
+    // ── OHLC stats for the most-recent candle ─────────────────────────────────
+    // Show under the chart when the area is tall enough and candle data exists
+    if !app.chart_candles.is_empty() && area.height > 12 {
+        // The vol_area_opt already reserves space; we add a 1-line OHLC row
+        // before the volume bar by overwriting the bottom of chart_area.
+        // We use the last candle as "current".
+        let c = app.chart_candles.last().unwrap();
+        let prev_close = app.chart_candles
+            .iter().rev().nth(1).map(|p| p.close).unwrap_or(c.open);
+        let day_chg  = c.close - prev_close;
+        let chg_col  = if day_chg >= 0.0 { Color::Green } else { Color::Red };
+        let chg_sign = if day_chg >= 0.0 { "+" } else { "" };
+
+        let ohlc_line = Line::from(vec![
+            Span::styled(" OHLC  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("O ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:.1}¢  ", c.open * 100.0)),
+            Span::styled("H ", Style::default().fg(Color::Green)),
+            Span::raw(format!("{:.1}¢  ", c.high * 100.0)),
+            Span::styled("L ", Style::default().fg(Color::Red)),
+            Span::raw(format!("{:.1}¢  ", c.low  * 100.0)),
+            Span::styled("C ", Style::default().fg(Color::White)),
+            Span::styled(format!("{:.1}¢  ", c.close * 100.0), Style::default().fg(Color::White).bold()),
+            Span::styled(
+                format!("{}{:.1}pp", chg_sign, day_chg * 100.0),
+                Style::default().fg(chg_col).bold(),
+            ),
+            if let Some(vol) = c.volume {
+                Span::styled(format!("   Vol {}", format_volume(Some(vol))), Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            },
+        ]);
+
+        // Draw one row above the volume area (or above the bottom border)
+        let ohlc_rect = Rect {
+            x:      chart_area.x + 1,
+            y:      chart_area.y + chart_area.height - 2,
+            width:  chart_area.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(ohlc_line), ohlc_rect);
+    }
+
     // Volume overlay (Kalshi only — Polymarket price history has no volume)
     if let Some(vol_area) = vol_area_opt {
         let max_vol = app.chart_candles.iter()
@@ -1182,25 +1307,68 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let spread = book.spread().map(|s| format!("{:.3}", s)).unwrap_or_else(|| "N/A".into());
-    let mid    = book.mid().map(|m| format!("{:.3}", m)).unwrap_or_else(|| "N/A".into());
-
     let title = app.selected_market_id
         .as_ref()
         .and_then(|id| app.markets.iter().find(|m| &m.id == id))
-        .map(|m| format!(" Order Book — {} ", m.title))
+        .map(|m| format!(" Order Book — {} ", trunc(&m.title, 50)))
         .unwrap_or_else(|| " Order Book ".to_string());
+
+    // ── Aggregate stats ───────────────────────────────────────────────────────
+    let total_bid_sz: f64 = book.bids.iter().map(|b| b.size).sum();
+    let total_ask_sz: f64 = book.asks.iter().map(|a| a.size).sum();
+    let imbalance = if total_bid_sz + total_ask_sz > 1e-9 {
+        (total_bid_sz - total_ask_sz) / (total_bid_sz + total_ask_sz)
+    } else { 0.0 };
+    let imb_color = if imbalance > 0.1 { Color::Green } else if imbalance < -0.1 { Color::Red } else { Color::Yellow };
+
+    let spread_pct = book.spread().unwrap_or(0.0) * 100.0;
+    let mid_pct    = book.mid().unwrap_or(0.0) * 100.0;
+
+    // Best bid / ask in cents
+    let best_bid = book.bids.first().map(|b| b.price * 100.0).unwrap_or(0.0);
+    let best_ask = book.asks.first().map(|a| a.price * 100.0).unwrap_or(0.0);
+
+    // ── Depth histogram (max 12 chars wide per side) ──────────────────────────
+    let max_sz = book.bids.iter().chain(book.asks.iter())
+        .map(|l| l.size)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    const BAR_W: usize = 12;
+    let size_bar = |sz: f64| -> String {
+        let filled = ((sz / max_sz) * BAR_W as f64).round() as usize;
+        "█".repeat(filled.min(BAR_W))
+    };
 
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::raw(format!(" Spread: {}  Mid: {}", spread, mid)),
+            Span::styled(" Mid: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢", mid_pct), Style::default().fg(Color::White).bold()),
+            Span::styled("  Spread: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢  ({:.0}bps)", spread_pct, spread_pct * 10.0),
+                Style::default().fg(Color::Yellow)),
+            Span::styled("  Bid: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢", best_bid), Style::default().fg(Color::Green)),
+            Span::styled("  Ask: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}¢", best_ask), Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Imbalance: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:+.2}  (bid {:.0}  ask {:.0})", imbalance, total_bid_sz, total_ask_sz),
+                Style::default().fg(imb_color).bold(),
+            ),
+            Span::styled(
+                if imbalance > 0.15 { "  ← buy pressure" }
+                else if imbalance < -0.15 { "  ← sell pressure" }
+                else { "  ← balanced" },
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("{:>10}  {:>10}  {:>10}  │  {:>10}  {:>10}  {:>10}",
-                    "TOTAL", "SIZE", "BID",
-                    "ASK",   "SIZE", "TOTAL"),
+                format!("  {:>12}  {:>8}  {:>7}  │  {:>7}  {:>8}  {:<12}",
+                    "DEPTH", "SIZE", "BID¢", "ASK¢", "SIZE", "DEPTH"),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -1213,37 +1381,45 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
 
     let bids: Vec<(f64, f64, f64)> = book.bids.iter().take(depth).map(|b| {
         bid_total += b.size;
-        (b.price, b.size, bid_total)
+        (b.price * 100.0, b.size, bid_total)
     }).collect();
     let asks: Vec<(f64, f64, f64)> = book.asks.iter().take(depth).map(|a| {
         ask_total += a.size;
-        (a.price, a.size, ask_total)
+        (a.price * 100.0, a.size, ask_total)
     }).collect();
 
     for i in 0..depth {
         let bid_part = bids.get(i).map(|(p, s, t)| {
+            let bar = size_bar(*s);
             (
-                Span::styled(format!("{:>10.0}", t), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("  {:>10.0}", s), Style::default().fg(Color::White)),
-                Span::styled(format!("  {:>10.3}", p), Style::default().fg(Color::Green).bold()),
+                Span::styled(format!("{:>12}", bar), Style::default().fg(Color::Green)),
+                Span::styled(format!("  {:>8.0}", s), Style::default().fg(Color::White)),
+                Span::styled(format!("  {:>7.1}", p), Style::default().fg(Color::Green).bold()),
+                *t,
             )
         });
         let ask_part = asks.get(i).map(|(p, s, t)| {
+            let bar = size_bar(*s);
             (
-                Span::styled(format!("{:>10.3}", p), Style::default().fg(Color::Red).bold()),
-                Span::styled(format!("  {:>10.0}", s), Style::default().fg(Color::White)),
-                Span::styled(format!("  {:>10.0}", t), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:>7.1}", p), Style::default().fg(Color::Red).bold()),
+                Span::styled(format!("  {:>8.0}", s), Style::default().fg(Color::White)),
+                Span::styled(format!("  {:<12}", bar), Style::default().fg(Color::Red)),
+                *t,
             )
         });
 
+        // Show cumulative total as DarkGray at the far edges
+        let _ = bid_part.as_ref().map(|(.., t)| t);
+        let _ = ask_part.as_ref().map(|(.., t)| t);
+
         let mut spans = Vec::new();
         match bid_part {
-            Some((total, size, price)) => { spans.push(total); spans.push(size); spans.push(price); }
-            None => { spans.push(Span::raw(" ".repeat(34))); }
+            Some((bar, size, price, _)) => { spans.push(bar); spans.push(size); spans.push(price); }
+            None => { spans.push(Span::raw(" ".repeat(30))); }
         }
         spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
         match ask_part {
-            Some((price, size, total)) => { spans.push(price); spans.push(size); spans.push(total); }
+            Some((price, size, bar, _)) => { spans.push(price); spans.push(size); spans.push(bar); }
             None => {}
         }
         lines.push(Line::from(spans));
@@ -1261,7 +1437,7 @@ fn render_orderbook(f: &mut Frame, area: Rect, app: &App) {
 fn render_portfolio(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(9), Constraint::Min(0)])
         .split(area);
 
     render_portfolio_summary(f, chunks[0], app);
@@ -1298,6 +1474,36 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
     let best_color  = if best_pnl  >= 0.0 { Color::Green } else { Color::Red };
     let worst_color = if worst_pnl >= 0.0 { Color::Green } else { Color::Red };
 
+    // ── Category exposure (correlation proxy) ─────────────────────────────────
+    // Group cost by category keyword to show topic concentration risk.
+    let mut cat_exposure: Vec<(String, f64)> = {
+        let mut map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for pos in positions {
+            let cat = app.markets.iter()
+                .find(|m| m.id == pos.market_id)
+                .and_then(|m| m.category.clone())
+                .unwrap_or_else(|| "Other".to_string());
+            *map.entry(cat).or_insert(0.0) += pos.cost();
+        }
+        let mut v: Vec<_> = map.into_iter().collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(4);
+        v
+    };
+    let exposure_str = if cat_exposure.is_empty() {
+        "—".to_string()
+    } else {
+        cat_exposure.iter()
+            .map(|(cat, cost)| format!("{}: ${:.0}", cat, cost))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    // Count positions with stop/target set
+    let with_targets = positions.iter()
+        .filter(|p| p.take_profit.is_some() || p.stop_loss.is_some())
+        .count();
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -1312,7 +1518,7 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("  Positions: "),
             Span::styled(format!("{}", n), Style::default().fg(Color::White)),
             Span::raw(format!("   Win rate: {:.0}%", win_rate)),
-            Span::raw(format!("   Top concentration: {:.0}%", concentration)),
+            Span::raw(format!("   Top conc.: {:.0}%", concentration)),
             Span::raw(format!("   PM: ${:.0}  KL: ${:.0}", pm_cost, kl_cost)),
         ]),
         Line::from(vec![
@@ -1320,10 +1526,15 @@ fn render_portfolio_summary(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(if n > 0 { format!("{:+.2}$", best_pnl)  } else { "—".into() }, Style::default().fg(best_color)),
             Span::raw("   Worst: "),
             Span::styled(if n > 0 { format!("{:+.2}$", worst_pnl) } else { "—".into() }, Style::default().fg(worst_color)),
+            Span::raw(format!("   Targets set: {}/{}", with_targets, n)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Exposure: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&exposure_str[..exposure_str.len().min(70)]),
         ]),
         Line::from(vec![
             Span::styled(
-                "  [n] Add position  [d] Delete selected  [Enter] Load chart",
+                "  [n] Add  [t] Set target  [d] Delete  [Enter] Load chart",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -1356,18 +1567,34 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
             Platform::Kalshi     => Color::Blue,
         };
         let mark = pos.mark_price.unwrap_or(pos.entry_price) * 100.0;
+        let title_str = trunc(&pos.title, 28);
 
-        let title_str = trunc(&pos.title, 30);
+        // Stop / take-profit indicators
+        let target_str = match (pos.take_profit, pos.stop_loss) {
+            (Some(tp), Some(sl)) => format!(" TP:{:.0}¢ SL:{:.0}¢", tp*100.0, sl*100.0),
+            (Some(tp), None)     => format!(" TP:{:.0}¢", tp*100.0),
+            (None,     Some(sl)) => format!(" SL:{:.0}¢", sl*100.0),
+            (None,     None)     => String::new(),
+        };
+
+        // Alert state indicators
+        let alert = if let Some(mark_p) = pos.mark_price {
+            if pos.take_profit.map(|tp| mark_p >= tp).unwrap_or(false) { " 🎯" }
+            else if pos.stop_loss.map(|sl| mark_p <= sl).unwrap_or(false) { " 🛑" }
+            else { "" }
+        } else { "" };
 
         let line = Line::from(vec![
             Span::styled(pos.platform.label(), Style::default().fg(platform_color)),
             Span::raw(" "),
             Span::styled(pos.side.label(), Style::default().fg(Color::White).bold()),
-            Span::raw(format!(" {:>6.1}¢ entry  {:>6.1}¢ mark  ", pos.entry_price * 100.0, mark)),
+            Span::raw(format!(" {:>6.1}¢→{:>6.1}¢  ", pos.entry_price * 100.0, mark)),
             Span::styled(
                 format!("{:+.2}$ ({:+.1}%)", pnl, pnl_pct),
                 Style::default().fg(pnl_color).bold(),
             ),
+            Span::styled(target_str, Style::default().fg(Color::DarkGray)),
+            Span::styled(alert, Style::default().fg(Color::Yellow)),
             Span::raw("  "),
             Span::raw(title_str),
         ]);
@@ -1703,48 +1930,62 @@ fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(62, 88, area);
+    let popup = centered_rect(66, 92, area);
     f.render_widget(Clear, popup);
+
+    let h = |s: &'static str| Line::from(vec![Span::styled(s, Style::default().fg(Color::Cyan).bold())]);
+    let kv = |k: &'static str, v: &'static str| Line::from(vec![
+        Span::styled(format!("  {:<24}", k), Style::default().fg(Color::Yellow)),
+        Span::raw(v),
+    ]);
 
     let lines = vec![
         Line::from(""),
-        Line::from(vec![Span::styled(" Navigation", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  1–8 / Tab / Shift+Tab   Switch tabs"),
-        Line::from("  j / ↓  ·  k / ↑         Navigate list / scroll"),
-        Line::from("  Enter                    Select market → load chart+book+smart money+trades"),
+        h(" Navigation"),
+        kv("1–8 / Tab / Shift+Tab", "Switch tabs directly"),
+        kv("j / ↓  ·  k / ↑", "Navigate list / scroll chat"),
+        kv("Enter", "Select market → load chart + book + trades"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Market Data", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  r                        Refresh market data now"),
-        Line::from("  p                        Cycle platform filter  ALL → PM → KL"),
-        Line::from("  c                        Cycle chart interval   1h→6h→1d→1w→1m"),
-        Line::from("  S (Shift+s)              Cycle sort: ~50% → Volume → EndDate → A-Z"),
-        Line::from("  /                        Enter search/filter mode"),
-        Line::from("  Esc                      Clear search"),
-        Line::from("  E (Shift+e)              Export current tab data to CSV"),
+        h(" Market Data"),
+        kv("r", "Refresh markets + chart + orderbook now"),
+        kv("p", "Cycle platform filter  ALL → PM → KL"),
+        kv("c", "Cycle chart interval  1h → 6h → 1d → 1w → 1m"),
+        kv("S", "Cycle sort  ~50% → Volume → End Date → A-Z"),
+        kv("/", "Enter search / filter mode"),
+        kv("Esc", "Clear search"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Watchlist", Style::default().fg(Color::Yellow).bold())]),
-        Line::from("  w                        Toggle watchlist for selected market  (★)"),
-        Line::from("  W (Shift+w)              Toggle watchlist-only filter"),
-        Line::from("  e                        Edit alert thresholds for watched market"),
+        h(" Signals"),
+        kv("x", "Dismiss selected signal (hidden until restart)"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Portfolio", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  n                        Add position for selected market"),
-        Line::from("  d                        Delete selected position  (Portfolio tab)"),
-        Line::from("  Enter  (Portfolio tab)   Load chart for position's market"),
+        h(" Watchlist"),
+        kv("w", "Toggle watchlist for selected market  (★)"),
+        kv("W", "Toggle watchlist-only filter"),
+        kv("e", "Edit price alert thresholds (above / below)"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Chat / AI", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  a                        Pre-fill AI analysis prompt for market"),
-        Line::from("  Enter                    Send chat message"),
-        Line::from("  ↑ / ↓                   Scroll input history"),
-        Line::from("  k / j                   Scroll chat up / down"),
+        h(" Portfolio"),
+        kv("n", "Add position for selected market"),
+        kv("t", "Set take-profit / stop-loss on selected position"),
+        kv("d", "Delete selected position  (Portfolio tab)"),
+        kv("Enter  (Portfolio tab)", "Load chart for that position's market"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Other", Style::default().fg(Color::Cyan).bold())]),
-        Line::from("  ?                        Toggle this help"),
-        Line::from("  q                        Quit (when input is empty)"),
-        Line::from("  Ctrl+C                   Quit / clear current input"),
+        h(" Export & Research"),
+        kv("E", "Export current tab to CSV  (~/.whoissharp/exports/)"),
+        kv("M", "Export Markdown report for selected market"),
+        kv("!note <text>", "Append timestamped note to research log"),
+        Line::from(""),
+        h(" Chat / AI"),
+        kv("a", "Pre-fill AI analysis prompt for selected market"),
+        kv("Enter", "Send chat message"),
+        kv("↑ / ↓", "Scroll input history"),
+        kv("k / j  (Chat tab)", "Scroll chat history up / down"),
+        Line::from(""),
+        h(" Other"),
+        kv("?", "Toggle this help overlay"),
+        kv("q", "Quit  (saves session automatically)"),
+        kv("Ctrl+C", "Quit / clear current input"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Press ? or Esc to close",
+            "  Press ? or Esc to close                   WhoIsSharp v0.1.0",
             Style::default().fg(Color::DarkGray),
         )]),
     ];
@@ -2121,20 +2362,33 @@ pub async fn run_tui(
             Some(ev) = event_rx.recv() => {
                 match ev {
                     AppEvent::MarketsLoaded(markets) => {
+                        // Snapshot current prices for momentum detection before overwriting
+                        let prev: HashMap<String, f64> = app.markets.iter()
+                            .map(|m| (m.id.clone(), m.yes_price))
+                            .collect();
+
                         app.markets = markets;
                         if app.market_list.selected().is_none() && !app.markets.is_empty() {
                             app.market_list.select(Some(0));
                         }
                         app.update_portfolio_marks();
+                        app.check_position_alerts();
                         app.check_watch_alerts();
-                    }
-                    AppEvent::EventsLoaded(_) => {}  // Events tab removed; ignore
-                    AppEvent::SignalsComputed(sigs) => {
+
+                        // Recompute signals with velocity and dismissed state
+                        let sigs = signals::compute_signals(
+                            &app.markets,
+                            &prev,
+                            &app.dismissed_signals,
+                        );
+                        app.prev_prices = prev;
                         app.signals = sigs;
                         if app.signal_list.selected().is_none() && !app.signals.is_empty() {
                             app.signal_list.select(Some(0));
                         }
                     }
+                    AppEvent::EventsLoaded(_) => {}  // Events tab removed; ignore
+                    AppEvent::SignalsComputed(_) => {} // Now computed inline in MarketsLoaded
                     AppEvent::PriceHistoryLoaded { market_id, candles } => {
                         if Some(&market_id) == app.selected_market_id.as_ref() {
                             app.chart_data = candles
@@ -2370,6 +2624,49 @@ async fn handle_key(
             }
             KC::Enter => {
                 app.advance_pos_input();
+            }
+            KC::Backspace => { app.input.pop(); }
+            KC::Char(c)   => { app.input.push(c); }
+            _ => {}
+        }
+        return false;
+    }
+
+    // ── Stop / take-profit target input flow ──────────────────────────────────
+    if app.target_input_mode {
+        match key.code {
+            KC::Esc => {
+                app.target_input_mode = false;
+                app.input.clear();
+                app.status = "Cancelled.".to_string();
+            }
+            KC::Enter => {
+                let val_str = app.input.trim().to_string();
+                app.input.clear();
+                match app.target_input_step {
+                    TargetInputStep::TakeProfit => {
+                        let tp = if val_str.is_empty() { None }
+                            else { val_str.parse::<f64>().ok().map(|v| v / 100.0) };
+                        if let Some(pos) = app.portfolio.positions.iter_mut()
+                                .find(|p| p.id == app.target_pos_id) {
+                            pos.take_profit = tp;
+                        }
+                        app.target_input_step = TargetInputStep::StopLoss;
+                        app.status = "Take-profit set. Enter stop-loss price (¢, or Enter to skip):".to_string();
+                    }
+                    TargetInputStep::StopLoss => {
+                        let sl = if val_str.is_empty() { None }
+                            else { val_str.parse::<f64>().ok().map(|v| v / 100.0) };
+                        if let Some(pos) = app.portfolio.positions.iter_mut()
+                                .find(|p| p.id == app.target_pos_id) {
+                            pos.stop_loss = sl;
+                        }
+                        let _ = portfolio::save_portfolio(&app.portfolio);
+                        app.target_input_mode = false;
+                        app.target_input_step = TargetInputStep::default();
+                        app.status = "Stop-loss set. Targets saved.".to_string();
+                    }
+                }
             }
             KC::Backspace => { app.input.pop(); }
             KC::Char(c)   => { app.input.push(c); }
