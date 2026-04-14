@@ -26,7 +26,7 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Chart, Dataset, GraphType,
+        Axis, Block, Borders, Chart, Clear, Dataset, GraphType,
         List, ListItem, ListState, Paragraph, Tabs, Wrap,
     },
     Frame, Terminal,
@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use crate::agent::{self, AppEvent};
 use crate::llm::{LlmBackend, LlmMessage};
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
-use crate::portfolio::{self, Portfolio, Position, Side};
+use crate::portfolio::{self, Portfolio, Position, Side, WatchEntry};
 use crate::signals::{Signal, SignalKind};
 use crate::tools::{MarketClients, SmartMoneyWallet};
 
@@ -153,6 +153,18 @@ pub struct App {
     pub sm_loading:       bool,
     pub sm_list:          ListState,
 
+    // Watchlist
+    pub watchlist:        Vec<WatchEntry>,
+    pub watchlist_only:   bool,
+    pub watch_alerts:     Vec<String>,  // recent alert messages
+
+    // Help overlay
+    pub show_help:        bool,
+
+    // Auto-refresh state
+    pub refresh_secs:     u64,
+    pub next_refresh_at:  Option<std::time::Instant>,
+
     // Status
     pub status:            String,
     pub is_loading:        bool,
@@ -215,6 +227,12 @@ impl App {
             sm_coord_pairs:    Vec::new(),
             sm_loading:        false,
             sm_list:           ListState::default(),
+            watchlist:         portfolio::load_watchlist(),
+            watchlist_only:    false,
+            watch_alerts:      Vec::new(),
+            show_help:         false,
+            refresh_secs:      60,
+            next_refresh_at:   None,
             status:            "Loading market data…".to_string(),
             is_loading:        true,
             backend_name,
@@ -230,10 +248,51 @@ impl App {
             .iter()
             .filter(|m| {
                 self.platform_filter.matches(&m.platform)
+                    && (!self.watchlist_only || self.watchlist.iter().any(|w| w.market_id == m.id))
                     && (self.search.is_empty()
                         || m.title.to_lowercase().contains(&self.search.to_lowercase()))
             })
             .collect()
+    }
+
+    pub fn is_watched(&self, market_id: &str) -> bool {
+        self.watchlist.iter().any(|w| w.market_id == market_id)
+    }
+
+    pub fn toggle_watchlist(&mut self, market: &Market) {
+        if self.is_watched(&market.id) {
+            self.watchlist.retain(|w| w.market_id != market.id);
+            self.status = format!("Removed '{}' from watchlist", &market.title[..market.title.len().min(40)]);
+        } else {
+            self.watchlist.push(WatchEntry::new(market.id.clone(), market.title.clone()));
+            self.status = format!("Added '{}' to watchlist  [★ {} watched]", &market.title[..market.title.len().min(30)], self.watchlist.len());
+        }
+        let _ = portfolio::save_watchlist(&self.watchlist);
+    }
+
+    /// Check watched markets against live prices and collect alert messages.
+    pub fn check_watch_alerts(&mut self) {
+        self.watch_alerts.clear();
+        for entry in &self.watchlist {
+            if let Some(m) = self.markets.iter().find(|m| m.id == entry.market_id) {
+                if entry.alert_above < 1.0 && m.yes_price > entry.alert_above {
+                    self.watch_alerts.push(format!(
+                        "⚡ {} crossed ABOVE {:.0}¢ (now {:.0}¢)",
+                        &m.title[..m.title.len().min(30)],
+                        entry.alert_above * 100.0,
+                        m.yes_price * 100.0,
+                    ));
+                }
+                if entry.alert_below > 0.0 && m.yes_price < entry.alert_below {
+                    self.watch_alerts.push(format!(
+                        "⚡ {} dropped BELOW {:.0}¢ (now {:.0}¢)",
+                        &m.title[..m.title.len().min(30)],
+                        entry.alert_below * 100.0,
+                        m.yes_price * 100.0,
+                    ));
+                }
+            }
+        }
     }
 
     pub fn selected_market(&self) -> Option<&Market> {
@@ -495,6 +554,11 @@ fn render(f: &mut Frame, app: &App) {
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
+
+    // Help overlay renders on top of everything
+    if app.show_help {
+        render_help_overlay(f, area);
+    }
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
@@ -722,7 +786,11 @@ fn render_markets(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
-    let filter_label = app.platform_filter.label();
+    let filter_label = if app.watchlist_only {
+        format!("★ {}", app.platform_filter.label())
+    } else {
+        app.platform_filter.label().to_string()
+    };
     let search_label = if app.search.is_empty() {
         String::new()
     } else {
@@ -743,9 +811,11 @@ fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
             let pct_color = price_color(m.yes_price);
             let vol = format_volume(m.volume);
 
-            let title_str = trunc(&m.title, 32);
+            let title_str = trunc(&m.title, 30);
+            let watch_star = if app.is_watched(&m.id) { "★" } else { " " };
 
             let line = Line::from(vec![
+                Span::styled(watch_star, Style::default().fg(Color::Yellow)),
                 Span::styled(m.platform.label(), Style::default().fg(platform_color)),
                 Span::raw(" "),
                 Span::styled(format!("{:5.1}%", pct), Style::default().fg(pct_color).bold()),
@@ -1320,20 +1390,125 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(coord_p, chunks[1]);
 }
 
+// ── Help overlay ─────────────────────────────────────────────────────────────
+
+fn centered_rect(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
+}
+
+fn render_help_overlay(f: &mut Frame, area: Rect) {
+    let popup = centered_rect(62, 88, area);
+    f.render_widget(Clear, popup);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(" Navigation", Style::default().fg(Color::Cyan).bold())]),
+        Line::from("  1–7 / Tab / Shift+Tab   Switch tabs"),
+        Line::from("  j / ↓  ·  k / ↑         Navigate list / scroll"),
+        Line::from("  Enter                    Select market → load chart+book+smart money"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Market Data", Style::default().fg(Color::Cyan).bold())]),
+        Line::from("  r                        Refresh market data now"),
+        Line::from("  p                        Cycle platform filter  ALL → PM → KL"),
+        Line::from("  c                        Cycle chart interval   1h→6h→1d→1w→1m"),
+        Line::from("  /                        Enter search/filter mode"),
+        Line::from("  Esc                      Clear search"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Watchlist", Style::default().fg(Color::Yellow).bold())]),
+        Line::from("  w                        Toggle watchlist for selected market  (★)"),
+        Line::from("  W (Shift+w)              Toggle watchlist-only filter"),
+        Line::from("  Alerts shown in status bar when a watched market crosses a threshold"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Portfolio", Style::default().fg(Color::Cyan).bold())]),
+        Line::from("  n                        Add position for selected market"),
+        Line::from("  d                        Delete selected position  (Portfolio tab)"),
+        Line::from("  Enter  (Portfolio tab)   Load chart for position's market"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Chat / AI", Style::default().fg(Color::Cyan).bold())]),
+        Line::from("  a                        Pre-fill AI analysis prompt for market"),
+        Line::from("  Enter                    Send chat message"),
+        Line::from("  ↑ / ↓                   Scroll input history"),
+        Line::from("  k / j                   Scroll chat up / down"),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Other", Style::default().fg(Color::Cyan).bold())]),
+        Line::from("  ?                        Toggle this help"),
+        Line::from("  q                        Quit (when input is empty)"),
+        Line::from("  Ctrl+C                   Quit / clear current input"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Press ? or Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" WhoIsSharp — Key Bindings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, popup);
+}
+
 // ── Status bar ────────────────────────────────────────────────────────────────
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
-    let filter = app.platform_filter.label();
+    let filter   = app.platform_filter.label();
     let interval = app.chart_interval.label();
+
+    // Refresh countdown
+    let refresh_str = match app.next_refresh_at {
+        Some(t) => {
+            let secs = t.saturating_duration_since(std::time::Instant::now()).as_secs();
+            format!(" ↺{}s ", secs)
+        }
+        None => " ↺off ".to_string(),
+    };
+
+    // Watchlist indicator
+    let wl_str = if app.watchlist.is_empty() {
+        String::new()
+    } else {
+        format!(" ★{} ", app.watchlist.len())
+    };
+    let wl_color = if app.watchlist_only { Color::Yellow } else { Color::DarkGray };
+
+    // Alert or status text
+    let status_text = if !app.watch_alerts.is_empty() {
+        app.watch_alerts.join("  ")
+    } else {
+        app.status.clone()
+    };
+    let status_color = if !app.watch_alerts.is_empty() { Color::Yellow } else { Color::White };
+
     let line = Line::from(vec![
         Span::styled(
             if app.is_loading { " ⟳ Loading " } else { " ● Ready   " },
             Style::default().fg(if app.is_loading { Color::Yellow } else { Color::Green }),
         ),
         Span::raw(format!(" {}  Chart:{}  ", filter, interval)),
+        Span::styled(refresh_str, Style::default().fg(Color::DarkGray)),
+        Span::styled(wl_str, Style::default().fg(wl_color)),
         Span::styled("│", Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
-        Span::styled(&app.status, Style::default().fg(Color::White)),
+        Span::styled(status_text, Style::default().fg(status_color)),
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::DarkGray)),
@@ -1583,6 +1758,7 @@ pub async fn run_tui(
     backend:      Option<Arc<dyn LlmBackend>>,
     clients:      Arc<MarketClients>,
     backend_name: String,
+    refresh_secs: u64,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1592,6 +1768,7 @@ pub async fn run_tui(
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(backend_name);
+    app.refresh_secs = refresh_secs;
     let mut llm_history: Vec<LlmMessage> = Vec::new();
 
     // Kick off initial market data refresh
@@ -1601,12 +1778,43 @@ pub async fn run_tui(
         tokio::spawn(async move { agent::refresh_markets(clients_clone, tx).await });
     }
 
+    // Auto-refresh ticker (fires every refresh_secs; disabled when refresh_secs == 0)
+    let mut refresh_ticker: Option<tokio::time::Interval> = if refresh_secs > 0 {
+        let mut iv = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(refresh_secs),
+            std::time::Duration::from_secs(refresh_secs),
+        );
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        app.next_refresh_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(refresh_secs));
+        Some(iv)
+    } else {
+        None
+    };
+
     let mut term_events = EventStream::new();
 
     loop {
         terminal.draw(|f| render(f, &app))?;
 
         tokio::select! {
+            // ── Auto-refresh tick ──────────────────────────────────────────────
+            _ = async {
+                match &mut refresh_ticker {
+                    Some(iv) => iv.tick().await,
+                    None     => { std::future::pending::<tokio::time::Instant>().await }
+                }
+            } => {
+                let clients_c = clients.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+                if app.refresh_secs > 0 {
+                    app.next_refresh_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(app.refresh_secs)
+                    );
+                }
+            }
+
             Some(ev) = event_rx.recv() => {
                 match ev {
                     AppEvent::MarketsLoaded(markets) => {
@@ -1615,6 +1823,7 @@ pub async fn run_tui(
                             app.market_list.select(Some(0));
                         }
                         app.update_portfolio_marks();
+                        app.check_watch_alerts();
                     }
                     AppEvent::EventsLoaded(_) => {}  // Events tab removed; ignore
                     AppEvent::SignalsComputed(sigs) => {
@@ -1958,6 +2167,41 @@ async fn handle_key(
             app.chart_data.clear();
             app.status = format!("Chart interval: {}", app.chart_interval.label());
             trigger_chart_load(app, clients, event_tx).await;
+        }
+
+        // ── Help overlay ─────────────────────────────────────────────────────
+        KC::Char('?') if app.input.is_empty() => {
+            app.show_help = !app.show_help;
+        }
+        KC::Esc if app.show_help => {
+            app.show_help = false;
+        }
+
+        // ── Watchlist toggle ──────────────────────────────────────────────────
+        KC::Char('w') if app.input.is_empty() => {
+            let market_info = match app.active_tab {
+                AppTab::Markets   => app.selected_market().map(|m| m.clone()),
+                AppTab::Signals   => app.selected_signal()
+                    .and_then(|s| app.markets.iter().find(|m| m.id == s.id_a))
+                    .cloned(),
+                _ => app.selected_market().map(|m| m.clone()),
+            };
+            if let Some(m) = market_info {
+                app.toggle_watchlist(&m);
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+        }
+
+        // ── Watchlist-only filter (Shift+W) ───────────────────────────────────
+        KC::Char('W') if app.input.is_empty() => {
+            app.watchlist_only = !app.watchlist_only;
+            app.market_list.select(Some(0));
+            app.status = if app.watchlist_only {
+                format!("Watchlist filter ON  ({} markets)", app.watchlist.len())
+            } else {
+                "Watchlist filter OFF".to_string()
+            };
         }
 
         // ── Ask AI ────────────────────────────────────────────────────────────

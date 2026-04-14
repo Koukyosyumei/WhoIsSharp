@@ -66,6 +66,10 @@ struct Cli {
     /// Vertex AI region (Gemini backend) [default: us-central1]
     #[arg(long)]
     location: Option<String>,
+
+    /// Auto-refresh interval in seconds (0 = disabled) [default: 60]
+    #[arg(long, short = 'R', default_value = "60")]
+    refresh: u64,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -116,7 +120,7 @@ async fn main() -> Result<()> {
 
     let clients = Arc::new(MarketClients::new());
 
-    tui::run_tui(backend, clients, backend_name).await?;
+    tui::run_tui(backend, clients, backend_name, cli.refresh).await?;
 
     Ok(())
 }

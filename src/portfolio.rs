@@ -198,6 +198,59 @@ pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
     Ok(())
 }
 
+// ─── Watchlist ────────────────────────────────────────────────────────────────
+
+fn watchlist_path() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".whoissharp");
+    p.push("watchlist.json");
+    p
+}
+
+/// A watched market entry — stores the market ID and an optional price alert
+/// threshold so we can fire a status-bar notification when the price crosses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchEntry {
+    pub market_id: String,
+    pub title:     String,
+    /// Alert fires when YES price falls below this value (0.0 = no alert).
+    pub alert_below: f64,
+    /// Alert fires when YES price rises above this value (1.0 = no alert).
+    pub alert_above: f64,
+}
+
+impl WatchEntry {
+    pub fn new(market_id: impl Into<String>, title: impl Into<String>) -> Self {
+        WatchEntry {
+            market_id:   market_id.into(),
+            title:       title.into(),
+            alert_below: 0.0,
+            alert_above: 1.0,
+        }
+    }
+}
+
+pub fn load_watchlist() -> Vec<WatchEntry> {
+    let path = watchlist_path();
+    if !path.exists() { return Vec::new(); }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_)   => Vec::new(),
+    }
+}
+
+pub fn save_watchlist(watchlist: &[WatchEntry]) -> Result<()> {
+    let path = watchlist_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create directory '{}'", parent.display()))?;
+    }
+    let data = serde_json::to_string_pretty(watchlist)?;
+    std::fs::write(&path, data)
+        .with_context(|| format!("Cannot write watchlist to '{}'", path.display()))?;
+    Ok(())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
