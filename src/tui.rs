@@ -1709,7 +1709,7 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     let risk = risk::compute(&app.portfolio, &app.markets);
 
     let outer_block = Block::default()
-        .title(" Portfolio Risk Analysis  [v] or [/risk] to toggle ")
+        .title(" Portfolio Risk Analysis  [Esc] or [v] to return ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = outer_block.inner(area);
@@ -4453,7 +4453,7 @@ async fn dispatch_slash_command(
         "v" | "risk" => {
             app.show_risk_view = !app.show_risk_view;
             app.status = if app.show_risk_view {
-                "Risk view — E[P&L], σ, scenario analysis  (v or /risk to toggle back)".to_string()
+                "Risk view — E[P&L], σ, scenario analysis  (Esc or v to return)".to_string()
             } else {
                 "Positions view  (v or /risk for risk analysis)".to_string()
             };
@@ -4867,6 +4867,14 @@ async fn handle_key(
         }
         // Close wallet detail panel (SmartMoney tab)
         KC::Esc if app.input.is_empty()
+            && app.active_tab == AppTab::Portfolio
+            && app.show_risk_view =>
+        {
+            app.show_risk_view = false;
+            app.status = "Positions view  (v or /risk for risk analysis)".to_string();
+        }
+
+        KC::Esc if app.input.is_empty()
             && app.active_tab == AppTab::SmartMoney
             && (app.sm_detail.is_some() || app.sm_detail_loading) =>
         {
@@ -4894,7 +4902,7 @@ async fn handle_key(
         KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
             app.show_risk_view = !app.show_risk_view;
             app.status = if app.show_risk_view {
-                "Risk view — E[P&L], σ, scenario analysis  (v or /risk to toggle back)".to_string()
+                "Risk view — E[P&L], σ, scenario analysis  (Esc or v to return)".to_string()
             } else {
                 "Positions view  (v or /risk for risk analysis)".to_string()
             };
