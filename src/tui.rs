@@ -208,7 +208,8 @@ pub struct App {
 
     // Filter / search
     pub platform_filter:   PlatformFilter,
-    pub search:            String,
+    pub search:            String,      // active market filter (persists after command bar closes)
+    pub command_input:     String,      // text being typed in the command bar (not a live filter)
     pub search_mode:       bool,
     pub chart_interval:    ChartInterval,
 
@@ -358,6 +359,7 @@ impl App {
             book_scroll:       0,
             platform_filter:   PlatformFilter::All,
             search:            String::new(),
+            command_input:     String::new(),
             search_mode:       false,
             chart_interval:    ChartInterval::OneWeek,
             chat_msgs:         Vec::new(),
@@ -1652,7 +1654,7 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     use crate::risk;
 
     if app.portfolio.positions.is_empty() {
-        let p = Paragraph::new("No positions to analyse. Add positions from the Markets tab (n).")
+        let p = Paragraph::new("No positions to analyse. Add positions from the Markets tab (/add).")
             .block(Block::default().title(" Portfolio Risk Analysis ").borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)));
         f.render_widget(p, area);
@@ -1662,7 +1664,7 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     let risk = risk::compute(&app.portfolio, &app.markets);
 
     let outer_block = Block::default()
-        .title(" Portfolio Risk Analysis  [v] back to positions ")
+        .title(" Portfolio Risk Analysis  [v] or [/risk] to toggle ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
     let inner = outer_block.inner(area);
@@ -3246,7 +3248,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let (prompt, content): (&str, &str) = if app.search_mode {
-        ("/ ", &app.search)
+        ("/ ", &app.command_input)
     } else if app.pos_input_mode {
         ("pos> ", &app.input)
     } else {
@@ -3839,7 +3841,8 @@ async fn dispatch_slash_command(
 ) -> SlashCmd {
     type AppTab = Tab;
     let cmd = raw.trim().to_lowercase();
-    match cmd.as_str() {
+    let cmd_word = cmd.split_whitespace().next().unwrap_or("");
+    match cmd_word {
         // ── quit ─────────────────────────────────────────────────────────────
         "q" | "quit" => SlashCmd::Quit,
 
@@ -4072,9 +4075,9 @@ async fn dispatch_slash_command(
         "v" | "risk" => {
             app.show_risk_view = !app.show_risk_view;
             app.status = if app.show_risk_view {
-                "Risk view — E[P&L], σ, scenario analysis  (use /risk to toggle back)".to_string()
+                "Risk view — E[P&L], σ, scenario analysis  (v or /risk to toggle back)".to_string()
             } else {
-                "Positions view  (use /risk for risk analysis)".to_string()
+                "Positions view  (v or /risk for risk analysis)".to_string()
             };
             SlashCmd::Handled
         }
@@ -4154,6 +4157,7 @@ async fn handle_key(
         if any_mode {
             app.input.clear();
             app.search.clear();
+            app.command_input.clear();
             app.sent_cursor = None;
             app.search_mode       = false;
             app.pos_input_mode    = false;
@@ -4329,13 +4333,13 @@ async fn handle_key(
         match key.code {
             KC::Esc => {
                 app.search_mode = false;
-                app.search.clear();
+                app.command_input.clear();
                 app.status = "Cancelled.".to_string();
             }
             KC::Enter => {
-                let typed = app.search.clone();
+                let typed = app.command_input.clone();
                 app.search_mode = false;
-                app.search.clear();
+                app.command_input.clear();
                 if typed.is_empty() {
                     app.status = "Cancelled.".to_string();
                     return false;
@@ -4352,8 +4356,8 @@ async fn handle_key(
                     }
                 }
             }
-            KC::Backspace => { app.search.pop(); }
-            KC::Char(c) => { app.search.push(c); }
+            KC::Backspace => { app.command_input.pop(); }
+            KC::Char(c) => { app.command_input.push(c); }
             _ => {}
         }
         return false;
@@ -4472,7 +4476,7 @@ async fn handle_key(
         // ── Command bar ───────────────────────────────────────────────────────────
         KC::Char('/') if app.input.is_empty() => {
             app.search_mode = true;
-            app.search.clear();
+            app.command_input.clear();
         }
         // Close wallet detail panel (SmartMoney tab)
         KC::Esc if app.input.is_empty()
@@ -4497,6 +4501,16 @@ async fn handle_key(
         // ── Help overlay ──────────────────────────────────────────────────────
         KC::Char('?') if app.input.is_empty() => {
             app.show_help = !app.show_help;
+        }
+
+        // ── Risk view toggle (Portfolio tab) ─────────────────────────────────
+        KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
+            app.show_risk_view = !app.show_risk_view;
+            app.status = if app.show_risk_view {
+                "Risk view — E[P&L], σ, scenario analysis  (v or /risk to toggle back)".to_string()
+            } else {
+                "Positions view  (v or /risk for risk analysis)".to_string()
+            };
         }
 
         // ── Refresh shortcut ──────────────────────────────────────────────────
