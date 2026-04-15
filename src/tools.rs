@@ -73,6 +73,7 @@ async fn dispatch_inner(
         "get_wallet_positions" => get_wallet_positions(clients, args).await,
         "kelly_size"          => kelly_size(clients, args).await,
         "search_news"         => search_news(clients, args).await,
+        "get_market_news"     => get_market_news(clients, args).await,
         _                     => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
@@ -193,19 +194,21 @@ async fn get_market(clients: &MarketClients, args: &serde_json::Value) -> Result
             } else {
                 String::new()
             };
+            let platform_str = m.platform.to_string();
             let out = format!(
-                "Market: {title}\nPlatform: {platform}\nCondition ID (use for get_market, find_smart_money, analyze_insider): {id}{token_line}\nStatus: {status}\nCategory: {cat}\nYES: {yes:.1}%  NO: {no:.1}%\nVolume: {vol}  Liquidity: {liq}\nEnds: {end}\nDescription: {desc}",
-                title    = m.title,
-                platform = m.platform,
-                id       = m.id,
-                status   = m.status,
-                cat      = m.category.as_deref().unwrap_or("N/A"),
-                yes      = m.yes_price * 100.0,
-                no       = m.no_price  * 100.0,
-                vol      = vol,
-                liq      = liq,
-                end      = m.end_date.as_deref().unwrap_or("N/A"),
-                desc     = m.description.as_deref().unwrap_or("N/A"),
+                "Market: {title}\nPlatform: {platform}\nCondition ID (use for get_market, find_smart_money, analyze_insider): {id}{token_line}\nStatus: {status}\nCategory: {cat}\nYES: {yes:.1}%  NO: {no:.1}%\nVolume: {vol}  Liquidity: {liq}\nEnds: {end}\nDescription: {desc}\n\n[Tip: call get_market_news(market_id=\"{id}\", platform=\"{platform_lc}\") to fetch recent news for this market before forming your probability estimate.]",
+                title      = m.title,
+                platform   = m.platform,
+                platform_lc = platform_str.to_lowercase(),
+                id         = m.id,
+                status     = m.status,
+                cat        = m.category.as_deref().unwrap_or("N/A"),
+                yes        = m.yes_price * 100.0,
+                no         = m.no_price  * 100.0,
+                vol        = vol,
+                liq        = liq,
+                end        = m.end_date.as_deref().unwrap_or("N/A"),
+                desc       = m.description.as_deref().unwrap_or("N/A"),
             );
             Ok(ToolOutput::ok(out))
         }
@@ -1662,8 +1665,63 @@ async fn search_news(clients: &MarketClients, args: &serde_json::Value) -> Resul
         return Ok(ToolOutput::ok(format!("No recent news found for query: '{}'", query)));
     }
 
-    let mut out = vec![format!("=== NEWS: '{}' ({} results) ===\n", query, articles.len())];
-    for a in &articles {
+    Ok(ToolOutput::ok(format_news_articles(query, &articles)))
+}
+
+/// Fetch news contextually relevant to a specific prediction market.
+///
+/// Looks up the market title, extracts key terms automatically (same
+/// stop-word removal as the UI's [0] key), then calls newsdata.io.
+async fn get_market_news(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let market_id = args["market_id"].as_str().unwrap_or("").trim();
+    let platform  = args["platform"].as_str().unwrap_or("polymarket");
+    let limit     = args["limit"].as_u64().unwrap_or(8).min(10) as u8;
+
+    if market_id.is_empty() {
+        return Ok(ToolOutput::err("Required: market_id"));
+    }
+
+    let Some(news) = &clients.news else {
+        return Ok(ToolOutput::err(
+            "News API not configured. Set the NEWSDATA_API_KEY environment variable."
+        ));
+    };
+
+    // Resolve the market title.
+    let markets = match platform {
+        "polymarket" => clients.polymarket.fetch_markets(200, None, None).await
+            .context("Failed to fetch Polymarket markets")?,
+        "kalshi" => clients.kalshi.fetch_markets(200, None).await
+            .context("Failed to fetch Kalshi markets")?,
+        _ => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),
+    };
+
+    let market = markets.iter()
+        .find(|m| m.id.eq_ignore_ascii_case(market_id))
+        .or_else(|| markets.iter().find(|m| m.title.to_lowercase().contains(&market_id.to_lowercase())));
+
+    let Some(m) = market else {
+        return Ok(ToolOutput::err(format!("Market '{}' not found on {}", market_id, platform)));
+    };
+
+    let articles = news.fetch_for_market(&m.title, limit).await
+        .context("newsdata.io fetch failed")?;
+
+    if articles.is_empty() {
+        return Ok(ToolOutput::ok(format!(
+            "No recent news found for market: '{}'\nQuery terms extracted: (none — title may be too generic; try search_news with custom terms)",
+            m.title
+        )));
+    }
+
+    // Prefix with the market title and extracted query so the LLM has full context.
+    let header = format!("=== NEWS for market: '{}' ===", m.title);
+    Ok(ToolOutput::ok(format!("{}\n{}", header, format_news_articles(&m.title, &articles))))
+}
+
+fn format_news_articles(label: &str, articles: &[crate::news::NewsArticle]) -> String {
+    let mut out = vec![format!("=== NEWS: '{}' ({} results) ===\n", label, articles.len())];
+    for a in articles {
         let sentiment = match a.sentiment.as_deref() {
             Some("positive") => " [+positive]",
             Some("negative") => " [-negative]",
@@ -1676,10 +1734,14 @@ async fn search_news(clients: &MarketClients, args: &serde_json::Value) -> Resul
             let desc: String = a.description.chars().take(200).collect();
             out.push(format!("  {}", desc));
         }
+        if let Some(kw) = &a.keywords {
+            if !kw.is_empty() {
+                out.push(format!("  Keywords: {}", kw.join(", ")));
+            }
+        }
         out.push(format!("  {}\n", a.link));
     }
-
-    Ok(ToolOutput::ok(out.join("\n")))
+    out.join("\n")
 }
 
 // ─── Kelly criterion position sizing ─────────────────────────────────────────
@@ -2074,11 +2136,39 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "get_market_news".into(),
+            description: "Fetch recent news articles relevant to a specific prediction market. \
+                Automatically extracts the most informative terms from the market title and \
+                queries newsdata.io. ALWAYS call this immediately after get_market before \
+                forming any probability estimate — news context is essential for calibrated \
+                predictions. Returns titles, sources, publication age, sentiment, and keywords. \
+                Requires NEWSDATA_API_KEY to be configured.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "market_id": {
+                        "type": "string",
+                        "description": "The market's condition ID (or ticker for Kalshi)."
+                    },
+                    "platform": {
+                        "type": "string",
+                        "enum": ["polymarket", "kalshi"],
+                        "description": "Which platform the market belongs to. Default: polymarket."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of articles to return (1–10). Default 8."
+                    }
+                },
+                "required": ["market_id"]
+            }),
+        },
+        ToolDefinition {
             name: "search_news".into(),
-            description: "Search for recent news articles relevant to a topic, market, or entity. \
-                Returns titles, sources, publication age, sentiment labels, and descriptions. \
-                Use this to add real-world context when analysing a market — e.g. search for \
-                the key participants or event before giving a probability assessment. \
+            description: "Search for recent news articles by custom query terms. Use when you want \
+                to investigate a specific angle not captured by get_market_news — e.g. a related \
+                entity, a second search with refined terms, or cross-checking a specific claim. \
+                Returns titles, sources, publication age, sentiment labels, keywords, and descriptions. \
                 Requires NEWSDATA_API_KEY to be configured.".into(),
             parameters: json!({
                 "type": "object",
