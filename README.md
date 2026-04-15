@@ -13,6 +13,13 @@
 
 WhoIsSharp is a Bloomberg-style terminal for [Polymarket](https://polymarket.com) and [Kalshi](https://kalshi.com) that embeds a full AI analyst. It detects cross-platform arbitrage, spots informed flow before it moves the market, and sizes positions with the Kelly criterion.
 
+
+<p align="center">
+  <a href="https://github.com/Koukyosyumei/WhoIsSharp/" target="_blank">
+      <img src="./assets/main.gif" alt="main.gif" height="500">
+  </a>
+</p>
+
 ---
 
 ## Features
