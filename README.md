@@ -33,6 +33,12 @@ WhoIsSharp is a Bloomberg-style terminal for [Polymarket](https://polymarket.com
 | `50/50` | Price within 5pp of 50% — maximum uncertainty |
 | `THIN` | Very low liquidity, high adverse-selection risk |
 
+**News feed** (Tab 0)
+- Per-market news from [newsdata.io](https://newsdata.io) (free tier: 200 req/day)
+- Sentiment badges: `+` positive · `-` negative · `~` neutral
+- The AI automatically fetches news before any probability estimate via `get_market_news`
+- Set `NEWSDATA_API_KEY` to enable (get a free key at https://newsdata.io)
+
 **Cross-platform pairs** (Tab 9)
 - Jaccard keyword matching always on; LLM semantic matching on demand
 - Net arbitrage after estimated transaction fees (2% per leg)
@@ -105,6 +111,7 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | `1`–`9` | Switch tabs directly |
+| `0` | Open News tab for selected market |
 | `Tab` / `Shift+Tab` | Cycle tabs |
 | `j` / `k` | Navigate list / scroll |
 | `Enter` | Select market (loads chart + book) / send chat |
@@ -139,6 +146,9 @@ cargo build --release
 | `/risk` or `/v` | Toggle risk/exposure view (Portfolio tab) |
 | `/pairs` or `/l` | Re-run LLM pair matching (Pairs tab) |
 | `/lower` / `/raise` | Adjust threshold (SmartMoney / Pairs tab) |
+| `/wallet <0x…>` | Import Polymarket wallet positions into portfolio |
+| `/wallet sync` | Re-sync all registered wallet addresses |
+| `/wallet analyze` or `/wa` | Ask AI to analyse registered wallet(s) |
 | `/export` or `/csv` | Export current tab to CSV |
 | `/report` or `/m` | Export Markdown research report |
 | `/help` or `/?` | Toggle help overlay |
@@ -159,6 +169,11 @@ cargo build --release
 | OpenAI | `OPENAI_API_KEY` | `--backend openai` |
 | Ollama (local) | — | `--backend ollama --model llama3.2` |
 | None (data only) | — | _(default)_ |
+
+**Optional: news feed**
+
+Set `NEWSDATA_API_KEY` to enable Tab 0 and the AI's `get_market_news` tool.
+Get a free key (200 req/day) at [https://newsdata.io](https://newsdata.io).
 
 Override any model: `--model claude-opus-4-6` or `WHOISSHARP_MODEL=<id>`.
 
