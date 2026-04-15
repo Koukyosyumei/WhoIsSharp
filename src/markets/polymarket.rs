@@ -323,6 +323,53 @@ impl PolymarketClient {
 
         Ok(candles)
     }
+
+    /// Fetch current open positions for a Polymarket wallet address.
+    ///
+    /// Hits `data-api.polymarket.com/positions?user=<addr>&sizeThreshold=.1`.
+    /// The `sizeThreshold` drops dust positions (< 0.1 shares).
+    pub async fn fetch_wallet_positions(&self, wallet: &str) -> Result<Vec<WalletPosition>> {
+        let url = format!(
+            "{}/positions?user={}&sizeThreshold=.1",
+            DATA_BASE,
+            urlencoding::encode(wallet),
+        );
+        // Use a short TTL — positions change with every trade.
+        let body = self.cached_get(&url, 30).await
+            .context("Polymarket data-api /positions request failed")?;
+        let raw: Vec<RawWalletPosition> =
+            serde_json::from_str(&body).context("Failed to parse Polymarket /positions")?;
+        Ok(raw.into_iter().map(|r| WalletPosition {
+            condition_id:  r.condition_id,
+            title:         r.title,
+            outcome:       r.outcome,
+            outcome_index: r.outcome_index,
+            size:          r.size,
+            avg_price:     r.avg_price,
+            current_value: r.current_value,
+        }).collect())
+    }
+}
+
+// ─── Public position type ─────────────────────────────────────────────────────
+
+/// A current open position held by a Polymarket wallet.
+#[derive(Debug, Clone)]
+pub struct WalletPosition {
+    /// Market condition ID.
+    pub condition_id:  String,
+    /// Market title.
+    pub title:         String,
+    /// Outcome label ("Yes" / "No" / custom).
+    pub outcome:       String,
+    /// 0 = first outcome (usually YES), 1 = second (usually NO).
+    pub outcome_index: i64,
+    /// Number of shares held.
+    pub size:          f64,
+    /// Average entry price per share (0.0–1.0).
+    pub avg_price:     f64,
+    /// Current market value in USDC.
+    pub current_value: f64,
 }
 
 // ─── Public trade record type ─────────────────────────────────────────────────
@@ -467,6 +514,25 @@ struct ClobLevel {
 #[derive(Deserialize, Debug)]
 struct PricesHistoryResponse {
     history: Vec<HistoryPoint>,
+}
+
+/// Raw position record from `data-api.polymarket.com/positions`.
+#[derive(Deserialize, Debug)]
+struct RawWalletPosition {
+    #[serde(rename = "conditionId", default)]
+    condition_id:  String,
+    #[serde(default)]
+    title:         String,
+    #[serde(default)]
+    outcome:       String,
+    #[serde(rename = "outcomeIndex", default)]
+    outcome_index: i64,
+    #[serde(default)]
+    size:          f64,
+    #[serde(rename = "avgPrice", default)]
+    avg_price:     f64,
+    #[serde(rename = "currentValue", default)]
+    current_value: f64,
 }
 
 /// Raw trade/activity record from `data-api.polymarket.com/trades`.

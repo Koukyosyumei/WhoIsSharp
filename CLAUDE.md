@@ -94,6 +94,9 @@ src/
 | `/wf`                         | Toggle watchlist-only filter                      |
 | `/alert` or `/e`              | Edit price alert thresholds (above / below)       |
 | `/add` or `/n`                | Add position for selected market                  |
+| `/wallet <0x…>`               | Import Polymarket wallet positions into portfolio  |
+| `/wallet sync`                | Re-sync all registered wallet addresses           |
+| `/wallet analyze` or `/wa`    | Ask AI to analyse registered wallet(s)            |
 | `/targets` or `/t`            | Set take-profit / stop-loss                       |
 | `/delete` or `/d`             | Delete selected position (Portfolio tab)          |
 | `/dismiss` or `/x`            | Dismiss selected signal (hidden until restart)    |

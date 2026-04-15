@@ -57,6 +57,13 @@ pub enum AppEvent {
     RefreshDone,
     RefreshError(String),
 
+    // ── Wallet portfolio import ───────────────────────────────────────────────
+    WalletImportStarted  { wallet: String },
+    WalletImportDone     { wallet: String, imported: usize, skipped: usize },
+    WalletImportError    { wallet: String, error: String },
+    /// The actual position objects to splice into app.portfolio.
+    WalletPositionsReady(Vec<crate::portfolio::Position>),
+
     /// Carry conversation history back to the TUI after each agent turn so it
     /// persists across multiple user messages.
     HistoryUpdated(Vec<crate::llm::LlmMessage>),

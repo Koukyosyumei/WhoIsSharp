@@ -206,6 +206,38 @@ pub fn save_portfolio(portfolio: &Portfolio) -> Result<()> {
     Ok(())
 }
 
+// ─── Wallet registry ─────────────────────────────────────────────────────────
+
+fn wallets_path() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".whoissharp");
+    p.push("wallets.json");
+    p
+}
+
+/// Load the list of registered Polymarket wallet addresses.
+pub fn load_wallets() -> Vec<String> {
+    let path = wallets_path();
+    if !path.exists() { return Vec::new(); }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_)   => Vec::new(),
+    }
+}
+
+/// Persist the wallet address list.
+pub fn save_wallets(wallets: &[String]) -> Result<()> {
+    let path = wallets_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create directory '{}'", parent.display()))?;
+    }
+    let data = serde_json::to_string_pretty(wallets)?;
+    std::fs::write(&path, data)
+        .with_context(|| format!("Cannot write wallets to '{}'", path.display()))?;
+    Ok(())
+}
+
 // ─── Watchlist ────────────────────────────────────────────────────────────────
 
 fn watchlist_path() -> PathBuf {

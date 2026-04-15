@@ -311,6 +311,9 @@ pub struct App {
     pub kelly_input:       String,
     pub kelly_my_prob:     Option<f64>,
     pub kelly_bankroll:    f64,    // remembered across calls
+
+    // Registered Polymarket wallet addresses for portfolio sync
+    pub wallet_addresses:  Vec<String>,
 }
 
 // Position add-flow state machine
@@ -418,6 +421,7 @@ impl App {
             kelly_input:       String::new(),
             kelly_my_prob:     None,
             kelly_bankroll:    10_000.0,
+            wallet_addresses:  portfolio::load_wallets(),
         }
     }
 
@@ -2015,7 +2019,12 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
             else { "" }
         } else { "" };
 
-        let line = Line::from(vec![
+        // Wallet-synced badge: show truncated wallet address in dim cyan.
+        let wallet_badge: Option<String> = pos.note.as_deref()
+            .and_then(|n| n.strip_prefix("wallet:"))
+            .map(|addr| format!(" [{}]", short_wallet(addr)));
+
+        let mut spans = vec![
             Span::styled(pos.platform.label(), Style::default().fg(platform_color)),
             Span::raw(" "),
             Span::styled(pos.side.label(), Style::default().fg(Color::White).bold()),
@@ -2028,7 +2037,11 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(alert, Style::default().fg(Color::Yellow)),
             Span::raw("  "),
             Span::raw(title_str),
-        ]);
+        ];
+        if let Some(badge) = wallet_badge {
+            spans.push(Span::styled(badge, Style::default().fg(Color::Cyan).dim()));
+        }
+        let line = Line::from(spans);
         ListItem::new(line)
     }).collect();
 
@@ -3155,6 +3168,9 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/wf", "Toggle watchlist-only filter"),
         kv("/alert  or  /e", "Edit price alert thresholds (above / below)"),
         kv("/add  or  /n", "Add position for selected market"),
+        kv("/wallet <0x…>", "Import Polymarket wallet positions  (sync on each call)"),
+        kv("/wallet sync", "Re-sync all registered wallet addresses"),
+        kv("/wallet analyze  or  /wa", "Ask AI to analyse registered wallet(s)"),
         kv("/targets  or  /t", "Set take-profit / stop-loss"),
         kv("/delete  or  /d", "Delete selected position  (Portfolio tab)"),
         kv("/dismiss  or  /x", "Dismiss selected signal (hidden until restart)"),
@@ -3285,6 +3301,13 @@ fn format_volume(v: Option<f64>) -> String {
         Some(v) if v >= 1_000.0     => format!("${:.0}K", v / 1_000.0),
         Some(v)                     => format!("${:.0}", v),
     }
+}
+
+/// Shorten a wallet address for display: `0x1234…abcd`.
+fn short_wallet(addr: &str) -> String {
+    let a = addr.trim();
+    if a.len() <= 12 { return a.to_string(); }
+    format!("{}…{}", &a[..6], &a[a.len() - 4..])
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…` if cut.
@@ -3746,6 +3769,31 @@ pub async fn run_tui(
                             app.pairs.len(), arb_count
                         );
                     }
+                    AppEvent::WalletImportStarted { wallet } => {
+                        let short = short_wallet(&wallet);
+                        app.status = format!("Syncing wallet {}…", short);
+                        app.is_loading = true;
+                    }
+                    AppEvent::WalletImportDone { wallet, imported, skipped } => {
+                        let short = short_wallet(&wallet);
+                        app.is_loading = false;
+                        portfolio::save_portfolio(&app.portfolio).ok();
+                        app.status = format!(
+                            "Wallet {} synced — {} position(s) imported, {} skipped",
+                            short, imported, skipped
+                        );
+                    }
+                    AppEvent::WalletImportError { wallet, error } => {
+                        let short = short_wallet(&wallet);
+                        app.is_loading = false;
+                        app.status = format!("Wallet {} import failed: {}", short, error);
+                    }
+                    AppEvent::WalletPositionsReady(positions) => {
+                        for pos in positions {
+                            app.portfolio.add(pos);
+                        }
+                        // update_marks will pick up mark prices on next market refresh
+                    }
                 }
             }
 
@@ -3796,6 +3844,46 @@ pub async fn run_tui(
 // ─── Key handling ─────────────────────────────────────────────────────────────
 
 enum SlashCmd { Handled, NotACommand, Quit }
+
+/// Pre-fill the chat input with a wallet analysis prompt for all registered wallets.
+///
+/// The LLM is directed to call `get_wallet_positions` (live snapshot from the
+/// data-api) and `analyze_wallet` (deep trade-history profile) for each wallet,
+/// then synthesise the findings.
+fn wallet_analyze_prompt(app: &mut App) {
+    if app.wallet_addresses.is_empty() {
+        app.status = "No wallets registered. Use /wallet <0x…> first.".to_string();
+        return;
+    }
+
+    // Build a wallet list string: "0xabc…  /  0xdef…"
+    let wallet_list = app.wallet_addresses.join("  /  ");
+    let count = app.wallet_addresses.len();
+    let plural = if count == 1 { "wallet" } else { "wallets" };
+
+    app.input = format!(
+        "Analyze my Polymarket {plural} ({count} registered).\n\
+         Wallet address{es}: {wallet_list}\n\n\
+         For each wallet:\n\
+         1. Call `get_wallet_positions` to see the current open positions (live snapshot).\n\
+         2. Call `analyze_wallet` for the full trade-history profile \
+            (win rate, alpha-entry score, timing signals, suspicion score).\n\
+         3. For any markets with meaningful exposure, call `get_price_history` to \
+            show how the position has moved since entry.\n\n\
+         Then give me:\n\
+         • A concise portfolio summary (total exposure, P&L direction, biggest bets).\n\
+         • Win-rate and edge assessment — am I statistically an alpha trader or noise?\n\
+         • Top 2-3 actionable insights or risk flags (e.g. over-concentrated, \
+           position approaching stop-loss territory, a market about to resolve).",
+        plural = plural,
+        count = count,
+        es = if count == 1 { "" } else { "es" },
+        wallet_list = wallet_list,
+    );
+    // Switch to Chat tab so the user sees the pre-filled prompt.
+    app.active_tab = Tab::Chat;
+    app.status = "Wallet analysis prompt ready — press Enter to send.".to_string();
+}
 
 /// Return (title, id, platform) for the market the user wants to analyze.
 ///
@@ -3990,6 +4078,46 @@ async fn dispatch_slash_command(
             } else {
                 app.start_add_position();
             }
+            SlashCmd::Handled
+        }
+
+        // ── wallet portfolio import ───────────────────────────────────────────
+        "wallet" | "w2" => {
+            // Split off the address argument: `/wallet <0x...>`, `/wallet sync`, `/wallet analyze`
+            let arg = cmd.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
+            if arg.is_empty() {
+                // No argument — list registered wallets
+                if app.wallet_addresses.is_empty() {
+                    app.status = "No wallets registered. Usage: /wallet <0x…address>".to_string();
+                } else {
+                    app.status = format!(
+                        "Registered wallets: {}  (use /wallet analyze to ask AI)",
+                        app.wallet_addresses.iter().map(|w| short_wallet(w)).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            } else if arg == "sync" {
+                // Re-sync all registered wallets
+                let wallets = app.wallet_addresses.clone();
+                if wallets.is_empty() {
+                    app.status = "No wallets registered. Usage: /wallet <0x…address>".to_string();
+                } else {
+                    for w in wallets {
+                        trigger_wallet_import(app, w, clients, event_tx);
+                    }
+                }
+            } else if arg == "analyze" || arg == "a" {
+                // Pre-fill chat with an AI wallet analysis prompt
+                wallet_analyze_prompt(app);
+            } else {
+                // Register + import the given address
+                trigger_wallet_import(app, arg, clients, event_tx);
+            }
+            SlashCmd::Handled
+        }
+
+        // ── AI wallet analysis (alias) ────────────────────────────────────────
+        "wa" => {
+            wallet_analyze_prompt(app);
             SlashCmd::Handled
         }
 
@@ -4875,6 +5003,91 @@ async fn send_chat(
     });
     // llm_history stays empty until HistoryUpdated arrives; a second message
     // sent before the first turn completes starts a fresh context (rare edge case).
+}
+
+/// Spawn a background task that fetches open positions for `wallet` from the
+/// Polymarket data-api and upserts them into `app.portfolio`.
+///
+/// On re-sync the existing positions tagged with this wallet are removed first
+/// so the portfolio always reflects the current on-chain state.
+fn trigger_wallet_import(
+    app:      &mut App,
+    wallet:   String,
+    clients:  &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    use crate::markets::Platform;
+    use crate::portfolio::{Position, Side};
+
+    // Register the wallet if not already known.
+    if !app.wallet_addresses.contains(&wallet) {
+        app.wallet_addresses.push(wallet.clone());
+        portfolio::save_wallets(&app.wallet_addresses).ok();
+    }
+
+    // Remove stale positions previously imported from this wallet so we can
+    // replace them with fresh data.
+    let tag = format!("wallet:{}", wallet);
+    app.portfolio.positions.retain(|p| {
+        p.note.as_deref().map(|n| !n.starts_with(&tag)).unwrap_or(true)
+    });
+
+    let tx        = event_tx.clone();
+    let wallet_c  = wallet.clone();
+    let clients_c = clients.clone();
+
+    let _ = tx.send(AppEvent::WalletImportStarted { wallet: wallet.clone() });
+
+    tokio::spawn(async move {
+        let positions_raw = match clients_c.polymarket.fetch_wallet_positions(&wallet_c).await {
+            Ok(p)  => p,
+            Err(e) => {
+                let _ = tx.send(AppEvent::WalletImportError {
+                    wallet: wallet_c,
+                    error:  e.to_string(),
+                });
+                return;
+            }
+        };
+
+        let tag = format!("wallet:{}", wallet_c);
+        let mut imported = 0usize;
+        let mut skipped  = 0usize;
+        let mut positions: Vec<Position> = Vec::new();
+
+        for wp in &positions_raw {
+            // outcome_index 0 = YES, anything else = NO
+            let side = if wp.outcome_index == 0 { Side::Yes } else { Side::No };
+            if wp.size < 0.01 {
+                skipped += 1;
+                continue;
+            }
+            let mut pos = Position::new(
+                Platform::Polymarket,
+                wp.condition_id.clone(),
+                wp.title.clone(),
+                wp.avg_price,
+                wp.size,
+                side,
+                Some(tag.clone()),
+            );
+            // Set mark price from current_value / size if meaningful.
+            if wp.size > 0.0 {
+                pos.mark_price = Some((wp.current_value / wp.size).clamp(0.0, 1.0));
+            }
+            positions.push(pos);
+            imported += 1;
+        }
+
+        let _ = tx.send(AppEvent::WalletImportDone {
+            wallet:   wallet_c,
+            imported,
+            skipped,
+        });
+
+        // Send the new positions via a dedicated event so the TUI can add them.
+        let _ = tx.send(AppEvent::WalletPositionsReady(positions));
+    });
 }
 
 async fn trigger_chart_load(
