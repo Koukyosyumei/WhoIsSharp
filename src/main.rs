@@ -14,6 +14,7 @@ mod config;
 mod http;
 mod llm;
 mod markets;
+mod news;
 mod pairs;
 mod portfolio;
 mod risk;
@@ -120,7 +121,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    let clients = Arc::new(MarketClients::new());
+    let newsdata_api_key = std::env::var("NEWSDATA_API_KEY").ok();
+    let clients = Arc::new(MarketClients::new(newsdata_api_key));
 
     tui::run_tui(backend, clients, backend_name, cli.refresh).await?;
 

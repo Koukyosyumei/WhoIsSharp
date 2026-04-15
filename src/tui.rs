@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::agent::{self, AppEvent};
 use crate::llm::{LlmBackend, LlmMessage};
+use crate::news::NewsArticle;
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
 use crate::markets::polymarket::PolyTrade;
 use crate::portfolio::{self, Portfolio, Position, Session, Side, WatchEntry};
@@ -45,7 +46,7 @@ use crate::tools::{MarketClients, SmartMoneyWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs"];
+const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs", "News"];
 
 const TIPS: &[&str] = &[
     "Press / to open the command bar — type a command and press Enter",
@@ -80,6 +81,7 @@ pub enum Tab {
     SmartMoney = 6,
     Trades     = 7,
     Pairs      = 8,
+    News       = 9,
 }
 
 impl Tab {
@@ -94,6 +96,7 @@ impl Tab {
             6 => Some(Tab::SmartMoney),
             7 => Some(Tab::Trades),
             8 => Some(Tab::Pairs),
+            9 => Some(Tab::News),
             _ => None,
         }
     }
@@ -314,6 +317,17 @@ pub struct App {
 
     // Registered Polymarket wallet addresses for portfolio sync
     pub wallet_addresses:  Vec<String>,
+
+    // News tab
+    pub news_articles:   Vec<NewsArticle>,
+    pub news_list:       ListState,
+    /// market_id whose news is currently displayed (None = no news loaded yet)
+    pub news_market_id:  Option<String>,
+    pub news_loading:    bool,
+    /// Index of the article expanded in the detail panel (right side)
+    pub news_detail_idx: Option<usize>,
+    /// Last error message from the news fetch (shown inside the tab)
+    pub news_error:      Option<String>,
 }
 
 // Position add-flow state machine
@@ -422,6 +436,12 @@ impl App {
             kelly_my_prob:     None,
             kelly_bankroll:    10_000.0,
             wallet_addresses:  portfolio::load_wallets(),
+            news_articles:     Vec::new(),
+            news_list:         ListState::default(),
+            news_market_id:    None,
+            news_loading:      false,
+            news_detail_idx:   None,
+            news_error:        None,
         }
     }
 
@@ -592,6 +612,13 @@ impl App {
                     self.pairs_cursor = (self.pairs_cursor + 1) % self.pairs.len();
                 }
             }
+            Tab::News => {
+                let len = self.news_articles.len();
+                if len == 0 { return; }
+                let i = self.news_list.selected().map(|i| (i + 1) % len).unwrap_or(0);
+                self.news_list.select(Some(i));
+                self.news_detail_idx = Some(i);
+            }
             _ => {}
         }
     }
@@ -654,6 +681,15 @@ impl App {
                         self.pairs_cursor - 1
                     };
                 }
+            }
+            Tab::News => {
+                let len = self.news_articles.len();
+                if len == 0 { return; }
+                let i = self.news_list.selected()
+                    .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                    .unwrap_or(0);
+                self.news_list.select(Some(i));
+                self.news_detail_idx = Some(i);
             }
             _ => {}
         }
@@ -831,6 +867,7 @@ fn render(f: &mut Frame, app: &App) {
         Tab::SmartMoney => render_smart_money(f, chunks[2], app),
         Tab::Trades     => render_trades(f, chunks[2], app),
         Tab::Pairs      => render_pairs(f, chunks[2], app),
+        Tab::News       => render_news(f, chunks[2], app),
     }
     render_status(f, chunks[3], app);
     render_input(f, chunks[4], app);
@@ -887,7 +924,11 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
     let titles: Vec<Line> = TAB_NAMES
         .iter()
         .enumerate()
-        .map(|(i, name)| Line::from(format!(" [{}] {} ", i + 1, name)))
+        .map(|(i, name)| {
+            // Tab indices 0-8 → keys 1-9; index 9 (News) → key 0
+            let key = if i < 9 { (i + 1).to_string() } else { "0".to_string() };
+            Line::from(format!(" [{}] {} ", key, name))
+        })
         .collect();
 
     let tabs = Tabs::new(titles)
@@ -3171,6 +3212,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/wallet <0x…>", "Import Polymarket wallet positions  (sync on each call)"),
         kv("/wallet sync", "Re-sync all registered wallet addresses"),
         kv("/wallet analyze  or  /wa", "Ask AI to analyse registered wallet(s)"),
+        Line::from(""),
+        h(" News tab  —  key [0]"),
+        kv("0", "Open news feed for selected market  (requires NEWSDATA_API_KEY)"),
+        kv("/refresh  (on News tab)", "Re-fetch news for selected market"),
         kv("/targets  or  /t", "Set take-profit / stop-loss"),
         kv("/delete  or  /d", "Delete selected position  (Portfolio tab)"),
         kv("/dismiss  or  /x", "Dismiss selected signal (hidden until restart)"),
@@ -3493,17 +3538,19 @@ mod tests {
         assert_eq!(Tab::Chat.next(),        Tab::SmartMoney);
         assert_eq!(Tab::SmartMoney.next(),  Tab::Trades);
         assert_eq!(Tab::Trades.next(),      Tab::Pairs);
-        assert_eq!(Tab::Pairs.next(),       Tab::Signals); // wraps
+        assert_eq!(Tab::Pairs.next(),       Tab::News);
+        assert_eq!(Tab::News.next(),        Tab::Signals); // wraps
     }
 
     #[test]
     fn tab_prev_cycles_backward() {
-        assert_eq!(Tab::Signals.prev(),     Tab::Pairs); // wraps
+        assert_eq!(Tab::Signals.prev(),     Tab::News); // wraps
         assert_eq!(Tab::Markets.prev(),     Tab::Signals);
         assert_eq!(Tab::Chat.prev(),        Tab::Portfolio);
         assert_eq!(Tab::SmartMoney.prev(),  Tab::Chat);
         assert_eq!(Tab::Trades.prev(),      Tab::SmartMoney);
         assert_eq!(Tab::Pairs.prev(),       Tab::Trades);
+        assert_eq!(Tab::News.prev(),        Tab::Pairs);
     }
 }
 
@@ -3769,6 +3816,20 @@ pub async fn run_tui(
                             app.pairs.len(), arb_count
                         );
                     }
+                    AppEvent::NewsLoaded { market_id, articles } => {
+                        app.news_loading = false;
+                        app.news_error = None;
+                        app.news_market_id = market_id;
+                        app.news_articles = articles;
+                        app.news_list.select(if app.news_articles.is_empty() { None } else { Some(0) });
+                        app.news_detail_idx = if app.news_articles.is_empty() { None } else { Some(0) };
+                        app.status = format!("{} news article(s) loaded", app.news_articles.len());
+                    }
+                    AppEvent::NewsError(e) => {
+                        app.news_loading = false;
+                        app.news_error = Some(e.clone());
+                        app.status = format!("News error: {}", e);
+                    }
                     AppEvent::WalletImportStarted { wallet } => {
                         let short = short_wallet(&wallet);
                         app.status = format!("Syncing wallet {}…", short);
@@ -3839,6 +3900,190 @@ pub async fn run_tui(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+// ─── News tab ────────────────────────────────────────────────────────────────
+
+fn render_news(f: &mut Frame, area: Rect, app: &App) {
+    use ratatui::style::Modifier;
+
+    // Split into left list (40%) and right detail panel (60%).
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    // ── Left: article list ────────────────────────────────────────────────────
+
+    if app.news_loading {
+        let p = Paragraph::new("Loading news…")
+            .block(Block::default().title(" News ").borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, panes[0]);
+        return;
+    }
+
+    if app.news_articles.is_empty() {
+        let msg = if let Some(ref err) = app.news_error {
+            format!("Error: {}", err)
+        } else if app.selected_market_id.is_none() {
+            "Select a market (Enter), then press 0 to load news.".to_string()
+        } else {
+            "No news loaded. Press /refresh or 0 to fetch.".to_string()
+        };
+        let color = if app.news_error.is_some() { Color::Red } else { Color::DarkGray };
+        let p = Paragraph::new(msg)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" News ").borders(Borders::ALL)
+                .border_style(Style::default().fg(color)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let market_label = app.news_market_id.as_deref()
+        .and_then(|id| app.markets.iter().find(|m| m.id == id))
+        .map(|m| format!(" News — {} ", trunc(&m.title, 30)))
+        .unwrap_or_else(|| " News ".to_string());
+
+    let items: Vec<ListItem> = app.news_articles.iter().enumerate().map(|(i, a)| {
+        let selected = app.news_detail_idx == Some(i);
+        let sentiment_color = match a.sentiment.as_deref() {
+            Some("positive") => Color::Green,
+            Some("negative") => Color::Red,
+            _                => Color::DarkGray,
+        };
+        let badge = a.sentiment_char();
+        let age   = a.age_label();
+        let title: String = a.title.chars().take(48).collect();
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{} ", badge),
+                Style::default().fg(sentiment_color).bold(),
+            ),
+            Span::styled(
+                title,
+                if selected {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>4}", age),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        ListItem::new(line)
+    }).collect();
+
+    let list = List::new(items)
+        .block(Block::default().title(market_label).borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)))
+        .highlight_style(Style::default().bg(Color::DarkGray).bold())
+        .highlight_symbol("▶ ");
+
+    let mut state = app.news_list.clone();
+    f.render_stateful_widget(list, panes[0], &mut state);
+
+    // ── Right: article detail ─────────────────────────────────────────────────
+
+    let detail_block = Block::default()
+        .title(" Article ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let Some(idx) = app.news_detail_idx else {
+        f.render_widget(detail_block, panes[1]);
+        return;
+    };
+    let Some(a) = app.news_articles.get(idx) else {
+        f.render_widget(detail_block, panes[1]);
+        return;
+    };
+
+    let sentiment_str = match a.sentiment.as_deref() {
+        Some("positive") => " [+positive]",
+        Some("negative") => " [-negative]",
+        Some("neutral")  => " [~neutral]",
+        _                => "",
+    };
+    let sentiment_color = match a.sentiment.as_deref() {
+        Some("positive") => Color::Green,
+        Some("negative") => Color::Red,
+        _                => Color::DarkGray,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Title
+    lines.push(Line::from(Span::styled(
+        a.title.clone(),
+        Style::default().fg(Color::White).bold().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Meta row: source · age · sentiment
+    lines.push(Line::from(vec![
+        Span::styled(a.source_name.clone(), Style::default().fg(Color::Cyan)),
+        Span::raw("  ·  "),
+        Span::styled(a.age_label(), Style::default().fg(Color::DarkGray)),
+        Span::styled(sentiment_str, Style::default().fg(sentiment_color)),
+    ]));
+    lines.push(Line::from(""));
+
+    // Description (word-wrapped at panel width)
+    let panel_w = panes[1].width.saturating_sub(4) as usize;
+    if panel_w > 0 && !a.description.is_empty() {
+        for word_line in wrap_text(&a.description, panel_w) {
+            lines.push(Line::from(Span::raw(word_line)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Keywords
+    if let Some(kws) = &a.keywords {
+        if !kws.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Keywords: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(kws.join(", ")),
+            ]));
+            lines.push(Line::from(""));
+        }
+    }
+
+    // Link (dim, at bottom)
+    lines.push(Line::from(Span::styled(
+        a.link.clone(),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let p = Paragraph::new(lines)
+        .block(detail_block)
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, panes[1]);
+}
+
+/// Naïve word-wrapper: splits `text` into lines of at most `width` chars.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current.clone());
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 // ─── Key handling ─────────────────────────────────────────────────────────────
@@ -3942,6 +4187,11 @@ async fn dispatch_slash_command(
             if app.selected_market_id.is_some() {
                 trigger_chart_load(app, clients, event_tx).await;
                 trigger_orderbook_load(app, clients, event_tx).await;
+            }
+            if app.active_tab == AppTab::News {
+                // Force a re-fetch (clear market_id so the stale-check lets it through)
+                app.news_market_id = None;
+                trigger_news_load(app, clients, event_tx);
             }
             app.status = "Refreshing…".to_string();
             SlashCmd::Handled
@@ -4518,6 +4768,13 @@ async fn handle_key(
             app.active_tab = AppTab::Pairs;
             trigger_llm_pairs(app, backend, event_tx).await;
         }
+        KC::Char('0') if app.input.is_empty() => {
+            app.active_tab = AppTab::News;
+            // Auto-fetch if a market is selected and news isn't already loaded for it
+            if app.news_market_id.as_ref() != app.selected_market_id.as_ref() {
+                trigger_news_load(app, clients, event_tx);
+            }
+        }
 
         KC::Tab => {
             app.active_tab = app.active_tab.next();
@@ -4527,6 +4784,7 @@ async fn handle_key(
                 AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
                 AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
                 AppTab::Pairs     => { trigger_llm_pairs(app, backend, event_tx).await; }
+                AppTab::News      => { trigger_news_load(app, clients, event_tx); }
                 _ => {}
             }
         }
@@ -4538,6 +4796,7 @@ async fn handle_key(
                 AppTab::SmartMoney => { trigger_smart_money_load(app, clients, event_tx).await; }
                 AppTab::Trades    => { trigger_trades_load(app, clients, event_tx).await; }
                 AppTab::Pairs     => { trigger_llm_pairs(app, backend, event_tx).await; }
+                AppTab::News      => { trigger_news_load(app, clients, event_tx); }
                 _ => {}
             }
         }
@@ -5087,6 +5346,54 @@ fn trigger_wallet_import(
 
         // Send the new positions via a dedicated event so the TUI can add them.
         let _ = tx.send(AppEvent::WalletPositionsReady(positions));
+    });
+}
+
+/// Spawn a background task that fetches news for the currently selected market.
+/// Does nothing if no market is selected or the news client is unavailable.
+fn trigger_news_load(
+    app:      &mut App,
+    clients:  &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(market_id) = app.selected_market_id.clone() else {
+        app.status = "Select a market first (press Enter on a market row).".to_string();
+        return;
+    };
+    let Some(market) = app.markets.iter().find(|m| m.id == market_id).cloned() else {
+        return;
+    };
+    if app.news_loading {
+        return; // already in flight
+    }
+
+    app.news_loading = true;
+    app.news_error = None;
+    app.news_articles.clear();
+    app.status = format!("Loading news for '{}'…", trunc(&market.title, 40));
+
+    let tx        = event_tx.clone();
+    let clients_c = clients.clone();
+    let mid       = market_id.clone();
+
+    tokio::spawn(async move {
+        let Some(news) = &clients_c.news else {
+            let _ = tx.send(AppEvent::NewsError(
+                "Set NEWSDATA_API_KEY to enable the news feed.".to_string()
+            ));
+            return;
+        };
+        match news.fetch_for_market(&market.title, 10).await {
+            Ok(articles) => {
+                let _ = tx.send(AppEvent::NewsLoaded {
+                    market_id: Some(mid),
+                    articles,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::NewsError(format!("{:#}", e)));
+            }
+        }
     });
 }
 

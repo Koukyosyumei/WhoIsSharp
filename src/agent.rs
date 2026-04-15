@@ -57,6 +57,14 @@ pub enum AppEvent {
     RefreshDone,
     RefreshError(String),
 
+    // ── News feed ─────────────────────────────────────────────────────────────
+    /// Articles fetched for a market (or None for the generic feed).
+    NewsLoaded {
+        market_id: Option<String>,
+        articles:  Vec<crate::news::NewsArticle>,
+    },
+    NewsError(String),
+
     // ── Wallet portfolio import ───────────────────────────────────────────────
     WalletImportStarted  { wallet: String },
     WalletImportDone     { wallet: String, imported: usize, skipped: usize },

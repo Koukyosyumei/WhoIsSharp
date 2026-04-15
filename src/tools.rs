@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::llm::ToolDefinition;
 use crate::markets::{kalshi::KalshiClient, polymarket::PolymarketClient, ChartInterval};
+use crate::news::NewsClient;
 
 // ─── Tool result ─────────────────────────────────────────────────────────────
 
@@ -24,13 +25,16 @@ impl ToolOutput {
 pub struct MarketClients {
     pub polymarket: PolymarketClient,
     pub kalshi:     KalshiClient,
+    /// None when `NEWSDATA_API_KEY` is not set.
+    pub news:       Option<NewsClient>,
 }
 
 impl MarketClients {
-    pub fn new() -> Self {
+    pub fn new(newsdata_api_key: Option<String>) -> Self {
         MarketClients {
             polymarket: PolymarketClient::new(),
             kalshi:     KalshiClient::new(),
+            news:       newsdata_api_key.map(NewsClient::new),
         }
     }
 }
@@ -68,6 +72,7 @@ async fn dispatch_inner(
         "scan_smart_money"    => scan_smart_money(clients, args).await,
         "get_wallet_positions" => get_wallet_positions(clients, args).await,
         "kelly_size"          => kelly_size(clients, args).await,
+        "search_news"         => search_news(clients, args).await,
         _                     => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
@@ -1633,6 +1638,50 @@ fn positions_total(history: &[crate::markets::polymarket::PolyTrade]) -> usize {
     history.iter().map(|t| t.condition_id.as_str()).collect::<HashSet<_>>().len()
 }
 
+// ─── News search ─────────────────────────────────────────────────────────────
+
+/// Search newsdata.io for articles matching `query`.
+async fn search_news(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let query  = args["query"].as_str().unwrap_or("").trim();
+    let limit  = args["limit"].as_u64().unwrap_or(8).min(10) as u8;
+
+    let Some(news) = &clients.news else {
+        return Ok(ToolOutput::err(
+            "News API not configured. Set the NEWSDATA_API_KEY environment variable."
+        ));
+    };
+
+    if query.is_empty() {
+        return Ok(ToolOutput::err("Required: query (search terms)"));
+    }
+
+    let articles = news.fetch_latest(query, limit).await
+        .context("newsdata.io search failed")?;
+
+    if articles.is_empty() {
+        return Ok(ToolOutput::ok(format!("No recent news found for query: '{}'", query)));
+    }
+
+    let mut out = vec![format!("=== NEWS: '{}' ({} results) ===\n", query, articles.len())];
+    for a in &articles {
+        let sentiment = match a.sentiment.as_deref() {
+            Some("positive") => " [+positive]",
+            Some("negative") => " [-negative]",
+            Some("neutral")  => " [~neutral]",
+            _                => "",
+        };
+        out.push(format!("• {} [{}{}]  —  {}",
+            a.title, a.source_name, sentiment, a.age_label()));
+        if !a.description.is_empty() {
+            let desc: String = a.description.chars().take(200).collect();
+            out.push(format!("  {}", desc));
+        }
+        out.push(format!("  {}\n", a.link));
+    }
+
+    Ok(ToolOutput::ok(out.join("\n")))
+}
+
 // ─── Kelly criterion position sizing ─────────────────────────────────────────
 
 /// Compute Kelly and half-Kelly bet sizes for a binary prediction market.
@@ -2022,6 +2071,28 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["wallet"]
+            }),
+        },
+        ToolDefinition {
+            name: "search_news".into(),
+            description: "Search for recent news articles relevant to a topic, market, or entity. \
+                Returns titles, sources, publication age, sentiment labels, and descriptions. \
+                Use this to add real-world context when analysing a market — e.g. search for \
+                the key participants or event before giving a probability assessment. \
+                Requires NEWSDATA_API_KEY to be configured.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search terms (3-5 key words work best, e.g. 'Trump tariffs China' or 'Fed rate decision')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of articles to return (1–10). Default 8."
+                    }
+                },
+                "required": ["query"]
             }),
         },
         ToolDefinition {
