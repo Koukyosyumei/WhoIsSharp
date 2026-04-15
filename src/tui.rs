@@ -3841,7 +3841,8 @@ async fn dispatch_slash_command(
 ) -> SlashCmd {
     type AppTab = Tab;
     let cmd = raw.trim().to_lowercase();
-    match cmd.as_str() {
+    let cmd_word = cmd.split_whitespace().next().unwrap_or("");
+    match cmd_word {
         // ── quit ─────────────────────────────────────────────────────────────
         "q" | "quit" => SlashCmd::Quit,
 
