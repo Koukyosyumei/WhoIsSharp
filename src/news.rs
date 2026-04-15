@@ -180,15 +180,15 @@ struct NewsResponse {
 
 #[derive(Deserialize)]
 struct RawArticle {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     title:       String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     link:        String,
-    #[serde(rename = "source_name", default)]
+    #[serde(rename = "source_name", default, deserialize_with = "null_as_empty")]
     source_name: String,
-    #[serde(rename = "pubDate", default)]
+    #[serde(rename = "pubDate", default, deserialize_with = "null_as_empty")]
     pub_date:    String,
     #[serde(default)]
     sentiment:   Option<String>,
@@ -196,6 +196,11 @@ struct RawArticle {
     keywords:    Option<Vec<String>>,
     #[serde(default)]
     category:    Option<Vec<String>>,
+}
+
+/// Deserialize a JSON string or null → String (null becomes "").
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 fn raw_to_article(r: RawArticle) -> NewsArticle {
