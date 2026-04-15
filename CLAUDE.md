@@ -124,6 +124,16 @@ The AI agent can call these tools:
 | `get_events`      | List event categories                                |
 | `search_markets`  | Search markets by keyword                            |
 
+## News integration
+
+Set `NEWSDATA_API_KEY` to enable the News tab and the `search_news` AI tool.
+
+- **`[0]` key** — opens the News tab and auto-fetches articles for the selected market
+- **`/refresh`** while on the News tab — re-fetches (respects 5-min TTL cache)
+- Market query is built automatically from the market title (stop-words stripped, top 4 terms)
+- Sentiment badges: `+` green (positive), `-` red (negative), `~` gray (neutral)
+- The AI's `search_news` tool lets Claude pull news during any analysis conversation
+
 ## API endpoints used
 
 ### Polymarket

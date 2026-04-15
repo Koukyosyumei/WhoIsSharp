@@ -96,6 +96,7 @@ All credentials can be provided as environment variables instead of CLI flags.
 | `GOOGLE_LOCATION` | Vertex AI region (default: `us-central1`) |
 | `OLLAMA_BASE_URL` | Ollama server URL (default: `http://localhost:11434`) |
 | `WHOISSHARP_MODEL` | Override the model ID for any backend |
+| `NEWSDATA_API_KEY` | API key for [newsdata.io](https://newsdata.io) — enables Tab 0 and the AI's `get_market_news` tool (free tier: 200 req/day) |
 
 ### Backend setup
 
@@ -158,7 +159,7 @@ Default model: `gemini-2.5-flash`. The backend uses the Vertex AI endpoint with 
 ┌─ header (1 line) ─────────────────────────────────────────────────────────────┐
 │  WhoIsSharp v0.1.0  ·  claude-sonnet-4-6  ·  PM + KL              14:23:05  │
 ├─ tab bar (1 line) ─────────────────────────────────────────────────────────────┤
-│  [1]Signals [2]Markets [3]Chart [4]Book [5]Portfolio [6]Chat [7]SM [8]Trades [9]Pairs
+│  [0]News [1]Signals [2]Markets [3]Chart [4]Book [5]Portfolio [6]Chat [7]SM [8]Trades [9]Pairs
 ├─ content area (fills remaining height) ───────────────────────────────────────┤
 │                                                                                │
 │  [tab content]                                                                 │
@@ -174,6 +175,35 @@ The input box is always active. Type to send a message to the AI. Prefix with `!
 ---
 
 ## Tabs Reference
+
+### Tab 0 — News
+
+Per-market news feed powered by [newsdata.io](https://newsdata.io).
+
+**Requires:** `NEWSDATA_API_KEY` environment variable. Get a free key at https://newsdata.io (free tier: 200 requests/day, 5-minute TTL cache so refreshes are conserved).
+
+**Layout:** Two-panel. Left panel lists articles (title, source, age, sentiment badge). Right panel shows the full description and link for the selected article.
+
+**Sentiment badges:**
+
+| Badge | Meaning |
+|-------|---------|
+| `+` (green) | Positive sentiment |
+| `-` (red) | Negative sentiment |
+| `~` (gray) | Neutral |
+| ` ` | No sentiment data |
+
+**Controls:**
+- `0` — open this tab and auto-fetch news for the selected market
+- `/refresh` — re-fetch (respects 5-min TTL cache)
+- `j`/`k` — scroll article list; detail panel updates live
+- `Esc` — return to previous tab
+
+**How news is fetched:** The market title is processed with stop-word removal to extract 3–4 key terms, which are sent to newsdata.io. The same query logic is used by the AI's `get_market_news` tool.
+
+> If no API key is configured, the tab displays sign-up instructions with the newsdata.io URL.
+
+---
 
 ### Tab 1 — Signals
 
@@ -435,6 +465,7 @@ This is an upper bound — real fills will be limited by orderbook depth, not to
 
 | Key | Action |
 |-----|--------|
+| `0` | Open News tab and fetch news for selected market |
 | `^` | Refresh markets + chart + orderbook |
 | `@` | Pre-fill AI analysis prompt for selected market |
 | `?` | Toggle help overlay |
@@ -464,6 +495,9 @@ Unrecognised input is used as a market search/filter term.
 | `/pairs` or `/l` | Re-run LLM pair matching (Pairs tab) |
 | `/lower` | Lower threshold by 5% (SmartMoney / Pairs tab) |
 | `/raise` | Raise threshold by 5% (SmartMoney / Pairs tab) |
+| `/wallet <0x…>` | Register a Polymarket wallet address and import its positions |
+| `/wallet sync` | Re-sync all registered wallet addresses |
+| `/wallet analyze` or `/wa` | Ask AI to analyse registered wallet(s) |
 | `/export` or `/csv` | Export current tab to CSV |
 | `/report` or `/m` | Export Markdown research report |
 | `/help` or `/?` | Toggle help overlay |
@@ -755,6 +789,35 @@ Deep profile of one wallet: trade history, alpha score, top markets, composite s
 | `address` | string | Ethereum address |
 
 **Suspicion score components:** win rate, alpha entry, trade frequency, coordination index.
+
+---
+
+### News tools
+
+#### `get_market_news`
+
+Fetches news articles contextually relevant to a specific prediction market. Automatically extracts key terms from the market title (same stop-word logic as Tab 0) and queries newsdata.io.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `market_id` | string | Market condition ID or Kalshi ticker |
+| `platform` | string | `"polymarket"` or `"kalshi"` (default: `"polymarket"`) |
+| `limit` | integer | Articles to return (1–10, default 8) |
+
+**Returns:** Titles, sources, publication age, sentiment labels, keywords, and descriptions.
+
+**When to use:** The AI is instructed to call this automatically immediately after `get_market`, before forming any probability estimate. Requires `NEWSDATA_API_KEY`.
+
+#### `search_news`
+
+Free-form news search by custom query terms. Use when you want to investigate a specific angle beyond what `get_market_news` covers — e.g. a related entity, a follow-up search with refined terms, or cross-checking a specific claim.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Search terms (3–5 keywords, e.g. `"Trump tariffs China"`) |
+| `limit` | integer | Articles to return (1–10, default 8) |
+
+Requires `NEWSDATA_API_KEY`.
 
 ---
 
