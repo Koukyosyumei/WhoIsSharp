@@ -3924,14 +3924,42 @@ fn render_news(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if app.news_articles.is_empty() {
-        let msg = if let Some(ref err) = app.news_error {
-            format!("Error: {}", err)
+        let no_key = app.news_error.as_deref()
+            .map(|e| e.contains("NEWSDATA_API_KEY"))
+            .unwrap_or(false);
+
+        let (msg, color) = if no_key {
+            (
+                "News feed requires a free API key from newsdata.io.\n\
+                 \n\
+                 1. Sign up at  https://newsdata.io/  (free tier: 200 req/day)\n\
+                 2. Copy your API key from the dashboard\n\
+                 3. Set it before launching:  export NEWSDATA_API_KEY=<your-key>\n\
+                 \n\
+                 Then press 0 on any market to load relevant news."
+                    .to_string(),
+                Color::Yellow,
+            )
+        } else if let Some(ref err) = app.news_error {
+            (format!("Error: {}", err), Color::Red)
         } else if app.selected_market_id.is_none() {
-            "Select a market (Enter), then press 0 to load news.".to_string()
+            (
+                "Select a market (Enter), then press 0 to load news.\n\
+                 \n\
+                 No API key yet?  Get a free one at  https://newsdata.io/"
+                    .to_string(),
+                Color::DarkGray,
+            )
         } else {
-            "No news loaded. Press /refresh or 0 to fetch.".to_string()
+            (
+                "Press 0 or /refresh to fetch news for the selected market.\n\
+                 \n\
+                 Powered by  https://newsdata.io/  (free tier: 200 req/day)"
+                    .to_string(),
+                Color::DarkGray,
+            )
         };
-        let color = if app.news_error.is_some() { Color::Red } else { Color::DarkGray };
+
         let p = Paragraph::new(msg)
             .wrap(Wrap { trim: false })
             .block(Block::default().title(" News ").borders(Borders::ALL)
