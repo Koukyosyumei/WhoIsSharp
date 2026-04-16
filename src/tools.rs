@@ -690,6 +690,19 @@ pub struct TooSmartResult {
     pub markets_scanned: usize,
 }
 
+/// A wallet identified by the LLM as suspicious in Too-Smart LLM mode.
+#[derive(Clone, Debug)]
+pub struct LlmIdentifiedWallet {
+    pub wallet:      String,
+    pub pseudonym:   String,
+    /// LLM's confidence ranking (1 = most suspicious).
+    pub rank:        usize,
+    /// LLM's analytical reasoning (2–4 sentences).
+    pub reasoning:   String,
+    /// Specific signals the LLM cited (e.g. "Wilson LB 72% at n=12").
+    pub key_signals: Vec<String>,
+}
+
 /// Internal per-wallet row produced by `market_wallet_scores`.
 struct MarketWalletScore {
     wallet:       String,
@@ -2565,6 +2578,50 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Tool definitions used exclusively in the Too-Smart LLM scan agent loop.
+/// Includes the regular analytical tools PLUS `flag_too_smart_wallet` so the
+/// LLM can register its confirmed suspects in a structured way.
+pub fn too_smart_llm_definitions() -> Vec<ToolDefinition> {
+    let mut defs = all_definitions();
+    defs.push(ToolDefinition {
+        name: "flag_too_smart_wallet".into(),
+        description: "Register a wallet you have identified as a 'too smart' informed trader. \
+            Call this once per suspect you are confident in. Be selective — only flag wallets \
+            with clear multi-signal evidence. The result will be shown to the user in the \
+            Too-Smart LLM tab with your reasoning.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "wallet": {
+                    "type": "string",
+                    "description": "Full Polymarket proxy wallet address (hex, e.g. '0xabc…')."
+                },
+                "pseudonym": {
+                    "type": "string",
+                    "description": "Display name / pseudonym from the scan data."
+                },
+                "rank": {
+                    "type": "integer",
+                    "description": "Your confidence ranking for this wallet (1 = most suspicious overall)."
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Your analytical reasoning in 2–4 sentences explaining why this \
+                        wallet is suspicious — cite specific statistics and patterns."
+                },
+                "key_signals": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "2–4 specific signal strings (e.g. 'Wilson LB 72% at n=12', \
+                        'appeared in 4/5 markets', 'avg entry 31¢ on wins')."
+                }
+            },
+            "required": ["wallet", "pseudonym", "rank", "reasoning", "key_signals"]
+        }),
+    });
+    defs
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

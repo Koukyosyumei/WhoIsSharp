@@ -42,7 +42,7 @@ use crate::markets::{ChartInterval, Market, Orderbook, Platform};
 use crate::markets::polymarket::PolyTrade;
 use crate::portfolio::{self, Portfolio, Position, Session, Side, WatchEntry};
 use crate::signals::{self, Signal, SignalKind};
-use crate::tools::{MarketClients, SmartMoneyWallet, TooSmartWallet};
+use crate::tools::{LlmIdentifiedWallet, MarketClients, SmartMoneyWallet, TooSmartWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
@@ -243,6 +243,14 @@ pub struct App {
     pub ts_markets_scanned:  usize,
     pub ts_loading:          bool,
     pub ts_list:             ListState,
+    // Too-Smart sub-mode (Model vs LLM identification)
+    pub ts_sub_mode:         TooSmartSubMode,
+    pub ts_llm_wallets:      Vec<LlmIdentifiedWallet>,
+    pub ts_llm_loading:      bool,
+    pub ts_llm_list:         ListState,
+    // Sensitivity controls for the static model scan
+    pub ts_threshold:        f64,   // min avg suspicion to include (default 35.0)
+    pub ts_min_appearances:  usize, // min markets a wallet must appear in (default 2)
 
     // Time & Sales tab
     pub trades_data:      Vec<PolyTrade>,
@@ -346,6 +354,16 @@ pub enum SmartMoneyMode {
     TooSmart,
 }
 
+/// Sub-mode within TooSmart: statistical model vs. LLM identification.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TooSmartSubMode {
+    /// Wallets identified by the 5-signal statistical model (default).
+    #[default]
+    Model,
+    /// Wallets identified by the LLM from raw scan data.
+    Llm,
+}
+
 // Position add-flow state machine
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum PosInputStep {
@@ -415,6 +433,12 @@ impl App {
             ts_markets_scanned:  0,
             ts_loading:          false,
             ts_list:             ListState::default(),
+            ts_sub_mode:         TooSmartSubMode::Model,
+            ts_llm_wallets:      Vec::new(),
+            ts_llm_loading:      false,
+            ts_llm_list:         ListState::default(),
+            ts_threshold:        35.0,
+            ts_min_appearances:  2,
             trades_data:       Vec::new(),
             trades_list:       ListState::default(),
             chart_candles:     Vec::new(),
@@ -612,12 +636,21 @@ impl App {
                 if self.sm_detail.is_some() || self.sm_detail_loading {
                     self.sm_detail_scroll = self.sm_detail_scroll.saturating_add(1);
                 } else if self.sm_mode == SmartMoneyMode::TooSmart {
-                    let len = self.ts_wallets.len() + 2;
-                    if len <= 2 { return; }
-                    let i = self.ts_list.selected().map(|i| {
-                        if i + 1 >= len { 2 } else { i + 1 }
-                    }).unwrap_or(2);
-                    self.ts_list.select(Some(i));
+                    if self.ts_sub_mode == TooSmartSubMode::Llm {
+                        let len = self.ts_llm_wallets.len() + 2;
+                        if len <= 2 { return; }
+                        let i = self.ts_llm_list.selected().map(|i| {
+                            if i + 1 >= len { 2 } else { i + 1 }
+                        }).unwrap_or(2);
+                        self.ts_llm_list.select(Some(i));
+                    } else {
+                        let len = self.ts_wallets.len() + 2;
+                        if len <= 2 { return; }
+                        let i = self.ts_list.selected().map(|i| {
+                            if i + 1 >= len { 2 } else { i + 1 }
+                        }).unwrap_or(2);
+                        self.ts_list.select(Some(i));
+                    }
                 } else {
                     let len = self.sm_wallets.len() + 2;
                     if len <= 2 { return; }
@@ -681,12 +714,21 @@ impl App {
                 if self.sm_detail.is_some() || self.sm_detail_loading {
                     self.sm_detail_scroll = self.sm_detail_scroll.saturating_sub(1);
                 } else if self.sm_mode == SmartMoneyMode::TooSmart {
-                    let len = self.ts_wallets.len() + 2;
-                    if len <= 2 { return; }
-                    let i = self.ts_list.selected()
-                        .map(|i| if i <= 2 { len - 1 } else { i - 1 })
-                        .unwrap_or(2);
-                    self.ts_list.select(Some(i));
+                    if self.ts_sub_mode == TooSmartSubMode::Llm {
+                        let len = self.ts_llm_wallets.len() + 2;
+                        if len <= 2 { return; }
+                        let i = self.ts_llm_list.selected()
+                            .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                            .unwrap_or(2);
+                        self.ts_llm_list.select(Some(i));
+                    } else {
+                        let len = self.ts_wallets.len() + 2;
+                        if len <= 2 { return; }
+                        let i = self.ts_list.selected()
+                            .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                            .unwrap_or(2);
+                        self.ts_list.select(Some(i));
+                    }
                 } else {
                     let len = self.sm_wallets.len() + 2;
                     if len <= 2 { return; }
@@ -2831,6 +2873,12 @@ fn render_sm_legend(f: &mut Frame, area: Rect) {
 
 /// Render the "Too Smart" cross-market wallet scan view.
 fn render_too_smart(f: &mut Frame, area: Rect, app: &App) {
+    // If in LLM sub-mode, delegate to the LLM view renderer
+    if app.ts_sub_mode == TooSmartSubMode::Llm {
+        render_too_smart_llm(f, area, app);
+        return;
+    }
+
     if app.ts_loading {
         let p = Paragraph::new("\n  Scanning markets for cross-market suspicious wallets…  (may take ~15s)")
             .block(Block::default()
@@ -2880,8 +2928,8 @@ fn render_too_smart(f: &mut Frame, area: Rect, app: &App) {
         .split(list_area);
 
     let title = format!(
-        " Too-Smart Wallets  ({} suspicious  ·  {} markets scanned)  [t] back ",
-        app.ts_wallets.len(), app.ts_markets_scanned
+        " Too-Smart Wallets  ({} suspicious  ·  {} markets  ·  threshold:{:.0}/100)  [ ] sensitivity  [t] back ",
+        app.ts_wallets.len(), app.ts_markets_scanned, app.ts_threshold
     );
 
     let header = Line::from(Span::styled(
@@ -3006,8 +3054,9 @@ fn render_too_smart_legend(f: &mut Frame, area: Rect) {
             Span::styled("Enter ", yw),   Span::styled("drill-in  ", dg),
             Span::styled("a ", yw),       Span::styled("AI analysis  ", dg),
             Span::styled("n/N ", yw),     Span::styled("new scan  ", dg),
+            Span::styled("[ / ] ", yw),   Span::styled("sensitivity  ", dg),
+            Span::styled("l ", yw),       Span::styled("LLM scan  ", dg),
             Span::styled("t ", yw),       Span::styled("Market Focus  ", dg),
-            Span::styled("Esc ", yw),     Span::styled("close detail", dg),
         ]),
     ];
 
@@ -3017,6 +3066,130 @@ fn render_too_smart_legend(f: &mut Frame, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(p, area);
+}
+
+/// Render the LLM-powered Too-Smart view (wallets identified by the LLM).
+fn render_too_smart_llm(f: &mut Frame, area: Rect, app: &App) {
+    let cy = Style::default().fg(Color::Cyan);
+    let dg = Style::default().fg(Color::DarkGray);
+    let yw = Style::default().fg(Color::Yellow);
+    let rd = Style::default().fg(Color::Red);
+
+    if app.ts_llm_loading && app.ts_llm_wallets.is_empty() {
+        let p = Paragraph::new(
+            "\n  LLM is analysing cross-market scan data…\n\n  \
+             The LLM independently identifies suspicious wallets from raw data.\n  \
+             Results stream in live as each suspect is flagged."
+        )
+        .block(Block::default()
+            .title(" Too-Smart: LLM Identification  [l] model view ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    if app.ts_llm_wallets.is_empty() {
+        let msg = "No LLM suspects yet.\n\n\
+            Press 'l' to run the LLM scan — the AI will independently identify\n\
+            suspicious wallets from raw cross-market data.\n\n\
+            Note: requires an LLM backend (--backend anthropic/gemini/openai).";
+        let p = Paragraph::new(msg)
+            .block(Block::default()
+                .title(" Too-Smart: LLM Identification  [l] model view ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Split: wallet list left, detail right (if detail open)
+    let show_detail = app.sm_detail.is_some() || app.sm_detail_loading;
+    let (list_area, detail_area_opt) = if show_detail {
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area);
+        (h[0], Some(h[1]))
+    } else {
+        (area, None)
+    };
+
+    // Vertical split: wallet table | reasoning panel
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(12)])
+        .split(list_area);
+
+    let loading_suffix = if app.ts_llm_loading { "  ● scanning…" } else { "" };
+    let title = format!(
+        " Too-Smart: LLM  ({} suspects){}  [l] model view ",
+        app.ts_llm_wallets.len(), loading_suffix
+    );
+
+    let header = Line::from(Span::styled(
+        format!("  {:<4} {:<24} {:>52}", "Rank", "Name", "Key signals"),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(header),
+        ListItem::new(Line::from(Span::styled(
+            "  ".to_string() + &"─".repeat(82),
+            Style::default().fg(Color::DarkGray),
+        ))),
+    ];
+
+    for w in &app.ts_llm_wallets {
+        let name   = trunc(&w.pseudonym, 24);
+        let rank_c = if w.rank <= 3 { Color::Red } else if w.rank <= 6 { Color::Yellow } else { Color::White };
+        let signals = w.key_signals.iter().take(2).cloned().collect::<Vec<_>>().join("  ·  ");
+        let signals_trunc = trunc(&signals, 50);
+
+        let line = Line::from(vec![
+            Span::styled(format!("  #{:<3}", w.rank), Style::default().fg(rank_c).bold()),
+            Span::styled(format!(" {:<24}", name), Style::default().fg(rank_c)),
+            Span::styled(format!("  {}", signals_trunc), Style::default().fg(Color::DarkGray)),
+        ]);
+        items.push(ListItem::new(line));
+    }
+
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("▶ ");
+
+    let mut state = app.ts_llm_list.clone();
+    f.render_stateful_widget(list, left_chunks[0], &mut state);
+
+    // ── Reasoning panel for selected wallet
+    let reasoning_text = app.ts_llm_list.selected()
+        .and_then(|idx| app.ts_llm_wallets.get(idx.saturating_sub(2)))
+        .map(|w| {
+            let signals = w.key_signals.iter().enumerate()
+                .map(|(i, s)| format!("  {}. {}", i + 1, s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Rank #{} — {}\n\nReasoning:\n  {}\n\nKey signals:\n{}",
+                w.rank, w.pseudonym, w.reasoning, signals)
+        })
+        .unwrap_or_else(|| "Select a wallet row (j/k) to see LLM reasoning.".to_string());
+
+    let reasoning_p = Paragraph::new(reasoning_text)
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .block(Block::default()
+            .title(" LLM Reasoning ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)));
+    f.render_widget(reasoning_p, left_chunks[1]);
+
+    // ── Wallet detail (right panel)
+    if let Some(detail_area) = detail_area_opt {
+        render_sm_wallet_detail(f, detail_area, app);
+    }
+
+    let _ = (cy, dg, yw, rd);
 }
 
 /// Render the wallet detail panel (right side of Smart Money split view).
@@ -4042,6 +4215,32 @@ pub async fn run_tui(
                         app.status = format!(
                             "Too-Smart scan: {} suspicious wallets found across {} markets — Enter to drill in",
                             app.ts_wallets.len(), app.ts_markets_scanned
+                        );
+                    }
+                    AppEvent::TooSmartLlmStarted => {
+                        app.ts_llm_loading = true;
+                        app.ts_llm_wallets.clear();
+                        app.ts_sub_mode = TooSmartSubMode::Llm;
+                        app.status = "LLM scanning for too-smart wallets…".to_string();
+                    }
+                    AppEvent::TooSmartLlmWalletFound { wallet, pseudonym, rank, reasoning, key_signals } => {
+                        // Insert in rank order
+                        let w = LlmIdentifiedWallet { wallet, pseudonym, rank, reasoning, key_signals };
+                        let pos = app.ts_llm_wallets.partition_point(|x| x.rank < w.rank);
+                        app.ts_llm_wallets.insert(pos, w);
+                        if app.ts_llm_list.selected().is_none() && !app.ts_llm_wallets.is_empty() {
+                            app.ts_llm_list.select(Some(2)); // skip header rows
+                        }
+                        app.status = format!(
+                            "LLM identified {} suspect wallet(s) so far…",
+                            app.ts_llm_wallets.len()
+                        );
+                    }
+                    AppEvent::TooSmartLlmDone => {
+                        app.ts_llm_loading = false;
+                        app.status = format!(
+                            "LLM Too-Smart scan complete — {} suspects identified  (l = toggle model/LLM)",
+                            app.ts_llm_wallets.len()
                         );
                     }
                     AppEvent::RefreshStarted => {
@@ -5150,9 +5349,13 @@ async fn handle_key(
             } else if !app.input.is_empty() {
                 send_chat(app, backend, clients, event_tx, llm_history).await;
             } else if app.active_tab == AppTab::SmartMoney {
-                // Drill into the selected wallet (works in both MarketFocus and TooSmart modes)
+                // Drill into the selected wallet (works in MarketFocus and both TooSmart sub-modes)
                 let wallet_addr = if app.sm_mode == SmartMoneyMode::TooSmart {
-                    if let Some(idx) = app.ts_list.selected() {
+                    if app.ts_sub_mode == TooSmartSubMode::Llm {
+                        app.ts_llm_list.selected()
+                            .and_then(|idx| app.ts_llm_wallets.get(idx.saturating_sub(2)))
+                            .map(|w| w.wallet.clone())
+                    } else if let Some(idx) = app.ts_list.selected() {
                         let wallet_idx = idx.saturating_sub(2);
                         app.ts_wallets.get(wallet_idx).map(|w| w.wallet.clone())
                     } else { None }
@@ -5256,10 +5459,15 @@ async fn handle_key(
                 // Kick off the scan if we haven't yet (or on explicit toggle)
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
+                let thresh = app.ts_threshold;
+                let min_app = app.ts_min_appearances;
                 tokio::spawn(async move {
-                    agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+                    agent::refresh_too_smart_wallets(clients_c, 30, min_app, thresh, tx).await;
                 });
-                app.status = "Switched to Too-Smart mode — scanning 30 markets…".to_string();
+                app.status = format!(
+                    "Switched to Too-Smart mode — scanning 30 markets  (threshold: {:.0}/100)…",
+                    app.ts_threshold
+                );
             } else {
                 app.sm_mode = SmartMoneyMode::MarketFocus;
                 app.status = "Switched to Market Focus mode — select a market and press Enter.".to_string();
@@ -5274,18 +5482,69 @@ async fn handle_key(
         {
             let clients_c = clients.clone();
             let tx = event_tx.clone();
+            let thresh  = app.ts_threshold;
+            let min_app = app.ts_min_appearances;
             tokio::spawn(async move {
-                agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+                agent::refresh_too_smart_wallets(clients_c, 30, min_app, thresh, tx).await;
             });
-            app.status = "New scan: re-scanning 30 markets for too-smart wallets…".to_string();
+            app.status = format!(
+                "New scan: re-scanning 30 markets  (threshold: {:.0}/100)…",
+                app.ts_threshold
+            );
+        }
+
+        // ── L = LLM Too-Smart scan (toggle Model/LLM sub-mode, trigger LLM if needed) ──
+        KC::Char('l') if app.input.is_empty()
+            && app.active_tab == AppTab::SmartMoney
+            && app.sm_mode == SmartMoneyMode::TooSmart
+            && app.sm_detail.is_none() && !app.sm_detail_loading =>
+        {
+            if app.ts_sub_mode == TooSmartSubMode::Llm {
+                // Toggle back to model view
+                app.ts_sub_mode = TooSmartSubMode::Model;
+                app.status = "Switched to statistical model view  (l = LLM view)".to_string();
+            } else {
+                // Switch to LLM view and trigger scan
+                app.ts_sub_mode = TooSmartSubMode::Llm;
+                if !app.ts_llm_loading {
+                    if let Some(backend_arc) = backend {
+                        let backend_c = backend_arc.clone();
+                        let clients_c = clients.clone();
+                        let tx        = event_tx.clone();
+                        // Pass pre-fetched static data if available to avoid double-scan
+                        let cached = if !app.ts_wallets.is_empty() {
+                            Some(crate::tools::TooSmartResult {
+                                wallets:         app.ts_wallets.clone(),
+                                markets_scanned: app.ts_markets_scanned,
+                            })
+                        } else {
+                            None
+                        };
+                        tokio::spawn(async move {
+                            agent::run_too_smart_llm_scan(backend_c, clients_c, cached, tx).await;
+                        });
+                        app.status = "LLM Too-Smart scan started — identifying suspects from raw data…".to_string();
+                    } else {
+                        app.status = "No LLM backend configured — start with --backend anthropic/gemini/openai.".to_string();
+                    }
+                } else {
+                    app.status = "LLM scan already in progress…".to_string();
+                }
+            }
         }
 
         // ── AI analyze shortcut for SmartMoney tab ────────────────────────────
         KC::Char('a') if app.input.is_empty() && app.active_tab == AppTab::SmartMoney => {
             let selected: Option<(String, String)> = if app.sm_mode == SmartMoneyMode::TooSmart {
-                app.ts_list.selected()
-                    .and_then(|idx| app.ts_wallets.get(idx.saturating_sub(2)))
-                    .map(|w| (w.wallet.clone(), w.pseudonym.clone()))
+                if app.ts_sub_mode == TooSmartSubMode::Llm {
+                    app.ts_llm_list.selected()
+                        .and_then(|idx| app.ts_llm_wallets.get(idx.saturating_sub(2)))
+                        .map(|w| (w.wallet.clone(), w.pseudonym.clone()))
+                } else {
+                    app.ts_list.selected()
+                        .and_then(|idx| app.ts_wallets.get(idx.saturating_sub(2)))
+                        .map(|w| (w.wallet.clone(), w.pseudonym.clone()))
+                }
             } else {
                 app.sm_list.selected()
                     .and_then(|idx| app.sm_wallets.get(idx.saturating_sub(2)))
@@ -5293,19 +5552,29 @@ async fn handle_key(
             };
             if let Some((addr, pname)) = selected {
                 let context = if app.sm_mode == SmartMoneyMode::TooSmart {
-                    app.ts_wallets.iter()
-                        .find(|w| w.wallet == addr)
-                        .map(|w| format!(
-                            "Cross-market profile: appeared in {}/{} scanned markets as top trader, \
-                             avg suspicion {:.0}/100 (max {:.0}/100), global win rate {:.1}%, \
-                             total vol ${:.0}. Flagged markets: {}.",
-                            w.markets_flagged, w.markets_total,
-                            w.avg_suspicion, w.max_suspicion,
-                            w.global_win_rate * 100.0,
-                            w.total_vol,
-                            w.flagged_markets.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
-                        ))
-                        .unwrap_or_default()
+                    if app.ts_sub_mode == TooSmartSubMode::Llm {
+                        app.ts_llm_wallets.iter()
+                            .find(|w| w.wallet == addr)
+                            .map(|w| format!(
+                                "LLM-identified suspect (rank #{}) — Reasoning: {} Signals: {}",
+                                w.rank, w.reasoning, w.key_signals.join("; ")
+                            ))
+                            .unwrap_or_default()
+                    } else {
+                        app.ts_wallets.iter()
+                            .find(|w| w.wallet == addr)
+                            .map(|w| format!(
+                                "Cross-market profile: appeared in {}/{} scanned markets as top trader, \
+                                 avg suspicion {:.0}/100 (max {:.0}/100), global win rate {:.1}%, \
+                                 total vol ${:.0}. Flagged markets: {}.",
+                                w.markets_flagged, w.markets_total,
+                                w.avg_suspicion, w.max_suspicion,
+                                w.global_win_rate * 100.0,
+                                w.total_vol,
+                                w.flagged_markets.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+                            ))
+                            .unwrap_or_default()
+                    }
                 } else {
                     app.sm_wallets.iter()
                         .find(|w| w.wallet == addr)
@@ -5350,10 +5619,15 @@ async fn handle_key(
             if app.active_tab == AppTab::SmartMoney && app.sm_mode == SmartMoneyMode::TooSmart {
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
+                let thresh  = app.ts_threshold;
+                let min_app = app.ts_min_appearances;
                 tokio::spawn(async move {
-                    agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+                    agent::refresh_too_smart_wallets(clients_c, 30, min_app, thresh, tx).await;
                 });
-                app.status = "Re-scanning 30 markets for too-smart wallets…".to_string();
+                app.status = format!(
+                    "Re-scanning 30 markets  (threshold: {:.0}/100)…",
+                    app.ts_threshold
+                );
             } else {
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
@@ -5381,11 +5655,26 @@ async fn handle_key(
         {
             match app.active_tab {
                 AppTab::SmartMoney => {
-                    app.coord_threshold = (app.coord_threshold - 0.05).max(0.05);
-                    app.status = format!(
-                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
-                        app.coord_threshold * 100.0,
-                    );
+                    if app.sm_mode == SmartMoneyMode::TooSmart {
+                        app.ts_threshold = (app.ts_threshold - 5.0).max(5.0);
+                        let thresh  = app.ts_threshold;
+                        let min_app = app.ts_min_appearances;
+                        let clients_c = clients.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            agent::refresh_too_smart_wallets(clients_c, 30, min_app, thresh, tx).await;
+                        });
+                        app.status = format!(
+                            "Suspicion threshold → {:.0}/100  (re-scanning)…",
+                            app.ts_threshold
+                        );
+                    } else {
+                        app.coord_threshold = (app.coord_threshold - 0.05).max(0.05);
+                        app.status = format!(
+                            "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                            app.coord_threshold * 100.0,
+                        );
+                    }
                 }
                 AppTab::Pairs => {
                     app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold - 0.05).max(0.05);
@@ -5402,11 +5691,26 @@ async fn handle_key(
         {
             match app.active_tab {
                 AppTab::SmartMoney => {
-                    app.coord_threshold = (app.coord_threshold + 0.05).min(0.95);
-                    app.status = format!(
-                        "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
-                        app.coord_threshold * 100.0,
-                    );
+                    if app.sm_mode == SmartMoneyMode::TooSmart {
+                        app.ts_threshold = (app.ts_threshold + 5.0).min(90.0);
+                        let thresh  = app.ts_threshold;
+                        let min_app = app.ts_min_appearances;
+                        let clients_c = clients.clone();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            agent::refresh_too_smart_wallets(clients_c, 30, min_app, thresh, tx).await;
+                        });
+                        app.status = format!(
+                            "Suspicion threshold → {:.0}/100  (re-scanning)…",
+                            app.ts_threshold
+                        );
+                    } else {
+                        app.coord_threshold = (app.coord_threshold + 0.05).min(0.95);
+                        app.status = format!(
+                            "Coord threshold → {:.0}%  (re-load Smart Money to apply)",
+                            app.coord_threshold * 100.0,
+                        );
+                    }
                 }
                 AppTab::Pairs => {
                     app.pairs_jaccard_threshold = (app.pairs_jaccard_threshold + 0.05).min(0.95);
