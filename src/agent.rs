@@ -47,6 +47,9 @@ pub enum AppEvent {
     WalletDetailLoading,
     WalletDetailLoaded(crate::tools::WalletDetail),
 
+    TooSmartLoading,
+    TooSmartLoaded(crate::tools::TooSmartResult),
+
     // ── Time & Sales tape ─────────────────────────────────────────────────────
     TradesLoaded {
         market_id: String,
@@ -457,6 +460,25 @@ pub async fn refresh_smart_money(
         }
         Err(e) => {
             let _ = event_tx.send(AppEvent::RefreshError(format!("Smart money: {}", e)));
+        }
+    }
+}
+
+/// Scan multiple Polymarket markets to find "too smart" wallets with persistent
+/// cross-market suspicion.
+pub async fn refresh_too_smart_wallets(
+    clients:      Arc<MarketClients>,
+    market_limit: usize,
+    event_tx:     mpsc::UnboundedSender<AppEvent>,
+) {
+    let _ = event_tx.send(AppEvent::TooSmartLoading);
+
+    match tools::scan_too_smart_wallets(&clients, market_limit, 2, 35.0).await {
+        Ok(result) => {
+            let _ = event_tx.send(AppEvent::TooSmartLoaded(result));
+        }
+        Err(e) => {
+            let _ = event_tx.send(AppEvent::RefreshError(format!("Too-smart scan: {}", e)));
         }
     }
 }

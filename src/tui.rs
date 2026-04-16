@@ -42,7 +42,7 @@ use crate::markets::{ChartInterval, Market, Orderbook, Platform};
 use crate::markets::polymarket::PolyTrade;
 use crate::portfolio::{self, Portfolio, Position, Session, Side, WatchEntry};
 use crate::signals::{self, Signal, SignalKind};
-use crate::tools::{MarketClients, SmartMoneyWallet};
+use crate::tools::{MarketClients, SmartMoneyWallet, TooSmartWallet};
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
@@ -228,6 +228,7 @@ pub struct App {
     pub pos_draft:         PosDraft,
 
     // Smart Money tab
+    pub sm_mode:            SmartMoneyMode,
     pub sm_wallets:         Vec<SmartMoneyWallet>,
     pub sm_market_title:    String,
     pub sm_coord_pairs:     Vec<(String, String, f64)>,
@@ -237,6 +238,11 @@ pub struct App {
     pub sm_detail:          Option<crate::tools::WalletDetail>,
     pub sm_detail_loading:  bool,
     pub sm_detail_scroll:   u16,
+    // Too-Smart cross-market scan
+    pub ts_wallets:          Vec<TooSmartWallet>,
+    pub ts_markets_scanned:  usize,
+    pub ts_loading:          bool,
+    pub ts_list:             ListState,
 
     // Time & Sales tab
     pub trades_data:      Vec<PolyTrade>,
@@ -330,6 +336,16 @@ pub struct App {
     pub news_error:      Option<String>,
 }
 
+// Smart Money view mode
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmartMoneyMode {
+    /// Per-market view: top traders for the selected market (original behaviour).
+    #[default]
+    MarketFocus,
+    /// Cross-market view: wallets that are suspicious across many markets.
+    TooSmart,
+}
+
 // Position add-flow state machine
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum PosInputStep {
@@ -386,6 +402,7 @@ impl App {
             pos_input_mode:    false,
             pos_input_step:    PosInputStep::default(),
             pos_draft:         PosDraft::default(),
+            sm_mode:            SmartMoneyMode::MarketFocus,
             sm_wallets:         Vec::new(),
             sm_market_title:    String::new(),
             sm_coord_pairs:     Vec::new(),
@@ -394,6 +411,10 @@ impl App {
             sm_detail:          None,
             sm_detail_loading:  false,
             sm_detail_scroll:   0,
+            ts_wallets:          Vec::new(),
+            ts_markets_scanned:  0,
+            ts_loading:          false,
+            ts_list:             ListState::default(),
             trades_data:       Vec::new(),
             trades_list:       ListState::default(),
             chart_candles:     Vec::new(),
@@ -589,10 +610,15 @@ impl App {
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_add(1); }
             Tab::SmartMoney => {
                 if self.sm_detail.is_some() || self.sm_detail_loading {
-                    // In detail view: scroll down through trade history
                     self.sm_detail_scroll = self.sm_detail_scroll.saturating_add(1);
+                } else if self.sm_mode == SmartMoneyMode::TooSmart {
+                    let len = self.ts_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.ts_list.selected().map(|i| {
+                        if i + 1 >= len { 2 } else { i + 1 }
+                    }).unwrap_or(2);
+                    self.ts_list.select(Some(i));
                 } else {
-                    // In list view: navigate wallets
                     let len = self.sm_wallets.len() + 2;
                     if len <= 2 { return; }
                     let i = self.sm_list.selected().map(|i| {
@@ -653,10 +679,15 @@ impl App {
             Tab::Orderbook  => { self.book_scroll = self.book_scroll.saturating_sub(1); }
             Tab::SmartMoney => {
                 if self.sm_detail.is_some() || self.sm_detail_loading {
-                    // In detail view: scroll up through trade history
                     self.sm_detail_scroll = self.sm_detail_scroll.saturating_sub(1);
+                } else if self.sm_mode == SmartMoneyMode::TooSmart {
+                    let len = self.ts_wallets.len() + 2;
+                    if len <= 2 { return; }
+                    let i = self.ts_list.selected()
+                        .map(|i| if i <= 2 { len - 1 } else { i - 1 })
+                        .unwrap_or(2);
+                    self.ts_list.select(Some(i));
                 } else {
-                    // In list view: navigate wallets
                     let len = self.sm_wallets.len() + 2;
                     if len <= 2 { return; }
                     let i = self.sm_list.selected()
@@ -2568,6 +2599,11 @@ fn render_trades(f: &mut Frame, area: Rect, app: &App) {
 // ── Smart Money tab ───────────────────────────────────────────────────────────
 
 fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
+    if app.sm_mode == SmartMoneyMode::TooSmart {
+        render_too_smart(f, area, app);
+        return;
+    }
+
     if app.sm_loading {
         let p = Paragraph::new("\n  Fetching top traders…  (this may take a few seconds)")
             .block(Block::default().title(" Smart Money ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
@@ -2605,7 +2641,7 @@ fn render_smart_money(f: &mut Frame, area: Rect, app: &App) {
         .constraints([
             Constraint::Min(0),
             Constraint::Length(app.sm_coord_pairs.len().max(1) as u16 + 3),
-            Constraint::Length(13),
+            Constraint::Length(15),
         ])
         .split(list_area);
 
@@ -2755,9 +2791,23 @@ fn render_sm_legend(f: &mut Frame, area: Rect) {
             Span::styled("0–100 composite score", hi),
         ]),
         Line::from(vec![
-            Span::styled("  Suspicion = ", dg),
-            Span::styled("fresh×0.4 + vol_anomaly×0.35 + win_rate×0.25", hi),
-            Span::styled("  (×1.2/1.3/1.5 for 2/3 signals / niche market)", dg),
+            Span::styled("  Score = ", dg),
+            Span::styled("S1×0.28 + S2×0.22 + S3×0.18 + S4×0.18 + S5×0.14", hi),
+            Span::styled("  ×1.25/×1.50/×1.75 (2/3/4 signals)  ×1.5 niche", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  S1 ", dg), Span::styled("stat-edge ", hi),
+            Span::styled("Wilson LB>50% (n≥5)  ", dg),
+            Span::styled("S2 ", dg), Span::styled("alpha ", hi),
+            Span::styled("avg win entry<45¢  ", dg),
+            Span::styled("S3 ", dg), Span::styled("sizing ", hi),
+            Span::styled("wins in top-half bets", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  S4 ", dg), Span::styled("fresh+conc ", hi),
+            Span::styled("new wallet × bet conc × vol-impact  ", dg),
+            Span::styled("S5 ", dg), Span::styled("recency ", hi),
+            Span::styled("edge improving over time", dg),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2768,12 +2818,203 @@ fn render_sm_legend(f: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  j/k ", yw),  Span::styled("navigate / scroll  ", dg),
-            Span::styled("@ ", yw),      Span::styled("pre-fill AI prompt for selected market", dg),
+            Span::styled("a ", yw),      Span::styled("AI wallet analysis  ", dg),
+            Span::styled("t ", yw),      Span::styled("switch to Too-Smart cross-market view", dg),
         ]),
     ];
 
     let p = Paragraph::new(lines)
         .block(Block::default().title(" Legend & Keys ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+/// Render the "Too Smart" cross-market wallet scan view.
+fn render_too_smart(f: &mut Frame, area: Rect, app: &App) {
+    if app.ts_loading {
+        let p = Paragraph::new("\n  Scanning markets for cross-market suspicious wallets…  (may take ~15s)")
+            .block(Block::default()
+                .title(" Too-Smart Scan ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    if app.ts_wallets.is_empty() {
+        let msg = if app.ts_markets_scanned > 0 {
+            format!(
+                "No cross-market suspicious wallets found across {} scanned markets.\n\
+                 Try pressing 't' to re-scan or lower the suspicion threshold.",
+                app.ts_markets_scanned
+            )
+        } else {
+            "Press 't' to switch to Too-Smart mode and scan for suspicious wallets across markets.\n\
+             This scans 30 recent markets and finds wallets that are consistently flagged.".to_string()
+        };
+        let p = Paragraph::new(msg)
+            .block(Block::default()
+                .title(" Too-Smart Wallets  [t] back to Market Focus ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Split: wallet list left (if detail open split 50/50, else full)
+    let show_detail = app.sm_detail.is_some() || app.sm_detail_loading;
+    let (list_area, detail_area_opt) = if show_detail {
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area);
+        (h[0], Some(h[1]))
+    } else {
+        (area, None)
+    };
+
+    // ── Vertical split: wallet table | detection legend
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(16)])
+        .split(list_area);
+
+    let title = format!(
+        " Too-Smart Wallets  ({} suspicious  ·  {} markets scanned)  [t] back ",
+        app.ts_wallets.len(), app.ts_markets_scanned
+    );
+
+    let header = Line::from(Span::styled(
+        format!("  {:<22} {:>6} {:>6} {:>9} {:>9} {:>8} {:>10}",
+            "Name", "Mrkts", "Flagd", "AvgSusp", "MaxSusp", "WinRate", "Vol($)"),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(header),
+        ListItem::new(Line::from(Span::styled(
+            "  ".to_string() + &"─".repeat(82),
+            Style::default().fg(Color::DarkGray),
+        ))),
+    ];
+
+    for w in &app.ts_wallets {
+        let name = trunc(&w.pseudonym, 22);
+        let flagged_col = if w.avg_suspicion >= 70.0 { Color::Red }
+                          else if w.avg_suspicion >= 40.0 { Color::Yellow }
+                          else { Color::White };
+        let flag_sym = if w.avg_suspicion >= 40.0 { "⚠" } else { " " };
+        let fresh_sym = if w.is_fresh { "N" } else { " " };
+
+        let line = Line::from(vec![
+            Span::styled(format!("{}{} ", fresh_sym, flag_sym), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:<22}", name), Style::default().fg(flagged_col).bold()),
+            Span::raw(format!(" {:>4}/{:<1}", w.markets_flagged, w.markets_total)),
+            Span::raw(format!("  {:>4}", w.markets_flagged)),
+            Span::styled(
+                format!(" {:>7.0}/100", w.avg_suspicion),
+                Style::default().fg(flagged_col),
+            ),
+            Span::styled(
+                format!(" {:>7.0}/100", w.max_suspicion),
+                Style::default().fg(if w.max_suspicion >= 70.0 { Color::Red } else { Color::Yellow }),
+            ),
+            Span::styled(
+                format!(" {:>7.1}%", w.global_win_rate * 100.0),
+                Style::default().fg(
+                    if w.global_win_rate >= 0.7 { Color::Red }
+                    else if w.global_win_rate >= 0.55 { Color::Yellow }
+                    else { Color::White }
+                ),
+            ),
+            Span::raw(format!(" {:>9.0}", w.total_vol)),
+        ]);
+        items.push(ListItem::new(line));
+    }
+
+    let list = List::new(items)
+        .block(Block::default().title(title).borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("▶ ");
+
+    let mut state = app.ts_list.clone();
+    f.render_stateful_widget(list, left_chunks[0], &mut state);
+
+    // ── Detection logic legend
+    render_too_smart_legend(f, left_chunks[1]);
+
+    // ── Wallet detail (right panel)
+    if let Some(detail_area) = detail_area_opt {
+        render_sm_wallet_detail(f, detail_area, app);
+    }
+}
+
+/// Detection-logic legend for the Too-Smart cross-market scan view.
+///
+/// Explains how the three-signal suspicion score is computed and what the
+/// column headers in the wallet list mean.
+fn render_too_smart_legend(f: &mut Frame, area: Rect) {
+    let dg = Style::default().fg(Color::DarkGray);
+    let hi = Style::default().fg(Color::White);
+    let yw = Style::default().fg(Color::Yellow);
+    let rd = Style::default().fg(Color::Red);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Score = ", dg),
+            Span::styled("S1×0.28 + S2×0.22 + S3×0.18 + S4×0.18 + S5×0.14", hi),
+            Span::styled("  ×1.25/×1.50/×1.75 (2/3/4+ signals > 15%)", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  S1 ", dg), Span::styled("stat-edge  ", yw),
+            Span::styled("Wilson LB 95%CI > 50%  n≥5  │  ", dg),
+            Span::styled("S2 ", dg), Span::styled("alpha  ", hi),
+            Span::styled("avg entry on wins < 45¢  │  ", dg),
+            Span::styled("niche ", rd), Span::styled("×1.5 if vol<$50k", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  S3 ", dg), Span::styled("inf-sizing  ", hi),
+            Span::styled("wins skewed to larger bets (>60% in top-half)  │  ", dg),
+            Span::styled("S4 ", dg), Span::styled("fresh×conc  ", yw),
+            Span::styled("new wallet, concentrated, vol-impact", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  S5 ", dg), Span::styled("recency  ", rd),
+            Span::styled("recency-weighted win rate > raw win rate + 10pp", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  AvgSusp ", dg),
+            Span::styled("mean score across all scanned markets  │  ", hi),
+            Span::styled("MaxSusp ", dg),
+            Span::styled("peak score in any single market  │  ", hi),
+            Span::styled("⚠ ", yw),
+            Span::styled("flagged (≥40)", dg),
+        ]),
+        Line::from(vec![
+            Span::styled("  Mrkts ", dg),
+            Span::styled("markets flagged / total appearances  │  ", hi),
+            Span::styled("N ", yw),
+            Span::styled("fresh wallet  │  ", dg),
+            Span::styled("WinRate ", dg),
+            Span::styled("aggregated across history", hi),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  j/k↑↓ ", yw), Span::styled("navigate  ", dg),
+            Span::styled("Enter ", yw),   Span::styled("drill-in  ", dg),
+            Span::styled("a ", yw),       Span::styled("AI analysis  ", dg),
+            Span::styled("n/N ", yw),     Span::styled("new scan  ", dg),
+            Span::styled("t ", yw),       Span::styled("Market Focus  ", dg),
+            Span::styled("Esc ", yw),     Span::styled("close detail", dg),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default()
+            .title(" Detection Logic & Keys ")
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(p, area);
 }
@@ -2792,8 +3033,12 @@ fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
 
     let Some(detail) = &app.sm_detail else { return };
 
-    // ── Stats header (fixed height) ────────────────────────────────────────
-    let stats_height: u16 = 10;
+    // Look up matching SmartMoneyWallet for signal breakdown
+    let sm_wallet = app.sm_wallets.iter()
+        .find(|w| w.wallet == detail.wallet);
+
+    // ── Stats header (fixed height, larger to fit signal breakdown) ──────────
+    let stats_height: u16 = 18;
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(stats_height), Constraint::Min(0)])
@@ -2812,7 +3057,53 @@ fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
         format!("{:.1}¢", detail.alpha_score * 100.0)
     };
 
-    let stats_lines = vec![
+    // Signal score bar helper: ████░░░░ style bar (8 chars)
+    let score_bar = |s: f64| -> String {
+        let filled = (s * 8.0).round() as usize;
+        format!("{}{}", "█".repeat(filled.min(8)), "░".repeat(8 - filled.min(8)))
+    };
+
+    // Build signal lines if we have SmartMoneyWallet data
+    let signal_lines: Vec<Line> = if let Some(sw) = sm_wallet {
+        let sigs = sw.signal_scores;
+        let lb_str = if sw.stat_lower_bound.is_nan() { "n/a".to_string() }
+                     else { format!("LB={:.0}%", sw.stat_lower_bound * 100.0) };
+        let roi_str = if sw.profit_roi.is_nan() { "—".to_string() }
+                      else { format!("ROI={:.0}%", sw.profit_roi * 100.0) };
+        let sig_color = |s: f64| if s > 0.6 { Color::Red } else if s > 0.2 { Color::Yellow } else { Color::DarkGray };
+        vec![
+            Line::from(Span::styled("  ─── Suspicion Signals ─────────────────────────────────", Style::default().fg(Color::DarkGray))),
+            Line::from(vec![
+                Span::styled("  S1 Stat edge    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[0]), Style::default().fg(sig_color(sigs[0]))),
+                Span::styled(format!(" {:>4.0}/100  {}", sigs[0]*100.0, lb_str), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("  S2 Alpha entry  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[1]), Style::default().fg(sig_color(sigs[1]))),
+                Span::styled(format!(" {:>4.0}/100  avg={}", sigs[1]*100.0, alpha_str), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("  S3 Inf. sizing  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[2]), Style::default().fg(sig_color(sigs[2]))),
+                Span::styled(format!(" {:>4.0}/100  top-half={:.0}%", sigs[2]*100.0, sw.informed_sizing*100.0), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("  S4 Fresh+conc   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[3]), Style::default().fg(sig_color(sigs[3]))),
+                Span::styled(format!(" {:>4.0}/100  {}", sigs[3]*100.0, roi_str), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("  S5 Recency acc. ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[4]), Style::default().fg(sig_color(sigs[4]))),
+                Span::styled(format!(" {:>4.0}/100  suspicion={:.0}/100", sigs[4]*100.0, sw.suspicion), Style::default().fg(Color::DarkGray)),
+            ]),
+        ]
+    } else {
+        vec![Line::from("")]
+    };
+
+    let mut stats_lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Wallet  ", Style::default().fg(Color::DarkGray)),
@@ -2852,12 +3143,13 @@ fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
                     .collect::<Vec<_>>().join("  ·  ")
             ),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  j/k scroll  ·  Esc to return",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
+    stats_lines.extend(signal_lines);
+    stats_lines.push(Line::from(""));
+    stats_lines.push(Line::from(Span::styled(
+        "  j/k scroll  ·  Esc to return",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let stats_p = Paragraph::new(stats_lines)
         .block(Block::default()
@@ -3731,6 +4023,26 @@ pub async fn run_tui(
                         app.sm_detail_loading = false;
                         app.status = format!("Wallet: {} — {} trades", detail.pseudonym, detail.recent_trades.len());
                         app.sm_detail = Some(detail);
+                    }
+                    AppEvent::TooSmartLoading => {
+                        app.ts_loading = true;
+                        app.ts_wallets.clear();
+                        app.ts_markets_scanned = 0;
+                        app.status = "Scanning markets for cross-market suspicious wallets…".to_string();
+                    }
+                    AppEvent::TooSmartLoaded(result) => {
+                        app.ts_loading = false;
+                        app.ts_markets_scanned = result.markets_scanned;
+                        app.ts_wallets = result.wallets;
+                        app.sm_detail = None;
+                        app.sm_detail_loading = false;
+                        if !app.ts_wallets.is_empty() {
+                            app.ts_list.select(Some(2)); // skip header rows
+                        }
+                        app.status = format!(
+                            "Too-Smart scan: {} suspicious wallets found across {} markets — Enter to drill in",
+                            app.ts_wallets.len(), app.ts_markets_scanned
+                        );
                     }
                     AppEvent::RefreshStarted => {
                         app.is_loading = true;
@@ -4838,17 +5150,24 @@ async fn handle_key(
             } else if !app.input.is_empty() {
                 send_chat(app, backend, clients, event_tx, llm_history).await;
             } else if app.active_tab == AppTab::SmartMoney {
-                // Drill into the selected wallet
-                if let Some(idx) = app.sm_list.selected() {
-                    let wallet_idx = idx.saturating_sub(2); // skip 2 header rows
-                    if let Some(w) = app.sm_wallets.get(wallet_idx) {
-                        let wallet_addr = w.wallet.clone();
-                        let clients_c = clients.clone();
-                        let tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            agent::refresh_wallet_detail(clients_c, wallet_addr, tx).await;
-                        });
-                    }
+                // Drill into the selected wallet (works in both MarketFocus and TooSmart modes)
+                let wallet_addr = if app.sm_mode == SmartMoneyMode::TooSmart {
+                    if let Some(idx) = app.ts_list.selected() {
+                        let wallet_idx = idx.saturating_sub(2);
+                        app.ts_wallets.get(wallet_idx).map(|w| w.wallet.clone())
+                    } else { None }
+                } else {
+                    if let Some(idx) = app.sm_list.selected() {
+                        let wallet_idx = idx.saturating_sub(2);
+                        app.sm_wallets.get(wallet_idx).map(|w| w.wallet.clone())
+                    } else { None }
+                };
+                if let Some(addr) = wallet_addr {
+                    let clients_c = clients.clone();
+                    let tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        agent::refresh_wallet_detail(clients_c, addr, tx).await;
+                    });
                 }
             } else {
                 // Load chart + orderbook from selected market (Markets or Signals)
@@ -4905,7 +5224,11 @@ async fn handle_key(
             app.sm_detail         = None;
             app.sm_detail_loading = false;
             app.sm_detail_scroll  = 0;
-            app.status = "Back to wallet list.".to_string();
+            app.status = if app.sm_mode == SmartMoneyMode::TooSmart {
+                "Back to Too-Smart wallet list.".to_string()
+            } else {
+                "Back to wallet list.".to_string()
+            };
         }
 
         KC::Esc if app.input.is_empty() && !app.search.is_empty() => {
@@ -4922,6 +5245,95 @@ async fn handle_key(
             app.show_help = !app.show_help;
         }
 
+        // ── Smart Money mode toggle (t = toggle between MarketFocus / TooSmart) ──
+        KC::Char('t') if app.input.is_empty() && app.active_tab == AppTab::SmartMoney
+            && app.sm_detail.is_none() && !app.sm_detail_loading =>
+        {
+            app.sm_detail = None;
+            app.sm_detail_loading = false;
+            if app.sm_mode == SmartMoneyMode::MarketFocus {
+                app.sm_mode = SmartMoneyMode::TooSmart;
+                // Kick off the scan if we haven't yet (or on explicit toggle)
+                let clients_c = clients.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+                });
+                app.status = "Switched to Too-Smart mode — scanning 30 markets…".to_string();
+            } else {
+                app.sm_mode = SmartMoneyMode::MarketFocus;
+                app.status = "Switched to Market Focus mode — select a market and press Enter.".to_string();
+            }
+        }
+
+        // ── N = new scan (re-run Too-Smart scan) ─────────────────────────────
+        KC::Char('n') | KC::Char('N') if app.input.is_empty()
+            && app.active_tab == AppTab::SmartMoney
+            && app.sm_mode == SmartMoneyMode::TooSmart
+            && app.sm_detail.is_none() && !app.sm_detail_loading =>
+        {
+            let clients_c = clients.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+            });
+            app.status = "New scan: re-scanning 30 markets for too-smart wallets…".to_string();
+        }
+
+        // ── AI analyze shortcut for SmartMoney tab ────────────────────────────
+        KC::Char('a') if app.input.is_empty() && app.active_tab == AppTab::SmartMoney => {
+            let selected: Option<(String, String)> = if app.sm_mode == SmartMoneyMode::TooSmart {
+                app.ts_list.selected()
+                    .and_then(|idx| app.ts_wallets.get(idx.saturating_sub(2)))
+                    .map(|w| (w.wallet.clone(), w.pseudonym.clone()))
+            } else {
+                app.sm_list.selected()
+                    .and_then(|idx| app.sm_wallets.get(idx.saturating_sub(2)))
+                    .map(|w| (w.wallet.clone(), w.pseudonym.clone()))
+            };
+            if let Some((addr, pname)) = selected {
+                let context = if app.sm_mode == SmartMoneyMode::TooSmart {
+                    app.ts_wallets.iter()
+                        .find(|w| w.wallet == addr)
+                        .map(|w| format!(
+                            "Cross-market profile: appeared in {}/{} scanned markets as top trader, \
+                             avg suspicion {:.0}/100 (max {:.0}/100), global win rate {:.1}%, \
+                             total vol ${:.0}. Flagged markets: {}.",
+                            w.markets_flagged, w.markets_total,
+                            w.avg_suspicion, w.max_suspicion,
+                            w.global_win_rate * 100.0,
+                            w.total_vol,
+                            w.flagged_markets.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+                        ))
+                        .unwrap_or_default()
+                } else {
+                    app.sm_wallets.iter()
+                        .find(|w| w.wallet == addr)
+                        .map(|w| format!(
+                            "Market: {}. Position ${:.0}, suspicion {:.0}/100, win rate {:.1}%.",
+                            app.sm_market_title, w.market_size, w.suspicion, w.win_rate * 100.0
+                        ))
+                        .unwrap_or_default()
+                };
+                app.input = format!(
+                    "Analyze this Polymarket wallet: {} (pseudonym: {}).\n\
+                     Context: {}\n\n\
+                     1. Call `analyze_wallet` with wallet=\"{}\" for their full trade history and performance profile.\n\
+                     2. Call `get_wallet_positions` for their current open positions.\n\
+                     3. For their top markets by exposure, call `get_price_history` to check entry timing.\n\
+                     Then give me:\n\
+                     • Suspicion assessment: informed trader, insider, or just lucky?\n\
+                     • Win-rate and alpha-entry score interpretation.\n\
+                     • Top 3 actionable signals or red flags from their trading pattern.",
+                    addr, pname, context, addr
+                );
+                app.active_tab = Tab::Chat;
+                app.status = "Wallet analysis prompt ready — press Enter to send.".to_string();
+            } else {
+                app.status = "Select a wallet row first (j/k to navigate).".to_string();
+            }
+        }
+
         // ── Risk view toggle (Portfolio tab) ─────────────────────────────────
         KC::Char('v') if app.input.is_empty() && app.active_tab == AppTab::Portfolio => {
             app.show_risk_view = !app.show_risk_view;
@@ -4934,14 +5346,24 @@ async fn handle_key(
 
         // ── Refresh shortcut ──────────────────────────────────────────────────
         KC::Char('^') if app.input.is_empty() => {
-            let clients_c = clients.clone();
-            let tx = event_tx.clone();
-            tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
-            if app.selected_market_id.is_some() {
-                trigger_chart_load(app, clients, event_tx).await;
-                trigger_orderbook_load(app, clients, event_tx).await;
+            // In Too-Smart mode: re-run the cross-market scan instead of a full market refresh
+            if app.active_tab == AppTab::SmartMoney && app.sm_mode == SmartMoneyMode::TooSmart {
+                let clients_c = clients.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    agent::refresh_too_smart_wallets(clients_c, 30, tx).await;
+                });
+                app.status = "Re-scanning 30 markets for too-smart wallets…".to_string();
+            } else {
+                let clients_c = clients.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+                if app.selected_market_id.is_some() {
+                    trigger_chart_load(app, clients, event_tx).await;
+                    trigger_orderbook_load(app, clients, event_tx).await;
+                }
+                app.status = "Refreshing…".to_string();
             }
-            app.status = "Refreshing…".to_string();
         }
 
         // ── AI analyze shortcut ───────────────────────────────────────────────

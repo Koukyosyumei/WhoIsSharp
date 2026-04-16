@@ -631,13 +631,22 @@ pub struct SmartMoneyWallet {
     pub total_vol:       f64,
     pub suspicion:       f64,    // 0–100 composite
     pub flagged:         bool,
-    /// True when the wallet has very few lifetime trades and all are recent —
-    /// approximates the "fresh wallet" signal from polymarket-insider-tracker.
     pub is_fresh:        bool,
-    /// Approx days since the wallet's oldest observed trade (None if unknown).
     pub wallet_age_days: Option<f64>,
-    /// Wallet's position size in this market / market daily volume (0.0 if vol unknown).
     pub volume_impact:   f64,
+    /// Wilson score lower bound (95% CI) on win rate — the statistically
+    /// conservative estimate of the wallet's true edge (NaN if < 5 positions).
+    pub stat_lower_bound: f64,
+    /// Fraction of the wallet's wins that come from their above-median-sized
+    /// positions (0.5 = random; > 0.65 = suspects sizing up on information).
+    pub informed_sizing:  f64,
+    /// Realised ROI on known winning positions:
+    /// (payout − cost) / cost  =  (1 − avg_entry) / avg_entry  on wins.
+    /// NaN if no winning trades in history.
+    pub profit_roi:       f64,
+    /// Per-signal scores [stat_edge, alpha, informed_sizing, fresh_conc, recency]
+    /// in that order; each in [0, 1].  Useful for displaying a breakdown.
+    pub signal_scores:    [f64; 5],
 }
 
 /// Result returned by `smart_money_for_market` for TUI consumption.
@@ -646,6 +655,220 @@ pub struct SmartMoneyResult {
     pub market_title: String,
     pub wallets:      Vec<SmartMoneyWallet>,
     pub coord_pairs:  Vec<(String, String, f64)>, // (name_a, name_b, jaccard)
+}
+
+// ─── Too-Smart wallet scan (cross-market) ────────────────────────────────────
+
+/// A wallet that shows suspicious behaviour across multiple markets.
+/// Produced by `scan_too_smart_wallets` which aggregates per-market suspicion scores.
+#[derive(Clone, Debug)]
+pub struct TooSmartWallet {
+    pub wallet:          String,
+    pub pseudonym:       String,
+    /// Number of scanned markets where this wallet appeared as a top trader.
+    pub markets_total:   usize,
+    /// Number of those markets where suspicion ≥ 40.
+    pub markets_flagged: usize,
+    /// Average suspicion score across all appearances.
+    pub avg_suspicion:   f64,
+    /// Highest suspicion score in any single market.
+    pub max_suspicion:   f64,
+    /// Total buy-side dollar volume observed across all scanned markets.
+    pub total_vol:       f64,
+    /// Aggregated win rate (wins / positions from the wallet's trade history).
+    pub global_win_rate: f64,
+    /// True if the wallet was classified as "fresh" in any of its appearances.
+    pub is_fresh:        bool,
+    /// Titles of markets where this wallet was flagged (suspicion ≥ 40).
+    pub flagged_markets: Vec<String>,
+}
+
+/// Result of `scan_too_smart_wallets`.
+#[derive(Debug)]
+pub struct TooSmartResult {
+    pub wallets:         Vec<TooSmartWallet>,
+    pub markets_scanned: usize,
+}
+
+/// Internal per-wallet row produced by `market_wallet_scores`.
+struct MarketWalletScore {
+    wallet:       String,
+    pseudonym:    String,
+    suspicion:    f64,
+    is_fresh:     bool,
+    win_rate:     f64,
+    total_vol:    f64,
+    market_title: String,
+}
+
+/// Fetch suspicion scores for ALL top wallets in a single market.
+/// Similar to `quick_market_scan` but returns every ranked wallet, not just the best.
+async fn market_wallet_scores(
+    clients:       &MarketClients,
+    market_id:     &str,
+    market_title:  &str,
+    market_volume: Option<f64>,
+    top_n:         usize,
+) -> Vec<MarketWalletScore> {
+    use std::collections::HashMap;
+    use futures_util::future::join_all;
+
+    let Ok(trades) = clients.polymarket.fetch_market_trades(market_id, 100).await else {
+        return Vec::new();
+    };
+    if trades.is_empty() { return Vec::new(); }
+
+    let mut agg: HashMap<String, (f64, String)> = HashMap::new();
+    for t in &trades {
+        if t.side == "BUY" {
+            let e = agg.entry(t.wallet.clone()).or_insert((0.0, t.pseudonym.clone()));
+            e.0 += t.size;
+        }
+    }
+    let mut ranked: Vec<(String, f64, String)> = agg
+        .into_iter().map(|(w, (s, p))| (w, s, p)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_n);
+
+    if ranked.is_empty() { return Vec::new(); }
+
+    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 50)));
+    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 50)));
+    let (trade_hists, redeem_hists) = tokio::join!(trade_futs, redeem_futs);
+
+    let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+    let mut scores = Vec::new();
+
+    for (i, (wallet, market_size, pseudonym)) in ranked.iter().enumerate() {
+        let mut history = trade_hists[i].as_ref().ok().cloned().unwrap_or_default();
+        if let Ok(r) = &redeem_hists[i] { history.extend(r.iter().cloned()); }
+        let profile = build_wallet_profile(wallet.clone(), pseudonym.clone(), *market_size, &history);
+        let vol_impact = match market_volume {
+            Some(v) if v > 0.0 => market_size / v,
+            _ => 0.0,
+        };
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche);
+        scores.push(MarketWalletScore {
+            wallet:       wallet.clone(),
+            pseudonym:    profile.pseudonym,
+            suspicion,
+            is_fresh:     profile.is_fresh,
+            win_rate:     profile.win_rate,
+            total_vol:    profile.total_vol,
+            market_title: market_title.to_string(),
+        });
+    }
+
+    scores
+}
+
+/// Scan multiple Polymarket markets and find wallets that are suspicious across
+/// many of them — "too smart" traders with persistent cross-market edge.
+///
+/// Returns wallets that appeared as a top trader in at least `min_appearances`
+/// markets and whose average suspicion score is ≥ `min_suspicion`.
+pub async fn scan_too_smart_wallets(
+    clients:         &MarketClients,
+    market_limit:    usize,
+    min_appearances: usize,
+    min_suspicion:   f64,
+) -> anyhow::Result<TooSmartResult> {
+    use std::collections::HashMap;
+    use futures_util::future::join_all;
+
+    let markets = clients.polymarket
+        .fetch_markets(market_limit as u32, None, None)
+        .await
+        .context("Failed to fetch markets for too-smart scan")?;
+
+    let markets_scanned = markets.len();
+    if markets_scanned == 0 {
+        return Ok(TooSmartResult { wallets: Vec::new(), markets_scanned: 0 });
+    }
+
+    // Scan all markets concurrently (shallow, fast — 50 trades per wallet)
+    let all_scores: Vec<Vec<MarketWalletScore>> = join_all(markets.iter().map(|m| {
+        let cid   = m.id.clone();
+        let title = m.title.clone();
+        let vol   = m.volume;
+        async move { market_wallet_scores(clients, &cid, &title, vol, 5).await }
+    })).await;
+
+    // Aggregate by wallet address
+    struct Agg {
+        pseudonym:       String,
+        appearances:     usize,
+        flagged:         usize,
+        suspicion_sum:   f64,
+        max_suspicion:   f64,
+        total_vol:       f64,
+        win_rate_sum:    f64,
+        win_rate_count:  usize,
+        is_fresh:        bool,
+        flagged_markets: Vec<String>,
+    }
+
+    let mut map: HashMap<String, Agg> = HashMap::new();
+
+    for scores in all_scores {
+        for s in scores {
+            let entry = map.entry(s.wallet.clone()).or_insert(Agg {
+                pseudonym:      s.pseudonym.clone(),
+                appearances:    0,
+                flagged:        0,
+                suspicion_sum:  0.0,
+                max_suspicion:  0.0,
+                total_vol:      0.0,
+                win_rate_sum:   0.0,
+                win_rate_count: 0,
+                is_fresh:       false,
+                flagged_markets: Vec::new(),
+            });
+            entry.appearances += 1;
+            entry.suspicion_sum  += s.suspicion;
+            entry.total_vol      += s.total_vol;
+            if s.suspicion > entry.max_suspicion { entry.max_suspicion = s.suspicion; }
+            if s.suspicion >= 40.0 {
+                entry.flagged += 1;
+                entry.flagged_markets.push(s.market_title.clone());
+            }
+            if s.win_rate > 0.0 {
+                entry.win_rate_sum   += s.win_rate;
+                entry.win_rate_count += 1;
+            }
+            if s.is_fresh { entry.is_fresh = true; }
+        }
+    }
+
+    // Filter, score, sort
+    let mut wallets: Vec<TooSmartWallet> = map
+        .into_iter()
+        .filter_map(|(wallet, a)| {
+            if a.appearances < min_appearances { return None; }
+            let avg_suspicion = a.suspicion_sum / a.appearances as f64;
+            if avg_suspicion < min_suspicion { return None; }
+            let global_win_rate = if a.win_rate_count > 0 {
+                a.win_rate_sum / a.win_rate_count as f64
+            } else { 0.0 };
+            Some(TooSmartWallet {
+                wallet,
+                pseudonym:       a.pseudonym,
+                markets_total:   a.appearances,
+                markets_flagged: a.flagged,
+                avg_suspicion,
+                max_suspicion:   a.max_suspicion,
+                total_vol:       a.total_vol,
+                global_win_rate,
+                is_fresh:        a.is_fresh,
+                flagged_markets: a.flagged_markets,
+            })
+        })
+        .collect();
+
+    wallets.sort_by(|a, b| b.avg_suspicion.partial_cmp(&a.avg_suspicion).unwrap_or(std::cmp::Ordering::Equal));
+    wallets.truncate(25);
+
+    Ok(TooSmartResult { wallets, markets_scanned })
 }
 
 /// Fetch smart money data for a Polymarket market and return structured results.
@@ -738,22 +961,29 @@ pub async fn smart_money_for_market(
             Some(vol) if vol > 0.0 => p.market_size / vol,
             _ => 0.0,
         };
-        let suspicion = compute_suspicion(p, volume_impact, is_niche);
+        let (suspicion, signal_scores) = compute_suspicion(p, volume_impact, is_niche);
         let flagged = suspicion >= 50.0;
+        let stat_lower_bound = if p.n_positions >= 5 {
+            wilson_lower_bound(p.n_wins, p.n_positions, 1.96)
+        } else { f64::NAN };
         SmartMoneyWallet {
-            wallet:          p.wallet.clone(),
-            pseudonym:       p.pseudonym.clone(),
-            market_size:     p.market_size,
-            n_positions:     p.n_positions,
-            n_wins:          p.n_wins,
-            win_rate:        p.win_rate,
-            alpha_score:     p.alpha_score,
-            total_vol:       p.total_vol,
+            wallet:           p.wallet.clone(),
+            pseudonym:        p.pseudonym.clone(),
+            market_size:      p.market_size,
+            n_positions:      p.n_positions,
+            n_wins:           p.n_wins,
+            win_rate:         p.win_rate,
+            alpha_score:      p.alpha_score,
+            total_vol:        p.total_vol,
             suspicion,
             flagged,
-            is_fresh:        p.is_fresh,
-            wallet_age_days: p.wallet_age_days,
+            is_fresh:         p.is_fresh,
+            wallet_age_days:  p.wallet_age_days,
             volume_impact,
+            stat_lower_bound,
+            informed_sizing:  p.informed_sizing_ratio,
+            profit_roi:       p.profit_roi,
+            signal_scores,
         }
     }).collect();
 
@@ -761,6 +991,18 @@ pub async fn smart_money_for_market(
 }
 
 // ─── Smart money / account analysis ──────────────────────────────────────────
+
+/// Wilson score lower bound — the conservative 95%-CI lower estimate of the
+/// true win probability.  Uses the Agresti-Coull approximation.
+///
+/// z = 1.96 for 95 % CI, 1.645 for 90 % CI.
+fn wilson_lower_bound(wins: usize, n: usize, z: f64) -> f64 {
+    if n == 0 { return 0.0; }
+    let z2     = z * z;
+    let n_     = n as f64 + z2;
+    let p_tilde = (wins as f64 + z2 / 2.0) / n_;
+    (p_tilde - z * (p_tilde * (1.0 - p_tilde) / n_).sqrt()).max(0.0)
+}
 
 /// Per-wallet analytics bundle, built from merged TRADE + REDEEM history.
 struct WalletProfile {
@@ -772,7 +1014,7 @@ struct WalletProfile {
     n_positions:     usize,
     /// REDEEM events (each = a winning payout).
     n_wins:          usize,
-    /// n_wins / n_positions — meaningful only when n_positions ≥ MIN_POSITIONS.
+    /// n_wins / n_positions — only meaningful when n_positions ≥ MIN_POSITIONS.
     win_rate:        f64,
     /// Mean BUY price on positions that later hit REDEEM (lower = earlier entry).
     alpha_score:     f64,
@@ -786,6 +1028,15 @@ struct WalletProfile {
     wallet_age_days: Option<f64>,
     /// Recency-weighted win rate (90-day half-life; emphasises recent positions).
     win_rate_weighted: f64,
+    /// Fraction of wins coming from above-median-sized positions.
+    /// 0.5 = random; > 0.65 = informed sizing pattern.
+    informed_sizing_ratio: f64,
+    /// Largest single-market buy-side position / total_vol.
+    /// High concentration = all-in on one bet, consistent with private knowledge.
+    concentration:   f64,
+    /// ROI on winning positions: (payout − cost) / cost = (1 − alpha) / alpha.
+    /// Measures quality of early-entry alpha, not just win count.
+    profit_roi:      f64,
 }
 
 fn build_wallet_profile(
@@ -797,10 +1048,10 @@ fn build_wallet_profile(
     use std::collections::{HashMap, HashSet};
 
     const MIN_POSITIONS:    usize = 3;
-    const FRESH_MAX_TRADES: usize = 10;  // ≤ this many lifetime trades → possibly fresh
-    const FRESH_MAX_DAYS:   f64   = 7.0; // all activity within this window → possibly fresh
+    const FRESH_MAX_TRADES: usize = 10;
+    const FRESH_MAX_DAYS:   f64   = 7.0;
 
-    // Unique conditionIds where they placed a TRADE
+    // ── Market set ────────────────────────────────────────────────────────────
     let market_set: HashSet<String> = history
         .iter()
         .filter(|t| t.trade_type == "TRADE" || t.trade_type.is_empty())
@@ -808,13 +1059,12 @@ fn build_wallet_profile(
         .collect();
     let n_positions = market_set.len();
 
-    // TRADE-only count for fresh-wallet heuristic
     let n_total_trades = history
         .iter()
         .filter(|t| t.trade_type == "TRADE" || t.trade_type.is_empty())
         .count();
 
-    // REDEEMs ≈ winning payouts (now fetched separately and merged into history)
+    // ── Win set (REDEEM events) ───────────────────────────────────────────────
     let redeemed: HashSet<&str> = history
         .iter()
         .filter(|t| t.trade_type == "REDEEM")
@@ -822,7 +1072,14 @@ fn build_wallet_profile(
         .collect();
     let n_wins = redeemed.len();
 
-    // Alpha score: average BUY price on markets that eventually paid out.
+    // ── Per-market buy aggregation (used by several signals below) ───────────
+    // For each condition_id: (total_buy_dollar_vol, avg_buy_price_on_wins)
+    let mut mkt_buy_vol: HashMap<&str, f64> = HashMap::new();
+    for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
+        *mkt_buy_vol.entry(t.condition_id.as_str()).or_default() += t.size * t.price;
+    }
+
+    // ── Alpha score: avg BUY price on positions that later paid out ───────────
     let mut winning_entries: HashMap<&str, Vec<f64>> = HashMap::new();
     for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
         if redeemed.contains(t.condition_id.as_str()) {
@@ -839,58 +1096,86 @@ fn build_wallet_profile(
         all_entries.iter().sum::<f64>() / all_entries.len() as f64
     };
 
-    // Total buy-side dollar volume
-    let total_vol: f64 = history
-        .iter()
-        .filter(|t| t.side == "BUY")
-        .map(|t| t.size * t.price)
-        .sum();
+    // ── Total buy-side dollar volume ─────────────────────────────────────────
+    let total_vol: f64 = mkt_buy_vol.values().sum();
 
     let win_rate = if n_positions >= MIN_POSITIONS {
         n_wins as f64 / n_positions as f64
-    } else {
-        0.0
-    };
+    } else { 0.0 };
 
-    // Wallet age from oldest trade timestamp
+    // ── Wallet age ───────────────────────────────────────────────────────────
     let now_secs = chrono::Utc::now().timestamp();
     let oldest_ts = history.iter().map(|t| t.timestamp).filter(|&ts| ts > 0).min();
     let wallet_age_days = oldest_ts.map(|ts| (now_secs - ts).max(0) as f64 / 86_400.0);
 
-    // Fresh wallet heuristic (approximates on-chain nonce check):
-    // few lifetime trades AND all observed activity is very recent.
     let is_fresh = n_total_trades <= FRESH_MAX_TRADES
         && wallet_age_days.map(|d| d <= FRESH_MAX_DAYS).unwrap_or(false);
 
-    // Recency-weighted win rate (90-day half-life exponential decay).
-    // Each market contributes a weight = exp(-λ × age_of_last_activity).
-    // Recent wins count proportionally more than wins from months ago.
+    // ── Recency-weighted win rate (90-day half-life) ──────────────────────────
     let win_rate_weighted = if n_positions >= MIN_POSITIONS {
-        use std::collections::HashMap as HM;
         const HALF_LIFE_DAYS: f64 = 90.0;
         let decay = std::f64::consts::LN_2 / (HALF_LIFE_DAYS * 86_400.0);
-
-        // Latest observed timestamp per market
-        let mut mkt_last_ts: HM<&str, i64> = HM::new();
+        let mut mkt_last_ts: HashMap<&str, i64> = HashMap::new();
         for t in history.iter().filter(|t| t.timestamp > 0) {
             let e = mkt_last_ts.entry(t.condition_id.as_str()).or_insert(0);
             *e = (*e).max(t.timestamp);
         }
-
         let (mut w_pos, mut w_wins) = (0.0f64, 0.0f64);
         for (cid, &ts) in &mkt_last_ts {
-            // Only count markets the wallet actually traded (not just redeems on
-            // markets that might be in the merged history from another wallet)
             if !market_set.contains(*cid) { continue; }
-            let age_s = (now_secs - ts).max(0) as f64;
-            let w = (-decay * age_s).exp();
-            w_pos  += w;
+            let w = (-(now_secs - ts).max(0) as f64 * decay).exp();
+            w_pos += w;
             if redeemed.contains(*cid) { w_wins += w; }
         }
         if w_pos > 0.0 { w_wins / w_pos } else { 0.0 }
-    } else {
-        0.0
+    } else { 0.0 };
+
+    // ── Informed sizing ratio ─────────────────────────────────────────────────
+    // For each market the wallet traded, record (buy_vol, did_win).
+    // Then ask: are wins concentrated in the larger-bet half?
+    //
+    // informed_sizing_ratio = wins_in_top_half / max(1, total_wins)
+    // where top_half = markets sorted by buy_vol, upper 50% by count.
+    // 0.5 = random; 1.0 = every win came from a large bet.
+    let informed_sizing_ratio = {
+        let mut mkt_vols: Vec<(f64, bool)> = market_set
+            .iter()
+            .filter_map(|cid| {
+                let vol = *mkt_buy_vol.get(cid.as_str()).unwrap_or(&0.0);
+                if vol > 0.0 {
+                    Some((vol, redeemed.contains(cid.as_str())))
+                } else { None }
+            })
+            .collect();
+
+        if mkt_vols.len() >= 4 && n_wins >= 2 {
+            mkt_vols.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let top_n = (mkt_vols.len() + 1) / 2;
+            let wins_in_top: usize = mkt_vols[..top_n].iter().filter(|(_, w)| *w).count();
+            wins_in_top as f64 / n_wins as f64
+        } else { 0.5 }
     };
+
+    // ── Concentration: largest single-market position / total_vol ────────────
+    let concentration = if total_vol > 0.0 {
+        mkt_buy_vol.values().cloned().fold(0.0_f64, f64::max) / total_vol
+    } else { 0.0 };
+
+    // ── Profit ROI on winning positions ──────────────────────────────────────
+    // For each winning market: revenue = Σ(size), cost = Σ(size × price)
+    // profit_roi = (revenue − cost) / cost
+    //            ≈ (1 − alpha_score) / alpha_score   [for uniform buy prices]
+    // Only meaningful when n_wins ≥ 2.
+    let profit_roi = if !alpha_score.is_nan() && alpha_score > 0.0 && n_wins >= 2 {
+        let (mut rev, mut cost) = (0.0_f64, 0.0_f64);
+        for t in history.iter().filter(|t| t.side == "BUY" && t.price > 0.0) {
+            if redeemed.contains(t.condition_id.as_str()) {
+                rev  += t.size;          // $1 payout per winning share
+                cost += t.size * t.price;
+            }
+        }
+        if cost > 0.0 { (rev - cost) / cost } else { f64::NAN }
+    } else { f64::NAN };
 
     WalletProfile {
         wallet,
@@ -905,6 +1190,9 @@ fn build_wallet_profile(
         is_fresh,
         wallet_age_days,
         win_rate_weighted,
+        informed_sizing_ratio,
+        concentration,
+        profit_roi,
     }
 }
 
@@ -916,40 +1204,82 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
     if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
 
-/// Composite suspicion score (0–100) combining three signals from the
-/// polymarket-insider-tracker reference tool:
+/// Quant-grade five-signal suspicion score (0–100).
 ///
-///   fresh_wallet  weight 0.40  — new wallet placing a large bet
-///   size_anomaly  weight 0.35  — position size vs market volume
-///   win_rate      weight 0.25  — historically elevated win rate
+/// ┌─────────────────────────────────────────────────────────────────────┐
+/// │  S1  Statistical edge      0.28  Wilson LB ≥ 50%, gate: n ≥ 5     │
+/// │  S2  Early-entry alpha     0.22  Avg win entry price < 45¢         │
+/// │  S3  Informed sizing       0.18  Wins come from larger positions   │
+/// │  S4  Fresh concentrated    0.18  New wallet × bet concentration    │
+/// │  S5  Recency acceleration  0.14  Edge improving over time          │
+/// ├─────────────────────────────────────────────────────────────────────┤
+/// │  Multi-signal bonus ×1.25/×1.50/×1.75  (2/3/4+ signals > 0.15)  │
+/// │  Niche market multiplier  ×1.50  (daily vol < $50k)               │
+/// └─────────────────────────────────────────────────────────────────────┘
 ///
-/// Two-signal bonus ×1.2, three-signal bonus ×1.3.
-/// Niche market multiplier ×1.5 (market volume < $50k).
-fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool) -> f64 {
-    // Fresh wallet signal (0 or 1)
-    let fresh_sig = if p.is_fresh { 1.0_f64 } else { 0.0 };
+/// Returns (composite_score, [s1, s2, s3, s4, s5]) so callers can display
+/// per-signal breakdowns without re-computing.
+fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool) -> (f64, [f64; 5]) {
 
-    // Size anomaly signal: volume_impact / 0.02 threshold, capped at 3×
-    let size_sig = if volume_impact > 0.02 {
-        ((volume_impact / 0.02).min(3.0) / 3.0) * 0.9
-    } else {
-        0.0_f64
+    // ─── S1: Statistical significance of win rate ─────────────────────────
+    // Wilson score lower bound at 95 % CI (z = 1.96).
+    // Only fires for wallets with ≥ 5 completed positions.
+    // Score: 0 at LB = 0.50, 1.0 at LB = 0.75+.
+    let s1 = if p.n_positions >= 5 {
+        let lb = wilson_lower_bound(p.n_wins, p.n_positions, 1.96);
+        ((lb - 0.50).max(0.0) / 0.25).min(1.0)
+    } else { 0.0 };
+
+    // ─── S2: Early-entry alpha (bought cheap on wins) ─────────────────────
+    // alpha_score = avg BUY price on winning positions (0–1).
+    // Informed traders enter early when probability is still low-priced.
+    // Score: 1.0 at 0¢ entry, 0 at 45¢+. Gate: ≥ 2 winning positions.
+    let s2 = if !p.alpha_score.is_nan() && p.n_wins >= 2 && p.alpha_score < 0.45 {
+        (0.45 - p.alpha_score) / 0.45
+    } else { 0.0 };
+
+    // ─── S3: Informed sizing (bet bigger when you know) ───────────────────
+    // informed_sizing_ratio: fraction of wins in the upper half by position size.
+    // 0.5 = random distribution; → 1.0 = all wins from large bets.
+    // Gate: ratio must beat 0.60 (above random with margin).
+    let s3 = if p.informed_sizing_ratio > 0.60 && p.n_positions >= 4 {
+        ((p.informed_sizing_ratio - 0.60) / 0.35).min(1.0)
+    } else { 0.0 };
+
+    // ─── S4: Fresh concentrated bet ───────────────────────────────────────
+    // New wallet with high position concentration × market size impact.
+    // A fresh Sybil wallet all-in on one bet is maximally suspicious.
+    // Non-fresh but very large positions also trigger (capped at 0.5).
+    let s4 = if p.is_fresh && volume_impact > 0.01 {
+        let conc_mult = (p.concentration / 0.50).min(2.0); // 1× at 50% conc, 2× at 100%
+        ((volume_impact / 0.02).min(3.0) / 3.0 * conc_mult).min(1.0)
+    } else if volume_impact > 0.05 {
+        // Established wallet but very large relative position
+        ((volume_impact - 0.05) / 0.10).min(0.5)
+    } else { 0.0 };
+
+    // ─── S5: Recency acceleration (edge improving over time) ──────────────
+    // win_rate_weighted uses a 90-day half-life, so it over-weights recent activity.
+    // If recency rate > raw rate by >10pp the wallet's edge is intensifying.
+    let s5 = if p.win_rate_weighted > p.win_rate + 0.10 && p.win_rate > 0.40 {
+        ((p.win_rate_weighted - p.win_rate - 0.10) / 0.25).min(1.0)
+    } else { 0.0 };
+
+    // ─── Multi-signal bonus ───────────────────────────────────────────────
+    let signals = [s1, s2, s3, s4, s5];
+    let n_triggered = signals.iter().filter(|&&s| s > 0.15).count();
+    let multi_bonus: f64 = match n_triggered {
+        0 | 1 => 1.00,
+        2     => 1.25,
+        3     => 1.50,
+        _     => 1.75,
     };
+    let niche_mult: f64 = if is_niche { 1.50 } else { 1.0 };
 
-    // Win-rate signal: prefer recency-weighted rate; fall back to raw if not computed.
-    let effective_win_rate = if p.win_rate_weighted > 0.0 { p.win_rate_weighted } else { p.win_rate };
-    let win_sig = if effective_win_rate > 0.55 { effective_win_rate } else { 0.0_f64 };
+    let base = s1 * 0.28 + s2 * 0.22 + s3 * 0.18 + s4 * 0.18 + s5 * 0.14;
+    let score = (base * multi_bonus * niche_mult * 100.0).min(100.0);
 
-    let n_triggered = [fresh_sig > 0.5, size_sig > 0.1, win_sig > 0.0]
-        .iter()
-        .filter(|&&x| x)
-        .count();
-
-    let multi_bonus = if n_triggered >= 3 { 1.3 } else if n_triggered >= 2 { 1.2 } else { 1.0_f64 };
-    let niche_mult  = if is_niche { 1.5_f64 } else { 1.0 };
-
-    let base = fresh_sig * 0.40 + size_sig * 0.35 + win_sig * 0.25;
-    (base * multi_bonus * niche_mult * 100.0).min(100.0)
+    (score, signals)
 }
 
 /// Identify wallets trading a market with suspiciously high win rates.
@@ -1080,11 +1410,14 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
             "—".to_string()
         };
 
-        let suspicion = compute_suspicion(p, volume_impact, is_niche);
+        let (suspicion, sigs) = compute_suspicion(p, volume_impact, is_niche);
+        let stat_lb = if p.n_positions >= 5 {
+            format!("LB:{:.0}%", wilson_lower_bound(p.n_wins, p.n_positions, 1.96) * 100.0)
+        } else { "LB:n/a".to_string() };
         let fresh_flag = if p.is_fresh { "N " } else { "  " };
 
         report.push(format!(
-            "{}{:<22} {:>8.0} {:>7} {:>6} {:>8.1}% {:>10} {:>6} {:>8.0}/100",
+            "{}{:<22} {:>8.0} {:>7} {:>6} {:>8.1}% {:>10} {:>6} {:>8.0}/100  [{}  sz:{:.0}  α:{:.0}  fresh:{:.0}  acc:{:.0}]",
             fresh_flag,
             name,
             p.market_size,
@@ -1094,6 +1427,11 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
             alpha_str,
             vol_pct,
             suspicion,
+            stat_lb,
+            sigs[2] * 100.0,
+            sigs[1] * 100.0,
+            sigs[3] * 100.0,
+            sigs[4] * 100.0,
         ));
 
         if suspicion >= 50.0 {
@@ -1353,17 +1691,26 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         }
     }
 
-    // ── Suspicion assessment (unified compute_suspicion formula) ──────────
+    // ── Suspicion assessment (quant five-signal model) ────────────────────
     report.push("\n--- Suspicion Assessment ---".to_string());
-    let suspicion = compute_suspicion(&profile, 0.0, false);
-    report.push(format!("Composite score: {:.0}/100", suspicion));
-    report.push(format!(
-        "Components:  fresh={:.0}  vol_anomaly=n/a (no market context)  \
-         win_rate={:.0}  recency_weighted={:.0}",
-        if profile.is_fresh { 100.0 } else { 0.0 },
-        profile.win_rate * 100.0,
-        profile.win_rate_weighted * 100.0,
-    ));
+    let (suspicion, sigs) = compute_suspicion(&profile, 0.0, false);
+    let stat_lb = if profile.n_positions >= 5 {
+        format!("{:.1}%", wilson_lower_bound(profile.n_wins, profile.n_positions, 1.96) * 100.0)
+    } else { "n/a (< 5 positions)".to_string() };
+    let roi_str = if profile.profit_roi.is_nan() { "n/a".to_string() }
+                  else { format!("{:.0}%", profile.profit_roi * 100.0) };
+    report.push(format!("Composite score:     {:.0}/100", suspicion));
+    report.push(format!("  S1 Statistical edge   {:.0}/100  (Wilson LB 95% CI: {})", sigs[0] * 100.0, stat_lb));
+    report.push(format!("  S2 Early-entry alpha  {:.0}/100  (avg entry on wins: {})",
+        sigs[1] * 100.0,
+        if profile.alpha_score.is_nan() { "n/a".to_string() } else { format!("{:.1}¢", profile.alpha_score * 100.0) }));
+    report.push(format!("  S3 Informed sizing    {:.0}/100  (wins in top-half by size: {:.0}%)",
+        sigs[2] * 100.0, profile.informed_sizing_ratio * 100.0));
+    report.push(format!("  S4 Fresh concentrated {:.0}/100  (fresh={}, concentration={:.0}%)",
+        sigs[3] * 100.0, profile.is_fresh, profile.concentration * 100.0));
+    report.push(format!("  S5 Recency accel.     {:.0}/100  (raw {:.1}%  →  recency-wtd {:.1}%)",
+        sigs[4] * 100.0, profile.win_rate * 100.0, profile.win_rate_weighted * 100.0));
+    report.push(format!("  Profit ROI on wins:   {}  (no market-vol context available)", roi_str));
     let verdict = if suspicion > 70.0 {
         "HIGH — multiple strong insider indicators present"
     } else if suspicion > 45.0 {
@@ -1371,9 +1718,9 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
     } else {
         "LOW — no strong signals at this stage"
     };
-    report.push(format!("Verdict:         {}", verdict));
+    report.push(format!("Verdict: {}", verdict));
     report.push("\nNote: scores are probabilistic proxies, not evidence of wrongdoing.".to_string());
-    report.push("For full context use find_smart_money on a specific market to get volume-impact scores.".to_string());
+    report.push("Use find_smart_money on a specific market to include volume-impact (S4) context.".to_string());
 
     Ok(ToolOutput::ok(report.join("\n")))
 }
@@ -1431,7 +1778,7 @@ async fn quick_market_scan(
             Some(v) if v > 0.0 => market_size / v,
             _ => 0.0,
         };
-        let suspicion = compute_suspicion(&profile, vol_impact, is_niche);
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche);
         if suspicion > best.0 {
             best = (suspicion, profile.pseudonym.clone(), wallet.clone());
         }
