@@ -73,6 +73,27 @@ struct Cli {
     /// Auto-refresh interval in seconds (0 = disabled) [default: 60]
     #[arg(long, short = 'R', default_value = "60")]
     refresh: u64,
+
+    /// Run a one-shot headless smart-money scan and exit (no TUI).
+    /// Scans Polymarket markets, flags suspicious wallets, and prints a report.
+    #[arg(long)]
+    scan: bool,
+
+    /// Number of markets to scan in headless mode [default: 30]
+    #[arg(long, default_value = "30")]
+    scan_markets: usize,
+
+    /// Minimum average suspicion score (0–100) to include a wallet [default: 40]
+    #[arg(long, default_value = "40.0")]
+    scan_threshold: f64,
+
+    /// Number of top flagged wallets to deep-dive with full profile [default: 5]
+    #[arg(long, default_value = "5")]
+    scan_deep: usize,
+
+    /// Emit JSON instead of human-readable text (useful for piping to jq or scripts)
+    #[arg(long)]
+    scan_json: bool,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -123,6 +144,18 @@ async fn main() -> Result<()> {
 
     let newsdata_api_key = std::env::var("NEWSDATA_API_KEY").ok();
     let clients = Arc::new(MarketClients::new(newsdata_api_key));
+
+    if cli.scan {
+        let report = tools::headless_scan(
+            &clients,
+            cli.scan_markets,
+            cli.scan_threshold,
+            cli.scan_deep,
+            cli.scan_json,
+        ).await?;
+        println!("{}", report);
+        return Ok(());
+    }
 
     tui::run_tui(backend, clients, backend_name, cli.refresh).await?;
 

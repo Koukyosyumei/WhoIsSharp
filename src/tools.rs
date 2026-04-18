@@ -644,9 +644,11 @@ pub struct SmartMoneyWallet {
     /// (payout − cost) / cost  =  (1 − avg_entry) / avg_entry  on wins.
     /// NaN if no winning trades in history.
     pub profit_roi:       f64,
-    /// Per-signal scores [stat_edge, alpha, informed_sizing, fresh_conc, recency]
+    /// Average SELL price on exits above 50¢ (NaN if fewer than 2 such sells).
+    pub sell_precision:   f64,
+    /// Per-signal scores [stat_edge, alpha, informed_sizing, fresh_conc, recency, sell_precision]
     /// in that order; each in [0, 1].  Useful for displaying a breakdown.
-    pub signal_scores:    [f64; 5],
+    pub signal_scores:    [f64; 6],
 }
 
 /// Result returned by `smart_money_for_market` for TUI consumption.
@@ -661,7 +663,7 @@ pub struct SmartMoneyResult {
 
 /// A wallet that shows suspicious behaviour across multiple markets.
 /// Produced by `scan_too_smart_wallets` which aggregates per-market suspicion scores.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TooSmartWallet {
     pub wallet:          String,
     pub pseudonym:       String,
@@ -681,13 +683,38 @@ pub struct TooSmartWallet {
     pub is_fresh:        bool,
     /// Titles of markets where this wallet was flagged (suspicion ≥ 40).
     pub flagged_markets: Vec<String>,
+    /// Number of temporal clusters where this wallet entered a market first —
+    /// a proxy for being a "leader" that other suspicious wallets follow.
+    pub leader_score:    u32,
+    /// Percentile rank within the current scan (0–100; higher = more suspicious).
+    /// Populated by `headless_scan`; 0.0 in TUI mode.
+    pub suspicion_pct:   f64,
+}
+
+/// A group of flagged wallets that entered the same market within a short window.
+/// Temporal entry clustering is a strong coordination signal — unrelated traders
+/// rarely enter niche markets within hours of each other.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TemporalCluster {
+    pub market_title:  String,
+    pub condition_id:  String,
+    /// (wallet_address, pseudonym, first_buy_unix_secs) for each member.
+    pub entries:       Vec<(String, String, i64)>,
+    /// Time between earliest and latest entry in this cluster (hours).
+    pub spread_hours:  f64,
 }
 
 /// Result of `scan_too_smart_wallets`.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct TooSmartResult {
-    pub wallets:         Vec<TooSmartWallet>,
-    pub markets_scanned: usize,
+    pub wallets:            Vec<TooSmartWallet>,
+    pub markets_scanned:    usize,
+    /// Markets where ≥ 2 flagged wallets entered within `TEMPORAL_WINDOW_SECS`.
+    pub temporal_clusters:  Vec<TemporalCluster>,
+    /// Raw avg_suspicion values for ALL wallets seen (before min_suspicion filter).
+    /// Used to compute percentile ranks: where does a flagged wallet sit in the
+    /// overall distribution of suspicious-ness?
+    pub score_distribution: Vec<f64>,
 }
 
 /// A wallet identified by the LLM as suspicious in Too-Smart LLM mode.
@@ -705,23 +732,27 @@ pub struct LlmIdentifiedWallet {
 
 /// Internal per-wallet row produced by `market_wallet_scores`.
 struct MarketWalletScore {
-    wallet:       String,
-    pseudonym:    String,
-    suspicion:    f64,
-    is_fresh:     bool,
-    win_rate:     f64,
-    total_vol:    f64,
-    market_title: String,
+    wallet:          String,
+    pseudonym:       String,
+    suspicion:       f64,
+    is_fresh:        bool,
+    win_rate:        f64,
+    total_vol:       f64,
+    market_title:    String,
+    condition_id:    String,
+    /// Unix timestamp of this wallet's first BUY in this specific market (0 if unknown).
+    first_entry_ts:  i64,
 }
 
 /// Fetch suspicion scores for ALL top wallets in a single market.
 /// Similar to `quick_market_scan` but returns every ranked wallet, not just the best.
 async fn market_wallet_scores(
-    clients:       &MarketClients,
-    market_id:     &str,
-    market_title:  &str,
-    market_volume: Option<f64>,
-    top_n:         usize,
+    clients:         &MarketClients,
+    market_id:       &str,
+    market_title:    &str,
+    market_category: Option<&str>,
+    market_volume:   Option<f64>,
+    top_n:           usize,
 ) -> Vec<MarketWalletScore> {
     use std::collections::HashMap;
     use futures_util::future::join_all;
@@ -760,15 +791,26 @@ async fn market_wallet_scores(
             Some(v) if v > 0.0 => market_size / v,
             _ => 0.0,
         };
-        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche);
+        let cat_mult = market_insider_risk(market_category, market_title);
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, cat_mult);
+
+        // First BUY timestamp in this specific market (for temporal clustering).
+        let first_entry_ts = history.iter()
+            .filter(|t| t.side == "BUY" && t.condition_id == market_id && t.timestamp > 0)
+            .map(|t| t.timestamp)
+            .min()
+            .unwrap_or(0);
+
         scores.push(MarketWalletScore {
-            wallet:       wallet.clone(),
-            pseudonym:    profile.pseudonym,
+            wallet:         wallet.clone(),
+            pseudonym:      profile.pseudonym,
             suspicion,
-            is_fresh:     profile.is_fresh,
-            win_rate:     profile.win_rate,
-            total_vol:    profile.total_vol,
-            market_title: market_title.to_string(),
+            is_fresh:       profile.is_fresh,
+            win_rate:       profile.win_rate,
+            total_vol:      profile.total_vol,
+            market_title:   market_title.to_string(),
+            condition_id:   market_id.to_string(),
+            first_entry_ts,
         });
     }
 
@@ -794,20 +836,35 @@ pub async fn scan_too_smart_wallets(
         .await
         .context("Failed to fetch markets for too-smart scan")?;
 
+    const TEMPORAL_WINDOW_SECS: i64 = 86_400; // 24h coordination window
+    // Limit concurrent market scans to avoid hammering the API.
+    // Each market scan fires 2×top_n = 10 wallet-history requests, so
+    // MAX_CONCURRENT_SCANS=8 caps peak concurrency at ~80 simultaneous requests.
+    const MAX_CONCURRENT_SCANS: usize = 8;
+
     let markets_scanned = markets.len();
     if markets_scanned == 0 {
-        return Ok(TooSmartResult { wallets: Vec::new(), markets_scanned: 0 });
+        return Ok(TooSmartResult {
+            wallets: Vec::new(), markets_scanned: 0,
+            temporal_clusters: Vec::new(), score_distribution: Vec::new(),
+        });
     }
 
-    // Scan all markets concurrently (shallow, fast — 50 trades per wallet)
+    // Scan markets with bounded concurrency (bounded via semaphore + join_all).
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SCANS));
     let all_scores: Vec<Vec<MarketWalletScore>> = join_all(markets.iter().map(|m| {
+        let sem   = sem.clone();
         let cid   = m.id.clone();
         let title = m.title.clone();
+        let cat   = m.category.clone();
         let vol   = m.volume;
-        async move { market_wallet_scores(clients, &cid, &title, vol, 5).await }
+        async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            market_wallet_scores(clients, &cid, &title, cat.as_deref(), vol, 5).await
+        }
     })).await;
 
-    // Aggregate by wallet address
+    // Aggregate by wallet address and collect per-market entry data for temporal clustering
     struct Agg {
         pseudonym:       String,
         appearances:     usize,
@@ -822,9 +879,19 @@ pub async fn scan_too_smart_wallets(
     }
 
     let mut map: HashMap<String, Agg> = HashMap::new();
+    // market condition_id → (market_title, Vec<(wallet, pseudonym, first_entry_ts, suspicion)>)
+    let mut market_entry_map: HashMap<String, (String, Vec<(String, String, i64, f64)>)> = HashMap::new();
 
     for scores in all_scores {
         for s in scores {
+            // Track per-market entries for temporal clustering (any suspicion ≥ 30)
+            if s.first_entry_ts > 0 && s.suspicion >= 30.0 {
+                let e = market_entry_map
+                    .entry(s.condition_id.clone())
+                    .or_insert_with(|| (s.market_title.clone(), Vec::new()));
+                e.1.push((s.wallet.clone(), s.pseudonym.clone(), s.first_entry_ts, s.suspicion));
+            }
+
             let entry = map.entry(s.wallet.clone()).or_insert(Agg {
                 pseudonym:      s.pseudonym.clone(),
                 appearances:    0,
@@ -853,7 +920,71 @@ pub async fn scan_too_smart_wallets(
         }
     }
 
-    // Filter, score, sort
+    // ── Temporal clustering: markets where ≥ 2 suspicious wallets entered
+    //    within TEMPORAL_WINDOW_SECS of each other.
+    let mut temporal_clusters: Vec<TemporalCluster> = Vec::new();
+    for (cid, (market_title, mut entries)) in market_entry_map {
+        if entries.len() < 2 { continue; }
+        entries.sort_by_key(|e| e.2); // sort by first_entry_ts ascending
+        let earliest = entries[0].2;
+        let latest   = entries[entries.len() - 1].2;
+        if latest - earliest <= TEMPORAL_WINDOW_SECS {
+            // All entries in this market fall within the window — flag as a cluster
+            let spread_hours = (latest - earliest) as f64 / 3600.0;
+            temporal_clusters.push(TemporalCluster {
+                market_title,
+                condition_id: cid,
+                entries: entries.into_iter().map(|(w, p, ts, _)| (w, p, ts)).collect(),
+                spread_hours,
+            });
+        } else {
+            // Sliding-window search for sub-clusters within the window
+            for i in 0..entries.len() {
+                let window_end = entries[i].2 + TEMPORAL_WINDOW_SECS;
+                let cluster: Vec<_> = entries[i..].iter()
+                    .take_while(|e| e.2 <= window_end)
+                    .collect();
+                if cluster.len() >= 2 {
+                    let spread_hours = (cluster.last().unwrap().2 - cluster[0].2) as f64 / 3600.0;
+                    temporal_clusters.push(TemporalCluster {
+                        market_title: market_title.clone(),
+                        condition_id: cid.clone(),
+                        entries: cluster.iter().map(|(w, p, ts, _)| (w.clone(), p.clone(), *ts)).collect(),
+                        spread_hours,
+                    });
+                    break; // one cluster per market is enough for the report
+                }
+            }
+        }
+    }
+    temporal_clusters.sort_by(|a, b| {
+        let size_cmp = b.entries.len().cmp(&a.entries.len());
+        if size_cmp != std::cmp::Ordering::Equal { size_cmp }
+        else { a.spread_hours.partial_cmp(&b.spread_hours).unwrap_or(std::cmp::Ordering::Equal) }
+    });
+    temporal_clusters.truncate(10);
+
+    // ── Leader-follower scoring ───────────────────────────────────────────
+    // A wallet that enters a market FIRST in a temporal cluster across multiple
+    // markets is a "leader" — other suspicious wallets appear to follow its trades.
+    // leader_scores[wallet] = number of clusters where this wallet was earliest.
+    let mut leader_scores: HashMap<String, u32> = HashMap::new();
+    for cluster in &temporal_clusters {
+        if cluster.entries.len() >= 2 {
+            let first_wallet = &cluster.entries[0].0;
+            *leader_scores.entry(first_wallet.clone()).or_default() += 1;
+        }
+    }
+
+    // ── Score distribution for percentile ranking ─────────────────────────
+    // Collect ALL avg_suspicion values (before filtering) so callers can
+    // compute percentile ranks for flagged wallets.
+    let score_distribution: Vec<f64> = map.values()
+        .filter(|a| a.appearances >= min_appearances)
+        .map(|a| a.suspicion_sum / a.appearances as f64)
+        .collect();
+
+    // Filter, score, sort wallets
     let mut wallets: Vec<TooSmartWallet> = map
         .into_iter()
         .filter_map(|(wallet, a)| {
@@ -863,6 +994,7 @@ pub async fn scan_too_smart_wallets(
             let global_win_rate = if a.win_rate_count > 0 {
                 a.win_rate_sum / a.win_rate_count as f64
             } else { 0.0 };
+            let leader_score = *leader_scores.get(&wallet).unwrap_or(&0);
             Some(TooSmartWallet {
                 wallet,
                 pseudonym:       a.pseudonym,
@@ -874,6 +1006,8 @@ pub async fn scan_too_smart_wallets(
                 global_win_rate,
                 is_fresh:        a.is_fresh,
                 flagged_markets: a.flagged_markets,
+                leader_score,
+                suspicion_pct:   0.0, // populated by headless_scan after collection
             })
         })
         .collect();
@@ -881,7 +1015,180 @@ pub async fn scan_too_smart_wallets(
     wallets.sort_by(|a, b| b.avg_suspicion.partial_cmp(&a.avg_suspicion).unwrap_or(std::cmp::Ordering::Equal));
     wallets.truncate(25);
 
-    Ok(TooSmartResult { wallets, markets_scanned })
+    Ok(TooSmartResult { wallets, markets_scanned, temporal_clusters, score_distribution })
+}
+
+// ─── Headless smart-money scan (--scan mode) ─────────────────────────────────
+
+/// Compute the percentile rank of `score` within `distribution` (0–100).
+fn percentile_rank(distribution: &[f64], score: f64) -> f64 {
+    if distribution.is_empty() { return 0.0; }
+    let below = distribution.iter().filter(|&&s| s < score).count();
+    (below as f64 / distribution.len() as f64 * 100.0).round()
+}
+
+/// Human-readable confidence level based on number of completed positions.
+fn confidence_label(n_positions: usize) -> &'static str {
+    match n_positions {
+        0..=4  => "Very Low",
+        5..=9  => "Low",
+        10..=29 => "Moderate",
+        30..=74 => "Good",
+        _ => "High",
+    }
+}
+
+/// One-shot headless scan: runs the full smart-money analysis pipeline and
+/// returns either a formatted text report or JSON, suitable for stdout/pipes.
+///
+/// Parameters:
+///   `market_limit`   — markets to scan (default 30)
+///   `min_suspicion`  — minimum avg suspicion to flag a wallet (default 40.0)
+///   `deep_dive_n`    — top wallets to profile in depth (default 5)
+///   `json_output`    — if true, emit JSON instead of human-readable text
+pub async fn headless_scan(
+    clients:       &MarketClients,
+    market_limit:  usize,
+    min_suspicion: f64,
+    deep_dive_n:   usize,
+    json_output:   bool,
+) -> anyhow::Result<String> {
+    use chrono::Utc;
+
+    let scan_start = std::time::Instant::now();
+    let ts = Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+
+    eprintln!("[scan] Starting WhoIsSharp smart-money scan  {}", ts);
+    eprintln!("[scan] Parameters: markets={} min_suspicion={:.0} deep_dive={}", market_limit, min_suspicion, deep_dive_n);
+    eprintln!("[scan] Fetching market list and wallet histories (bounded to 8 concurrent)…");
+
+    let mut result = scan_too_smart_wallets(clients, market_limit, 1, min_suspicion).await?;
+
+    eprintln!("[scan] Scanned {} markets in {:.1}s  →  {} flagged wallets",
+        result.markets_scanned, scan_start.elapsed().as_secs_f32(), result.wallets.len());
+
+    // ── Populate percentile ranks for each flagged wallet ─────────────────
+    let dist = result.score_distribution.clone();
+    for w in result.wallets.iter_mut() {
+        w.suspicion_pct = percentile_rank(&dist, w.avg_suspicion);
+    }
+
+    // ── JSON output ───────────────────────────────────────────────────────
+    if json_output {
+        #[derive(serde::Serialize)]
+        struct JsonReport<'a> {
+            timestamp:        &'a str,
+            markets_scanned:  usize,
+            min_suspicion:    f64,
+            wallets:          &'a [TooSmartWallet],
+            temporal_clusters: &'a [TemporalCluster],
+        }
+        let report = JsonReport {
+            timestamp:         &ts,
+            markets_scanned:   result.markets_scanned,
+            min_suspicion,
+            wallets:           &result.wallets,
+            temporal_clusters: &result.temporal_clusters,
+        };
+        return Ok(serde_json::to_string_pretty(&report)?);
+    }
+
+    // ── Text report ───────────────────────────────────────────────────────
+    let mut out = Vec::<String>::new();
+    const W: usize = 72;
+
+    out.push(format!("╔{}╗", "═".repeat(W)));
+    out.push(format!("║{:<W$}║", "  WhoIsSharp — Smart Money Headless Scan"));
+    out.push(format!("║{:<W$}║", format!("  {}", ts)));
+    out.push(format!("╚{}╝", "═".repeat(W)));
+    out.push(format!("Markets scanned: {}  |  Flagged wallets: {}  |  Elapsed: {:.1}s",
+        result.markets_scanned, result.wallets.len(), scan_start.elapsed().as_secs_f32()));
+    out.push(format!("Score threshold: {:.0}/100  |  Distribution: {} wallets sampled",
+        min_suspicion, dist.len()));
+    out.push("─".repeat(W));
+
+    if result.wallets.is_empty() {
+        out.push(format!("No wallets met the suspicion threshold of {:.0}.", min_suspicion));
+    } else {
+        out.push(format!("{:<6}  {:<3}  {:<3}  {:<22}  {:>4}  {:>4}  {:>5}  {:>8}  {}",
+            "Score", "Pct", "Ldr", "Pseudonym", "Mkt", "Flg", "WinR%", "Vol$", "Address"));
+        out.push("─".repeat(W));
+        for (i, w) in result.wallets.iter().enumerate() {
+            let addr = &w.wallet[..w.wallet.len().min(14)];
+            let name: String = w.pseudonym.chars().take(22).collect();
+            let leader_tag = if w.leader_score > 0 { format!("×{}", w.leader_score) } else { "   ".to_string() };
+            out.push(format!("{:>5.0}/100  {:>2.0}%  {:<3}  {:<22}  {:>4}  {:>4}  {:>5.1}  {:>8.0}  {}…",
+                w.avg_suspicion, w.suspicion_pct, leader_tag, name,
+                w.markets_total, w.markets_flagged,
+                w.global_win_rate * 100.0, w.total_vol, addr));
+
+            // Flagged market list (indented, truncated)
+            if !w.flagged_markets.is_empty() {
+                let mkt_list: String = w.flagged_markets.iter()
+                    .map(|m| m.chars().take(35).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                out.push(format!("  #{:<2}  Flagged in: {}", i + 1, mkt_list));
+            }
+            // Leader annotation
+            if w.leader_score > 0 {
+                out.push(format!("       ★ LEADER: entered {} market(s) before other suspicious wallets", w.leader_score));
+            }
+        }
+        out.push(String::new());
+        out.push("Columns: Score=avg_suspicion Pct=percentile_in_scan Ldr=leader_count".to_string());
+    }
+
+    // ── Temporal coordination clusters ────────────────────────────────────
+    if !result.temporal_clusters.is_empty() {
+        out.push(String::new());
+        out.push(format!("╔{}╗", "═".repeat(W)));
+        out.push(format!("║{:<W$}║", "  TEMPORAL COORDINATION CLUSTERS"));
+        out.push(format!("║{:<W$}║", "  ≥ 2 wallets entered the same market within 24h — strong coordination signal"));
+        out.push(format!("╚{}╝", "═".repeat(W)));
+        for (i, cluster) in result.temporal_clusters.iter().enumerate() {
+            out.push(format!("[{}] {}  (spread: {:.1}h  |  {} wallets)",
+                i + 1, cluster.market_title, cluster.spread_hours, cluster.entries.len()));
+            out.push(format!("    ConditionId: {}", cluster.condition_id));
+            for (idx, (wallet, pseudonym, ts_entry)) in cluster.entries.iter().enumerate() {
+                let dt = chrono::DateTime::<Utc>::from_timestamp(*ts_entry, 0)
+                    .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let role = if idx == 0 { "LEADER".to_string() } else { format!("  +{:.1}h", (ts_entry - cluster.entries[0].2) as f64 / 3600.0) };
+                out.push(format!("    {:<6}  {} ({})  entered: {}", role, pseudonym, &wallet[..wallet.len().min(14)], dt));
+            }
+            out.push(String::new());
+        }
+    }
+
+    // ── Per-wallet deep dive ──────────────────────────────────────────────
+    let to_dive: Vec<_> = result.wallets.iter().take(deep_dive_n).collect();
+    if !to_dive.is_empty() {
+        eprintln!("[scan] Running deep-dive on top {} wallets…", to_dive.len());
+        out.push(format!("╔{}╗", "═".repeat(W)));
+        out.push(format!("║{:<W$}║", format!("  DEEP DIVE: TOP {} WALLETS (full analyze_wallet profile)", to_dive.len())));
+        out.push(format!("║{:<W$}║", "  Note: score below excludes per-market volume context (S4=0 in bulk mode)"));
+        out.push(format!("╚{}╝", "═".repeat(W)));
+        for (i, w) in to_dive.iter().enumerate() {
+            let pct = percentile_rank(&dist, w.avg_suspicion);
+            out.push("─".repeat(W));
+            out.push(format!("Rank #{} | {:.0}/100 (p{:.0}) | Leader score: {} | {}",
+                i + 1, w.avg_suspicion, pct, w.leader_score, w.pseudonym));
+            let args = serde_json::json!({ "wallet": w.wallet, "limit": 250 });
+            let profile_out = dispatch(clients, "analyze_wallet", &args).await;
+            out.push(profile_out.text);
+        }
+    }
+
+    let elapsed = scan_start.elapsed().as_secs_f32();
+    out.push(String::new());
+    out.push(format!("╔{}╗", "═".repeat(W)));
+    out.push(format!("║{:<W$}║", format!("  SCAN COMPLETE  |  total time: {:.1}s", elapsed)));
+    out.push(format!("║{:<W$}║", "  Tip: --scan-json for machine-readable output | diff with yesterday to spot new suspects"));
+    out.push(format!("╚{}╝", "═".repeat(W)));
+
+    eprintln!("[scan] Done in {:.1}s.", elapsed);
+    Ok(out.join("\n"))
 }
 
 /// Fetch smart money data for a Polymarket market and return structured results.
@@ -894,11 +1201,12 @@ pub async fn scan_too_smart_wallets(
 /// detection.  Wallet pairs sharing ≥ this fraction of traded markets are
 /// flagged as possibly coordinated.  Default 0.35.
 pub async fn smart_money_for_market(
-    clients:         &MarketClients,
-    market_id:       &str,
-    top_n:           usize,
-    market_volume:   Option<f64>,
-    coord_threshold: f64,
+    clients:          &MarketClients,
+    market_id:        &str,
+    top_n:            usize,
+    market_volume:    Option<f64>,
+    market_category:  Option<&str>,
+    coord_threshold:  f64,
 ) -> anyhow::Result<SmartMoneyResult> {
     use std::collections::HashMap;
     use futures_util::future::join_all;
@@ -967,6 +1275,7 @@ pub async fn smart_money_for_market(
 
     // Niche market flag: volume < $50k
     let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+    let cat_mult = market_insider_risk(market_category, &market_title);
 
     // Convert to public structs using the improved scoring formula
     let wallets = profiles.iter().map(|p| {
@@ -974,7 +1283,7 @@ pub async fn smart_money_for_market(
             Some(vol) if vol > 0.0 => p.market_size / vol,
             _ => 0.0,
         };
-        let (suspicion, signal_scores) = compute_suspicion(p, volume_impact, is_niche);
+        let (suspicion, signal_scores) = compute_suspicion(p, volume_impact, is_niche, cat_mult);
         let flagged = suspicion >= 50.0;
         let stat_lower_bound = if p.n_positions >= 5 {
             wilson_lower_bound(p.n_wins, p.n_positions, 1.96)
@@ -996,6 +1305,7 @@ pub async fn smart_money_for_market(
             stat_lower_bound,
             informed_sizing:  p.informed_sizing_ratio,
             profit_roi:       p.profit_roi,
+            sell_precision:   p.sell_precision,
             signal_scores,
         }
     }).collect();
@@ -1050,6 +1360,24 @@ struct WalletProfile {
     /// ROI on winning positions: (payout − cost) / cost = (1 − alpha) / alpha.
     /// Measures quality of early-entry alpha, not just win count.
     profit_roi:      f64,
+    /// Average SELL price across SELL events where price > 50¢ (NaN if < 2 such events).
+    /// High values (> 70¢) indicate disciplined profit-taking before resolution.
+    sell_precision:  f64,
+    /// Total number of SELL events in history.
+    n_sells:         usize,
+    /// Longest consecutive winning streak across chronologically sorted markets.
+    /// A streak ≥ 5 is statistically anomalous at random (p < 0.03 for 50% base rate).
+    max_win_streak:  usize,
+    /// New markets entered per day (n_positions / wallet_age_days).
+    /// High values signal an algorithmic or highly active wallet.
+    position_velocity: f64,
+    /// Fraction of BUY trades placed on the YES outcome (outcome_index == 0).
+    /// Strong directional bias (< 0.2 or > 0.8) suggests asymmetric information.
+    outcome_yes_fraction: f64,
+    /// Markets where avg BUY price was ≤ 90¢ (excludes post-resolution buyers).
+    n_quality_positions: usize,
+    /// Wins within quality positions only (used by S1 to filter redemption arb).
+    n_quality_wins: usize,
 }
 
 fn build_wallet_profile(
@@ -1112,8 +1440,31 @@ fn build_wallet_profile(
     // ── Total buy-side dollar volume ─────────────────────────────────────────
     let total_vol: f64 = mkt_buy_vol.values().sum();
 
+    // ── Late-entry filter: exclude markets where avg BUY price > 90¢ ─────────
+    // Wallets that buy near-settled markets (avg entry > 90¢) are post-resolution
+    // redemption buyers, not informed early traders.  Counting their REDEEMs as
+    // "wins" inflates n_wins and corrupts S1/S2.  We compute a parallel set of
+    // "quality positions" (avg entry ≤ 90¢) for the win-rate denominator.
+    let quality_positions: HashSet<&str> = market_set
+        .iter()
+        .filter(|cid| {
+            let buys: Vec<f64> = history.iter()
+                .filter(|t| t.side == "BUY" && t.price > 0.0 && t.condition_id == cid.as_str())
+                .map(|t| t.price)
+                .collect();
+            if buys.is_empty() { return false; }
+            let avg = buys.iter().sum::<f64>() / buys.len() as f64;
+            avg <= 0.90
+        })
+        .map(|s| s.as_str())
+        .collect();
+    let n_quality = quality_positions.len();
+    let n_quality_wins = redeemed.iter().filter(|cid| quality_positions.contains(*cid)).count();
+
+    // Cap at 1.0: multi-outcome markets can produce more REDEEMs than traded
+    // condition_ids when YES/NO tokens share a condition_id differently.
     let win_rate = if n_positions >= MIN_POSITIONS {
-        n_wins as f64 / n_positions as f64
+        (n_wins as f64 / n_positions as f64).min(1.0)
     } else { 0.0 };
 
     // ── Wallet age ───────────────────────────────────────────────────────────
@@ -1190,6 +1541,65 @@ fn build_wallet_profile(
         if cost > 0.0 { (rev - cost) / cost } else { f64::NAN }
     } else { f64::NAN };
 
+    // ── Sell-side precision ───────────────────────────────────────────────────
+    // High avg SELL price (> 70¢) means the wallet exits positions at near-peak
+    // prices, consistent with having foreknowledge of resolution outcomes.
+    // Only count sells where price > 50¢ to filter dust / bad-price events.
+    // Only count sells on markets where the wallet entered at a reasonable price
+    // (avg BUY ≤ 90¢).  Selling at 99¢ after buying at 99¢ is not precision —
+    // it's a post-resolution exit.  quality_positions already filters these out.
+    let high_sells: Vec<f64> = history.iter()
+        .filter(|t| t.side == "SELL" && t.price > 0.5
+            && quality_positions.contains(t.condition_id.as_str()))
+        .map(|t| t.price)
+        .collect();
+    let n_sells = history.iter().filter(|t| t.side == "SELL").count();
+    let sell_precision = if high_sells.len() >= 2 {
+        high_sells.iter().sum::<f64>() / high_sells.len() as f64
+    } else { f64::NAN };
+
+    // ── Max consecutive win streak ────────────────────────────────────────────
+    // Sort markets by their most-recent trade timestamp (chronological order),
+    // then count the longest consecutive run of won markets.
+    let max_win_streak = {
+        let mut mkt_with_ts: Vec<(i64, bool)> = market_set.iter()
+            .map(|cid| {
+                let last_ts = history.iter()
+                    .filter(|t| &t.condition_id == cid && t.timestamp > 0)
+                    .map(|t| t.timestamp)
+                    .max()
+                    .unwrap_or(0);
+                (last_ts, redeemed.contains(cid.as_str()))
+            })
+            .collect();
+        mkt_with_ts.sort_by_key(|e| e.0);
+        let mut max_s = 0usize;
+        let mut cur_s = 0usize;
+        for (_, won) in &mkt_with_ts {
+            if *won { cur_s += 1; max_s = max_s.max(cur_s); } else { cur_s = 0; }
+        }
+        max_s
+    };
+
+    // ── Position velocity (markets per day) ───────────────────────────────────
+    let position_velocity = wallet_age_days
+        .filter(|&d| d >= 1.0)
+        .map(|d| n_positions as f64 / d)
+        .unwrap_or(0.0);
+
+    // ── Outcome YES/NO bias ───────────────────────────────────────────────────
+    // Consistent directional bias (> 80% YES or < 20% YES) may indicate the
+    // wallet has asymmetric access to positive or negative resolution information.
+    let buy_trades: Vec<_> = history.iter()
+        .filter(|t| t.side == "BUY" && (t.trade_type == "TRADE" || t.trade_type.is_empty()))
+        .collect();
+    let outcome_yes_fraction = if buy_trades.is_empty() {
+        f64::NAN
+    } else {
+        buy_trades.iter().filter(|t| t.outcome_index == 0).count() as f64
+        / buy_trades.len() as f64
+    };
+
     WalletProfile {
         wallet,
         pseudonym,
@@ -1206,6 +1616,13 @@ fn build_wallet_profile(
         informed_sizing_ratio,
         concentration,
         profit_roi,
+        sell_precision,
+        n_sells,
+        max_win_streak,
+        position_velocity,
+        outcome_yes_fraction,
+        n_quality_positions: n_quality,
+        n_quality_wins,
     }
 }
 
@@ -1217,69 +1634,160 @@ fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<
     if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
 
-/// Quant-grade five-signal suspicion score (0–100).
+/// Classify a market's insider-trading risk from its category tag and title.
 ///
-/// ┌─────────────────────────────────────────────────────────────────────┐
-/// │  S1  Statistical edge      0.28  Wilson LB ≥ 50%, gate: n ≥ 5     │
-/// │  S2  Early-entry alpha     0.22  Avg win entry price < 45¢         │
-/// │  S3  Informed sizing       0.18  Wins come from larger positions   │
-/// │  S4  Fresh concentrated    0.18  New wallet × bet concentration    │
-/// │  S5  Recency acceleration  0.14  Edge improving over time          │
-/// ├─────────────────────────────────────────────────────────────────────┤
-/// │  Multi-signal bonus ×1.25/×1.50/×1.75  (2/3/4+ signals > 0.15)  │
-/// │  Niche market multiplier  ×1.50  (daily vol < $50k)               │
-/// └─────────────────────────────────────────────────────────────────────┘
+/// Returns a multiplier (≥ 1.0) applied to the final suspicion score:
+///   1.50 — Politics / Government / Legal / Regulatory
+///   1.35 — Company / Finance / Crypto / Macro
+///   1.15 — Science / Technology product launches
+///   1.00 — Sports / Entertainment / Weather / Gaming (base rate)
 ///
-/// Returns (composite_score, [s1, s2, s3, s4, s5]) so callers can display
-/// per-signal breakdowns without re-computing.
-fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool) -> (f64, [f64; 5]) {
+/// Both `category` (the API field) and `title` (keyword fallback) are checked.
+/// Title matching is intentionally conservative: we only upgrade the tier when
+/// at least one unambiguous keyword is present so "Will X WIN the championship?"
+/// doesn't trigger the politics tier because of the word "will".
+pub fn market_insider_risk(category: Option<&str>, title: &str) -> f64 {
+    let cat  = category.unwrap_or("").to_lowercase();
+    let titl = title.to_lowercase();
 
-    // ─── S1: Statistical significance of win rate ─────────────────────────
-    // Wilson score lower bound at 95 % CI (z = 1.96).
-    // Only fires for wallets with ≥ 5 completed positions.
-    // Score: 0 at LB = 0.50, 1.0 at LB = 0.75+.
-    let s1 = if p.n_positions >= 5 {
-        let lb = wilson_lower_bound(p.n_wins, p.n_positions, 1.96);
-        ((lb - 0.50).max(0.0) / 0.25).min(1.0)
+    // ── High-risk: Politics, law, regulation, corporate actions ──────────
+    let political_cat = ["politics", "political", "election", "government", "legal",
+        "law", "policy", "regulation", "geopolitics", "economy", "economics",
+        "finance", "financial", "business", "company", "stock", "merger", "ipo",
+        "crypto", "bitcoin", "ethereum", "monetary", "macro", "fiscal",
+        "federal reserve", "central bank", "tariff", "trade"];
+    let political_title = [
+        "election", "president", "congress", "senate", "parliament",
+        "prime minister", "governor", "supreme court", "indicted", "lawsuit",
+        "tariff", "fed rate", "interest rate", "earnings", "revenue", "merger",
+        "acquisition", "ipo", "bankruptcy", "indictment", "regulation",
+        "sanction", "geopolitical", "gdp", "inflation", "unemployment",
+        "bitcoin", "ethereum", "crypto", "defi", "sec ", "fda ", "fbi ",
+        "executive order", "legislation", "vote ", "referendum", "impeach",
+    ];
+
+    // ── Medium-high: Technology, science (product launches, clinical trials)
+    let tech_title = [
+        "launch", "release", "announce", "approved by fda", "clinical trial",
+        "breakthrough", "patent",
+    ];
+
+    // ── Sports / Gaming: explicit downgrade keywords (base rate) ──────────
+    let sports_title = [
+        "game ", "match", "o/u", "over/under", "kills", "goals", "points",
+        "championship", "tournament", "grand slam", "open golf", "heritage",
+        "masters golf", "nba", "nfl", "nhl", "mlb", "premier league",
+        "world cup", "playoffs", "season", "league", "score ", "vs.",
+        "round ", "quarter ", "set ", "inning", "wicket",
+    ];
+
+    // ── Explicit category field always takes priority over title keywords ────
+    if political_cat.iter().any(|k| cat.contains(k)) {
+        return 1.50;
+    }
+    // "sports" / "entertainment" / "gaming" categories lock in base rate regardless
+    // of what the title says (prevents crypto-title-in-sports-category false upgrades).
+    let sports_cat = ["sports", "entertainment", "gaming", "esports", "music", "tv", "film",
+        "awards", "celebrity", "weather"];
+    if sports_cat.iter().any(|k| cat.contains(k)) {
+        return 1.00;
+    }
+
+    // ── Title keyword matching (fallback when no explicit category) ───────────
+    // Politics/corporate tier
+    if political_title.iter().any(|k| titl.contains(k)) {
+        return 1.50;
+    }
+    // Sports/gaming — explicitly base rate
+    if sports_title.iter().any(|k| titl.contains(k)) {
+        return 1.00;
+    }
+    // Tech/science — modest boost
+    if tech_title.iter().any(|k| titl.contains(k)) {
+        return 1.15;
+    }
+    // Unknown / ambiguous — no adjustment
+    1.00
+}
+
+/// Quant-grade six-signal suspicion score (0–100), production-calibrated.
+///
+/// ┌──────────────────────────────────────────────────────────────────────────┐
+/// │  S1  Statistical edge      0.25  Wilson LB ≥ 55%, gate: n ≥ 10         │
+/// │  S2  Early-entry alpha     0.19  Avg win entry < 45¢, confidence-scaled │
+/// │  S3  Informed sizing       0.15  Wins in upper-half, gate: 65%, n ≥ 6   │
+/// │  S4  Fresh concentrated    0.15  New wallet × volume impact ≥ 3%        │
+/// │  S5  Recency acceleration  0.13  Edge improving over time                │
+/// │  S6  Sell precision        0.13  Exits at high prices (> 70¢)           │
+/// ├──────────────────────────────────────────────────────────────────────────┤
+/// │  Multi-signal bonus ×1.25/×1.50/×1.75  (2/3/4+ signals > 0.15)        │
+/// │  Niche market multiplier  ×1.50  (daily vol < $50k)                     │
+/// │  Category risk multiplier ×1.00–×1.50  (politics/company > sports)     │
+/// └──────────────────────────────────────────────────────────────────────────┘
+///
+/// Signal gate changes from v1 (reduces false positives on small samples):
+///   S1: n ≥ 10 (was 5), LB threshold 55% (was 50%)
+///   S2: confidence-weighted by min(1, n_wins/5) — penalises n_wins < 5
+///   S3: threshold 65% (was 60%), n ≥ 6 (was 4)
+///   S4: volume_impact gate 3% fresh / 8% established (was 1% / 5%)
+///
+/// Returns (composite_score, [s1..s6]) so callers can display per-signal
+/// breakdowns without re-computing.
+fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool, category_mult: f64) -> (f64, [f64; 6]) {
+
+    // ─── S1: Statistical significance of win rate (quality-filtered) ────
+    // Uses n_quality_positions / n_quality_wins which exclude markets where
+    // the wallet's avg BUY price was > 90¢ — those are post-resolution redemption
+    // buyers, not informed early traders, and would otherwise inflate the win rate.
+    // Gate: n_quality ≥ 10, Wilson LB threshold 55%, score 0→1 at LB 55%→77%.
+    let s1 = if p.n_quality_positions >= 10 {
+        let lb = wilson_lower_bound(p.n_quality_wins, p.n_quality_positions, 1.96);
+        ((lb - 0.55).max(0.0) / 0.22).min(1.0)
     } else { 0.0 };
 
-    // ─── S2: Early-entry alpha (bought cheap on wins) ─────────────────────
+    // ─── S2: Early-entry alpha with confidence weighting ─────────────────
     // alpha_score = avg BUY price on winning positions (0–1).
-    // Informed traders enter early when probability is still low-priced.
-    // Score: 1.0 at 0¢ entry, 0 at 45¢+. Gate: ≥ 2 winning positions.
+    // confidence_mult penalises wallets with only 2–4 winning positions:
+    //   n_wins=2 → ×0.40; n_wins=3 → ×0.60; n_wins=5+ → ×1.00
+    // This prevents two lucky early entries from triggering the signal.
     let s2 = if !p.alpha_score.is_nan() && p.n_wins >= 2 && p.alpha_score < 0.45 {
-        (0.45 - p.alpha_score) / 0.45
+        let raw = (0.45 - p.alpha_score) / 0.45;
+        let confidence_mult = (p.n_wins as f64 / 5.0).min(1.0);
+        raw * confidence_mult
     } else { 0.0 };
 
-    // ─── S3: Informed sizing (bet bigger when you know) ───────────────────
-    // informed_sizing_ratio: fraction of wins in the upper half by position size.
-    // 0.5 = random distribution; → 1.0 = all wins from large bets.
-    // Gate: ratio must beat 0.60 (above random with margin).
-    let s3 = if p.informed_sizing_ratio > 0.60 && p.n_positions >= 4 {
-        ((p.informed_sizing_ratio - 0.60) / 0.35).min(1.0)
+    // ─── S3: Informed sizing (tightened) ─────────────────────────────────
+    // Threshold raised to 65% (was 60%) and gate to n ≥ 6 (was 4) to reduce
+    // false positives from wallets with few positions.
+    let s3 = if p.informed_sizing_ratio > 0.65 && p.n_positions >= 6 {
+        ((p.informed_sizing_ratio - 0.65) / 0.30).min(1.0)
     } else { 0.0 };
 
-    // ─── S4: Fresh concentrated bet ───────────────────────────────────────
-    // New wallet with high position concentration × market size impact.
-    // A fresh Sybil wallet all-in on one bet is maximally suspicious.
-    // Non-fresh but very large positions also trigger (capped at 0.5).
-    let s4 = if p.is_fresh && volume_impact > 0.01 {
-        let conc_mult = (p.concentration / 0.50).min(2.0); // 1× at 50% conc, 2× at 100%
-        ((volume_impact / 0.02).min(3.0) / 3.0 * conc_mult).min(1.0)
-    } else if volume_impact > 0.05 {
-        // Established wallet but very large relative position
-        ((volume_impact - 0.05) / 0.10).min(0.5)
+    // ─── S4: Fresh concentrated bet (tightened thresholds) ───────────────
+    // Fresh wallet gate raised to 3% of market volume (was 1%) to avoid
+    // flagging tiny positions in small markets as suspicious.
+    // Established wallet gate raised to 8% (was 5%).
+    let s4 = if p.is_fresh && volume_impact > 0.03 {
+        let conc_mult = (p.concentration / 0.50).min(2.0);
+        ((volume_impact / 0.04).min(3.0) / 3.0 * conc_mult).min(1.0)
+    } else if volume_impact > 0.08 {
+        ((volume_impact - 0.08) / 0.12).min(0.5)
     } else { 0.0 };
 
     // ─── S5: Recency acceleration (edge improving over time) ──────────────
-    // win_rate_weighted uses a 90-day half-life, so it over-weights recent activity.
-    // If recency rate > raw rate by >10pp the wallet's edge is intensifying.
     let s5 = if p.win_rate_weighted > p.win_rate + 0.10 && p.win_rate > 0.40 {
         ((p.win_rate_weighted - p.win_rate - 0.10) / 0.25).min(1.0)
     } else { 0.0 };
 
+    // ─── S6: Sell-side precision (exits at high prices) ───────────────────
+    // Informed traders exit positions near peak prices before bad news.
+    // Score: 0 at ≤ 70¢, 1.0 at 95¢. Gate: n_sells ≥ 2, avg sell > 70¢.
+    let s6 = if !p.sell_precision.is_nan() && p.n_sells >= 2 && p.sell_precision > 0.70 {
+        ((p.sell_precision - 0.70) / 0.25).min(1.0)
+    } else { 0.0 };
+
     // ─── Multi-signal bonus ───────────────────────────────────────────────
-    let signals = [s1, s2, s3, s4, s5];
+    let signals = [s1, s2, s3, s4, s5, s6];
     let n_triggered = signals.iter().filter(|&&s| s > 0.15).count();
     let multi_bonus: f64 = match n_triggered {
         0 | 1 => 1.00,
@@ -1289,8 +1797,8 @@ fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool) -> (
     };
     let niche_mult: f64 = if is_niche { 1.50 } else { 1.0 };
 
-    let base = s1 * 0.28 + s2 * 0.22 + s3 * 0.18 + s4 * 0.18 + s5 * 0.14;
-    let score = (base * multi_bonus * niche_mult * 100.0).min(100.0);
+    let base = s1*0.25 + s2*0.19 + s3*0.15 + s4*0.15 + s5*0.13 + s6*0.13;
+    let score = (base * multi_bonus * niche_mult * category_mult * 100.0).min(100.0);
 
     (score, signals)
 }
@@ -1340,7 +1848,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     }
 
     let market_title = &market_trades[0].market_title;
-    report.push(format!("Market: {}\n", market_title));
+    report.push(format!("Market: {}", market_title));
 
     // ── 2. Pick top-N wallets by buy-side position size ────────────────────
     let mut wallet_agg: HashMap<String, (f64, String)> = HashMap::new();
@@ -1380,15 +1888,22 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
         })
         .collect();
 
-    // Also look up market volume for size-anomaly scoring
-    let market_volume: Option<f64> = clients
+    // Also look up market volume + category for size-anomaly and insider-risk scoring
+    let market_meta = clients
         .polymarket
         .fetch_market_by_condition_id(market_id)
         .await
         .ok()
-        .flatten()
-        .and_then(|m| m.volume);
-    let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+        .flatten();
+    let market_volume:   Option<f64>   = market_meta.as_ref().and_then(|m| m.volume);
+    let market_category: Option<String> = market_meta.as_ref().and_then(|m| m.category.clone());
+    let is_niche   = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+    let cat_mult   = market_insider_risk(market_category.as_deref(), market_title);
+    let risk_tier  = if cat_mult >= 1.45 { format!("×{:.2} POLITICS/CORPORATE (high insider risk)", cat_mult) }
+        else if cat_mult >= 1.25 { format!("×{:.2} FINANCE/MACRO (elevated insider risk)", cat_mult) }
+        else if cat_mult >= 1.10 { format!("×{:.2} TECH/SCIENCE (modest insider risk)", cat_mult) }
+        else { format!("×{:.2} SPORTS/ENTERTAINMENT (base rate)", cat_mult) };
+    report.push(format!("Category risk tier: {}\n", risk_tier));
 
     // ── 4. Summary table ───────────────────────────────────────────────────
     report.push(format!(
@@ -1423,7 +1938,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
             "—".to_string()
         };
 
-        let (suspicion, sigs) = compute_suspicion(p, volume_impact, is_niche);
+        let (suspicion, sigs) = compute_suspicion(p, volume_impact, is_niche, cat_mult);
         let stat_lb = if p.n_positions >= 5 {
             format!("LB:{:.0}%", wilson_lower_bound(p.n_wins, p.n_positions, 1.96) * 100.0)
         } else { "LB:n/a".to_string() };
@@ -1573,6 +2088,8 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         .unwrap_or_else(|| "unknown".to_string());
     let fresh_note = if profile.is_fresh { "  ⚠ FRESH WALLET" } else { "" };
     report.push(format!("Wallet age:  {}{}",  age_str, fresh_note));
+    report.push(format!("Confidence:  {} ({} positions in history)",
+        confidence_label(profile.n_positions), profile.n_positions));
 
     // ── Performance summary ────────────────────────────────────────────────
     report.push("\n--- Performance Summary ---".to_string());
@@ -1706,10 +2223,17 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
 
     // ── Suspicion assessment (quant five-signal model) ────────────────────
     report.push("\n--- Suspicion Assessment ---".to_string());
-    let (suspicion, sigs) = compute_suspicion(&profile, 0.0, false);
-    let stat_lb = if profile.n_positions >= 5 {
-        format!("{:.1}%", wilson_lower_bound(profile.n_wins, profile.n_positions, 1.96) * 100.0)
-    } else { "n/a (< 5 positions)".to_string() };
+    let (suspicion, sigs) = compute_suspicion(&profile, 0.0, false, 1.0);
+    let stat_lb = if profile.n_quality_positions >= 5 {
+        format!("{:.1}%  (n={} quality positions)",
+            wilson_lower_bound(profile.n_quality_wins, profile.n_quality_positions, 1.96) * 100.0,
+            profile.n_quality_positions)
+    } else {
+        format!("n/a ({} quality positions < 5; {}/{} total excluded as late-entry)",
+            profile.n_quality_positions,
+            profile.n_positions - profile.n_quality_positions,
+            profile.n_positions)
+    };
     let roi_str = if profile.profit_roi.is_nan() { "n/a".to_string() }
                   else { format!("{:.0}%", profile.profit_roi * 100.0) };
     report.push(format!("Composite score:     {:.0}/100", suspicion));
@@ -1723,15 +2247,59 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
         sigs[3] * 100.0, profile.is_fresh, profile.concentration * 100.0));
     report.push(format!("  S5 Recency accel.     {:.0}/100  (raw {:.1}%  →  recency-wtd {:.1}%)",
         sigs[4] * 100.0, profile.win_rate * 100.0, profile.win_rate_weighted * 100.0));
+    report.push(format!("  S6 Sell precision     {:.0}/100  (avg sell price on exits > 50¢: {})",
+        sigs[5] * 100.0,
+        if profile.sell_precision.is_nan() { "n/a".to_string() }
+        else { format!("{:.1}¢  ({} sell events)", profile.sell_precision * 100.0, profile.n_sells) }));
     report.push(format!("  Profit ROI on wins:   {}  (no market-vol context available)", roi_str));
-    let verdict = if suspicion > 70.0 {
+    report.push("  Note: category_mult=1.0 here (standalone); find_smart_money applies market risk tier.".to_string());
+    report.push(String::new());
+    report.push("--- Supplementary Metrics ---".to_string());
+    report.push(format!("Max win streak:        {} consecutive wins ({})",
+        profile.max_win_streak,
+        if profile.max_win_streak >= 5 { "⚠ statistically unlikely at random" }
+        else if profile.max_win_streak >= 3 { "moderate" }
+        else { "typical" }));
+    let vel_str = if profile.position_velocity < 0.001 { "< 0.01".to_string() }
+                  else { format!("{:.2}", profile.position_velocity) };
+    report.push(format!("Position velocity:     {}/day  ({})",
+        vel_str,
+        if profile.position_velocity > 1.0 { "high — multiple new markets per day" }
+        else if profile.position_velocity > 0.3 { "moderate" }
+        else { "low — infrequent trading" }));
+    if !profile.outcome_yes_fraction.is_nan() {
+        let bias_label = if profile.outcome_yes_fraction > 0.80 { "⚠ strong YES bias" }
+                        else if profile.outcome_yes_fraction < 0.20 { "⚠ strong NO bias" }
+                        else { "balanced" };
+        report.push(format!("YES-outcome bias:      {:.0}% of BUY trades on YES  ({})",
+            profile.outcome_yes_fraction * 100.0, bias_label));
+    }
+    report.push(format!("Sample confidence:     {}", confidence_label(profile.n_positions)));
+    // Boost verdict if supplementary metrics raise independent red flags.
+    let supp_flags = {
+        let mut f = Vec::new();
+        if profile.max_win_streak >= 7 { f.push(format!("{}-win streak", profile.max_win_streak)); }
+        if !profile.outcome_yes_fraction.is_nan()
+            && (profile.outcome_yes_fraction > 0.85 || profile.outcome_yes_fraction < 0.15) {
+            f.push(format!("{:.0}% directional bias", profile.outcome_yes_fraction * 100.0));
+        }
+        f
+    };
+    let adjusted_suspicion = if supp_flags.is_empty() { suspicion }
+                              else { (suspicion + supp_flags.len() as f64 * 10.0).min(100.0) };
+
+    let verdict = if adjusted_suspicion > 70.0 {
         "HIGH — multiple strong insider indicators present"
-    } else if suspicion > 45.0 {
+    } else if adjusted_suspicion > 45.0 {
         "MODERATE — some indicators; monitor closely"
     } else {
         "LOW — no strong signals at this stage"
     };
     report.push(format!("Verdict: {}", verdict));
+    if !supp_flags.is_empty() {
+        report.push(format!("  → Supplementary flags: {}", supp_flags.join(", ")));
+        report.push(format!("  → Adjusted suspicion (incl. supplementary): {:.0}/100", adjusted_suspicion));
+    }
     report.push("\nNote: scores are probabilistic proxies, not evidence of wrongdoing.".to_string());
     report.push("Use find_smart_money on a specific market to include volume-impact (S4) context.".to_string());
 
@@ -1744,11 +2312,12 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
 /// Fetches top `top_n` wallets with 50-trade histories for speed.
 /// Returns `(market_title, condition_id, max_suspicion, top_wallet_name, top_wallet_addr)`.
 async fn quick_market_scan(
-    clients:       &MarketClients,
-    market_id:     &str,
-    market_title:  &str,
-    market_volume: Option<f64>,
-    top_n:         usize,
+    clients:         &MarketClients,
+    market_id:       &str,
+    market_title:    &str,
+    market_category: Option<&str>,
+    market_volume:   Option<f64>,
+    top_n:           usize,
 ) -> (String, String, f64, String, String) {
     use std::collections::HashMap;
     use futures_util::future::join_all;
@@ -1781,6 +2350,7 @@ async fn quick_market_scan(
     let (trade_hists, redeem_hists) = tokio::join!(trade_futs, redeem_futs);
 
     let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
+    let cat_mult  = market_insider_risk(market_category, market_title);
     let mut best = (0.0f64, String::new(), String::new());
 
     for (i, (wallet, market_size, pseudonym)) in ranked.iter().enumerate() {
@@ -1791,7 +2361,7 @@ async fn quick_market_scan(
             Some(v) if v > 0.0 => market_size / v,
             _ => 0.0,
         };
-        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche);
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, cat_mult);
         if suspicion > best.0 {
             best = (suspicion, profile.pseudonym.clone(), wallet.clone());
         }
@@ -1824,8 +2394,9 @@ async fn scan_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     let scans = join_all(markets.iter().map(|m| {
         let cid   = m.id.clone();
         let title = m.title.clone();
+        let cat   = m.category.clone();
         let vol   = m.volume;
-        async move { quick_market_scan(clients, &cid, &title, vol, top_n).await }
+        async move { quick_market_scan(clients, &cid, &title, cat.as_deref(), vol, top_n).await }
     })).await;
 
     // Filter and sort
@@ -2747,6 +3318,64 @@ mod tests {
         let bankroll = 1000.0_f64;
         let ev = bankroll * f * (e - m); // simplified EV for small bets
         assert!(ev > 0.0, "EV should be positive with edge");
+    }
+
+    // ── market_insider_risk ───────────────────────────────────────────────────
+
+    #[test]
+    fn risk_politics_keyword_in_title() {
+        let r = market_insider_risk(None, "Will Donald Trump win the 2024 election?");
+        assert!((r - 1.50).abs() < 1e-9, "election title should be 1.50, got {}", r);
+    }
+
+    #[test]
+    fn risk_politics_category_field() {
+        let r = market_insider_risk(Some("politics"), "Any market title");
+        assert!((r - 1.50).abs() < 1e-9, "politics category should be 1.50, got {}", r);
+    }
+
+    #[test]
+    fn risk_company_bitcoin() {
+        let r = market_insider_risk(None, "Will Bitcoin exceed $100k by end of 2025?");
+        assert!((r - 1.50).abs() < 1e-9, "bitcoin title should be 1.50, got {}", r);
+    }
+
+    #[test]
+    fn risk_fed_rate_decision() {
+        let r = market_insider_risk(None, "Will the Fed cut interest rate in June?");
+        assert!((r - 1.50).abs() < 1e-9, "fed rate title should be 1.50, got {}", r);
+    }
+
+    #[test]
+    fn risk_sports_golf_base_rate() {
+        let r = market_insider_risk(None, "Will Ryan Fox win the 2026 RBC Heritage?");
+        assert!((r - 1.00).abs() < 1e-9, "golf tournament title should be 1.00, got {}", r);
+    }
+
+    #[test]
+    fn risk_esports_kills_base_rate() {
+        let r = market_insider_risk(None, "Total Kills Over/Under 28.5 in Game 2?");
+        assert!((r - 1.00).abs() < 1e-9, "esports o/u title should be 1.00, got {}", r);
+    }
+
+    #[test]
+    fn risk_soccer_over_under_base_rate() {
+        let r = market_insider_risk(None, "AS Roma vs. Atalanta BC: O/U 3.5");
+        assert!((r - 1.00).abs() < 1e-9, "soccer o/u should be 1.00, got {}", r);
+    }
+
+    #[test]
+    fn risk_sports_category_overrides_any_title() {
+        // Even if title could match something, explicit "sports" category → base rate
+        let r = market_insider_risk(Some("sports"), "Bitcoin price above $100k?");
+        assert!((r - 1.00).abs() < 1e-9,
+            "explicit sports category should stay 1.00 even with bitcoin title, got {}", r);
+    }
+
+    #[test]
+    fn risk_multiplier_bounded_above_one() {
+        let r = market_insider_risk(None, "completely ambiguous market");
+        assert!(r >= 1.0, "risk multiplier should never drop below 1.0, got {}", r);
     }
 }
 

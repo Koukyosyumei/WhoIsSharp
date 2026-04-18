@@ -3271,6 +3271,18 @@ fn render_sm_wallet_detail(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(score_bar(sigs[4]), Style::default().fg(sig_color(sigs[4]))),
                 Span::styled(format!(" {:>4.0}/100  suspicion={:.0}/100", sigs[4]*100.0, sw.suspicion), Style::default().fg(Color::DarkGray)),
             ]),
+            Line::from(vec![
+                Span::styled("  S6 Sell prec.   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(score_bar(sigs[5]), Style::default().fg(sig_color(sigs[5]))),
+                Span::styled(
+                    if sw.sell_precision.is_nan() {
+                        format!(" {:>4.0}/100  avg_sell=n/a", sigs[5]*100.0)
+                    } else {
+                        format!(" {:>4.0}/100  avg_sell={:.1}¢", sigs[5]*100.0, sw.sell_precision * 100.0)
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
         ]
     } else {
         vec![Line::from("")]
@@ -5514,8 +5526,10 @@ async fn handle_key(
                         // Pass pre-fetched static data if available to avoid double-scan
                         let cached = if !app.ts_wallets.is_empty() {
                             Some(crate::tools::TooSmartResult {
-                                wallets:         app.ts_wallets.clone(),
-                                markets_scanned: app.ts_markets_scanned,
+                                wallets:            app.ts_wallets.clone(),
+                                markets_scanned:    app.ts_markets_scanned,
+                                temporal_clusters:  Vec::new(),
+                                score_distribution: Vec::new(),
                             })
                         } else {
                             None
@@ -6200,14 +6214,15 @@ async fn trigger_smart_money_load(
     let Some(market) = app.markets.iter().find(|m| &m.id == id) else { return };
     if market.platform != Platform::Polymarket { return; }
 
-    let clients_c       = clients.clone();
-    let tx              = event_tx.clone();
-    let market_id       = id.clone();
-    let market_volume   = market.volume;
-    let coord_threshold = app.coord_threshold;
+    let clients_c        = clients.clone();
+    let tx               = event_tx.clone();
+    let market_id        = id.clone();
+    let market_volume    = market.volume;
+    let market_category  = market.category.clone();
+    let coord_threshold  = app.coord_threshold;
 
     tokio::spawn(async move {
-        agent::refresh_smart_money(clients_c, market_id, market_volume, coord_threshold, tx).await;
+        agent::refresh_smart_money(clients_c, market_id, market_volume, market_category, coord_threshold, tx).await;
     });
 }
 

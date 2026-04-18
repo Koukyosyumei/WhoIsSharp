@@ -459,15 +459,16 @@ pub async fn refresh_price_history(
 }
 
 pub async fn refresh_smart_money(
-    clients:         Arc<MarketClients>,
-    market_id:       String,
-    market_volume:   Option<f64>,
-    coord_threshold: f64,
-    event_tx:        mpsc::UnboundedSender<AppEvent>,
+    clients:          Arc<MarketClients>,
+    market_id:        String,
+    market_volume:    Option<f64>,
+    market_category:  Option<String>,
+    coord_threshold:  f64,
+    event_tx:         mpsc::UnboundedSender<AppEvent>,
 ) {
     let _ = event_tx.send(AppEvent::SmartMoneyLoading);
 
-    match tools::smart_money_for_market(&clients, &market_id, 8, market_volume, coord_threshold).await {
+    match tools::smart_money_for_market(&clients, &market_id, 8, market_volume, market_category.as_deref(), coord_threshold).await {
         Ok(result) => {
             let _ = event_tx.send(AppEvent::SmartMoneyLoaded { market_id, result });
         }
