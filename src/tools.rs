@@ -23,18 +23,21 @@ impl ToolOutput {
 // ─── Clients (shared) ────────────────────────────────────────────────────────
 
 pub struct MarketClients {
-    pub polymarket: PolymarketClient,
-    pub kalshi:     KalshiClient,
+    pub polymarket:    PolymarketClient,
+    pub kalshi:        KalshiClient,
     /// None when `NEWSDATA_API_KEY` is not set.
-    pub news:       Option<NewsClient>,
+    pub news:          Option<NewsClient>,
+    /// Max trades/redeems to fetch per wallet (CLI --history flag, default 500).
+    pub history_limit: u32,
 }
 
 impl MarketClients {
-    pub fn new(newsdata_api_key: Option<String>) -> Self {
+    pub fn new(newsdata_api_key: Option<String>, history_limit: u32) -> Self {
         MarketClients {
             polymarket: PolymarketClient::new(),
             kalshi:     KalshiClient::new(),
             news:       newsdata_api_key.map(NewsClient::new),
+            history_limit,
         }
     }
 }
@@ -557,8 +560,8 @@ pub async fn fetch_wallet_detail(
     use std::collections::HashMap;
 
     let (trades_res, redeems_res) = join(
-        clients.polymarket.fetch_user_trades(wallet, 200),
-        clients.polymarket.fetch_user_redeems(wallet, 200),
+        clients.polymarket.fetch_user_trades(wallet, clients.history_limit),
+        clients.polymarket.fetch_user_redeems(wallet, clients.history_limit),
     ).await;
 
     let mut history = trades_res.context("Failed to fetch wallet trade history")?;
@@ -776,8 +779,10 @@ async fn market_wallet_scores(
 
     if ranked.is_empty() { return Vec::new(); }
 
-    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 50)));
-    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 50)));
+    // 200 each to reduce sample bias — active wallets can have 500+ trades and
+    // a 100-item window may hit a lucky streak unrepresentative of full history.
+    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, clients.history_limit)));
+    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, clients.history_limit)));
     let (trade_hists, redeem_hists) = tokio::join!(trade_futs, redeem_futs);
 
     let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
@@ -791,8 +796,9 @@ async fn market_wallet_scores(
             Some(v) if v > 0.0 => market_size / v,
             _ => 0.0,
         };
-        let cat_mult = market_insider_risk(market_category, market_title);
-        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, cat_mult);
+        let cat_mult    = market_insider_risk(market_category, market_title);
+        let is_spec     = is_speculation_market(market_category, market_title);
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, is_spec, cat_mult);
 
         // First BUY timestamp in this specific market (for temporal clustering).
         let first_entry_ts = history.iter()
@@ -1244,10 +1250,10 @@ pub async fn smart_money_for_market(
     // Fetch TRADE and REDEEM histories concurrently for every wallet.
     // REDEEMs must be fetched separately because the data-api requires type=.
     let trade_hists: Vec<_> = join_all(
-        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 150))
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, clients.history_limit))
     ).await;
     let redeem_hists: Vec<_> = join_all(
-        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 150))
+        ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, clients.history_limit))
     ).await;
 
     let profiles: Vec<WalletProfile> = ranked
@@ -1276,6 +1282,7 @@ pub async fn smart_money_for_market(
     // Niche market flag: volume < $50k
     let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
     let cat_mult = market_insider_risk(market_category, &market_title);
+    let is_spec  = is_speculation_market(market_category, &market_title);
 
     // Convert to public structs using the improved scoring formula
     let wallets = profiles.iter().map(|p| {
@@ -1283,7 +1290,7 @@ pub async fn smart_money_for_market(
             Some(vol) if vol > 0.0 => p.market_size / vol,
             _ => 0.0,
         };
-        let (suspicion, signal_scores) = compute_suspicion(p, volume_impact, is_niche, cat_mult);
+        let (suspicion, signal_scores) = compute_suspicion(p, volume_impact, is_niche, is_spec, cat_mult);
         let flagged = suspicion >= 50.0;
         let stat_lower_bound = if p.n_positions >= 5 {
             wilson_lower_bound(p.n_wins, p.n_positions, 1.96)
@@ -1405,11 +1412,23 @@ fn build_wallet_profile(
         .filter(|t| t.trade_type == "TRADE" || t.trade_type.is_empty())
         .count();
 
-    // ── Win set (REDEEM events) ───────────────────────────────────────────────
-    let redeemed: HashSet<&str> = history
+    // ── Win set (REDEEM events, restricted to market_set) ────────────────────
+    // CRITICAL: Only count REDEEMs for condition_ids that also appear as TRADE
+    // events in our history sample.  TRADE and REDEEM are fetched in separate API
+    // calls with independent limits; if the limits differ or the wallet is very
+    // active, the two sets can be misaligned — e.g. 50 recent REDEEMs from older
+    // markets that aren't in the 50 most-recent TRADEs.  Counting those inflates
+    // n_wins relative to n_positions and produces spuriously high win rates.
+    let all_redeemed: HashSet<&str> = history
         .iter()
         .filter(|t| t.trade_type == "REDEEM")
         .map(|t| t.condition_id.as_str())
+        .collect();
+    // Intersect with market_set so numerator and denominator cover the same markets.
+    let redeemed: HashSet<&str> = all_redeemed
+        .iter()
+        .copied()
+        .filter(|cid| market_set.contains(*cid))
         .collect();
     let n_wins = redeemed.len();
 
@@ -1672,6 +1691,26 @@ pub fn market_insider_risk(category: Option<&str>, title: &str) -> f64 {
         "breakthrough", "patent",
     ];
 
+    // ── Short-term price speculation: no insider info is possible ────────
+    // "Will ETH be above $2200 on April 19?" / "Bitcoin Up or Down - 9AM-9:05AM ET"
+    // These are hourly/daily price-move bets, not outcome markets with information
+    // asymmetry.  Crypto keywords in the title would otherwise trigger ×1.50,
+    // inflating scores for pure speculators.  Check this BEFORE political_title.
+    //
+    // Key patterns: "Up or Down" (intraday binary) and "price above/below" (threshold bets).
+    // We intentionally exclude "reach $" / "exceed $" which can be long-horizon bets
+    // where macro/regulatory insider info IS relevant (e.g. "Bitcoin reach $100k by 2025?").
+    let speculation_title = [
+        "up or down",  // classic Polymarket intraday binary format
+        "above $",     // "ETH be above $2,200 on April X" — dollar-threshold bet
+        "below $",     // "will price be below $1,800"
+        "dip to $",    // always short-term directional speculation
+        "drop to $",
+    ];
+    if speculation_title.iter().any(|k| titl.contains(k)) {
+        return 1.00;
+    }
+
     // ── Sports / Gaming: explicit downgrade keywords (base rate) ──────────
     let sports_title = [
         "game ", "match", "o/u", "over/under", "kills", "goals", "points",
@@ -1681,16 +1720,24 @@ pub fn market_insider_risk(category: Option<&str>, title: &str) -> f64 {
         "round ", "quarter ", "set ", "inning", "wicket",
     ];
 
-    // ── Explicit category field always takes priority over title keywords ────
-    if political_cat.iter().any(|k| cat.contains(k)) {
-        return 1.50;
-    }
-    // "sports" / "entertainment" / "gaming" categories lock in base rate regardless
-    // of what the title says (prevents crypto-title-in-sports-category false upgrades).
+    // ── Sports / Entertainment category → always base rate ───────────────
     let sports_cat = ["sports", "entertainment", "gaming", "esports", "music", "tv", "film",
         "awards", "celebrity", "weather"];
     if sports_cat.iter().any(|k| cat.contains(k)) {
         return 1.00;
+    }
+
+    // ── Title speculation patterns override everything else ────────────────
+    // Even if the category says "Crypto", a title like "ETH above $2,200 on April 19?"
+    // is a pure price-threshold bet where insider information is impossible.
+    // This check must happen BEFORE the political_cat check below.
+    if speculation_title.iter().any(|k| titl.contains(k)) {
+        return 1.00;
+    }
+
+    // ── Explicit political/financial/crypto category ───────────────────────
+    if political_cat.iter().any(|k| cat.contains(k)) {
+        return 1.50;
     }
 
     // ── Title keyword matching (fallback when no explicit category) ───────────
@@ -1708,6 +1755,20 @@ pub fn market_insider_risk(category: Option<&str>, title: &str) -> f64 {
     }
     // Unknown / ambiguous — no adjustment
     1.00
+}
+
+/// Returns true when the market title matches short-term price-speculation patterns
+/// (intraday binary bets, daily price-threshold bets).  These markets are inherently
+/// low-volume and niche, so the niche multiplier must NOT apply — the market's small
+/// size is a structural feature, not a signal of unusual informed interest.
+fn is_speculation_market(category: Option<&str>, title: &str) -> bool {
+    let cat  = category.unwrap_or("").to_lowercase();
+    let titl = title.to_lowercase();
+    let sports_cat = ["sports", "entertainment", "gaming", "esports", "music", "tv", "film",
+        "awards", "celebrity", "weather"];
+    if sports_cat.iter().any(|k| cat.contains(k)) { return false; }
+    let speculation_title = ["up or down", "above $", "below $", "dip to $", "drop to $"];
+    speculation_title.iter().any(|k| titl.contains(k))
 }
 
 /// Quant-grade six-signal suspicion score (0–100), production-calibrated.
@@ -1733,7 +1794,7 @@ pub fn market_insider_risk(category: Option<&str>, title: &str) -> f64 {
 ///
 /// Returns (composite_score, [s1..s6]) so callers can display per-signal
 /// breakdowns without re-computing.
-fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool, category_mult: f64) -> (f64, [f64; 6]) {
+fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool, is_speculation: bool, category_mult: f64) -> (f64, [f64; 6]) {
 
     // ─── S1: Statistical significance of win rate (quality-filtered) ────
     // Uses n_quality_positions / n_quality_wins which exclude markets where
@@ -1745,12 +1806,20 @@ fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool, cate
         ((lb - 0.55).max(0.0) / 0.22).min(1.0)
     } else { 0.0 };
 
-    // ─── S2: Early-entry alpha with confidence weighting ─────────────────
+    // ─── S2: Early-entry alpha with confidence weighting + win-rate gate ────
     // alpha_score = avg BUY price on winning positions (0–1).
-    // confidence_mult penalises wallets with only 2–4 winning positions:
-    //   n_wins=2 → ×0.40; n_wins=3 → ×0.60; n_wins=5+ → ×1.00
-    // This prevents two lucky early entries from triggering the signal.
-    let s2 = if !p.alpha_score.is_nan() && p.n_wins >= 2 && p.alpha_score < 0.45 {
+    // confidence_mult penalises wallets with only 2–4 winning positions.
+    //
+    // NEW: quality_win_rate gate (≥ 35%) — a wallet that buys at 5¢ and wins
+    // only 23% of the time is playing lottery tickets at market odds, NOT
+    // demonstrating informed early entry.  Informed traders are cheap AND right
+    // at an above-random rate.  Without this gate, any speculative strategy
+    // that occasionally wins big at low prices scores maximum S2.
+    let quality_win_rate = if p.n_quality_positions > 0 {
+        p.n_quality_wins as f64 / p.n_quality_positions as f64
+    } else { 0.0 };
+    let s2 = if !p.alpha_score.is_nan() && p.n_wins >= 2 && p.alpha_score < 0.45
+               && quality_win_rate >= 0.40 {
         let raw = (0.45 - p.alpha_score) / 0.45;
         let confidence_mult = (p.n_wins as f64 / 5.0).min(1.0);
         raw * confidence_mult
@@ -1795,10 +1864,18 @@ fn compute_suspicion(p: &WalletProfile, volume_impact: f64, is_niche: bool, cate
         3     => 1.50,
         _     => 1.75,
     };
-    let niche_mult: f64 = if is_niche { 1.50 } else { 1.0 };
+    // Speculation markets (intraday price bets) are structurally low-volume/niche,
+    // so niche_mult must not apply — the small size is expected, not suspicious.
+    let niche_mult: f64 = if is_niche && !is_speculation { 1.50 } else { 1.0 };
+
+    // Category multiplier only applies when the wallet has demonstrated real
+    // winning ability in quality markets (n_quality_wins ≥ 3).  A speculative
+    // wallet with no track record should not get boosted just because the market
+    // happens to mention "bitcoin" or "election" in its title.
+    let effective_cat_mult = if p.n_quality_wins >= 3 { category_mult } else { 1.0 };
 
     let base = s1*0.25 + s2*0.19 + s3*0.15 + s4*0.15 + s5*0.13 + s6*0.13;
-    let score = (base * multi_bonus * niche_mult * category_mult * 100.0).min(100.0);
+    let score = (base * multi_bonus * niche_mult * effective_cat_mult * 100.0).min(100.0);
 
     (score, signals)
 }
@@ -1899,6 +1976,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
     let market_category: Option<String> = market_meta.as_ref().and_then(|m| m.category.clone());
     let is_niche   = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
     let cat_mult   = market_insider_risk(market_category.as_deref(), market_title);
+    let is_spec    = is_speculation_market(market_category.as_deref(), market_title);
     let risk_tier  = if cat_mult >= 1.45 { format!("×{:.2} POLITICS/CORPORATE (high insider risk)", cat_mult) }
         else if cat_mult >= 1.25 { format!("×{:.2} FINANCE/MACRO (elevated insider risk)", cat_mult) }
         else if cat_mult >= 1.10 { format!("×{:.2} TECH/SCIENCE (modest insider risk)", cat_mult) }
@@ -1938,7 +2016,7 @@ async fn find_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
             "—".to_string()
         };
 
-        let (suspicion, sigs) = compute_suspicion(p, volume_impact, is_niche, cat_mult);
+        let (suspicion, sigs) = compute_suspicion(p, volume_impact, is_niche, is_spec, cat_mult);
         let stat_lb = if p.n_positions >= 5 {
             format!("LB:{:.0}%", wilson_lower_bound(p.n_wins, p.n_positions, 1.96) * 100.0)
         } else { "LB:n/a".to_string() };
@@ -2223,7 +2301,7 @@ async fn analyze_wallet(clients: &MarketClients, args: &serde_json::Value) -> Re
 
     // ── Suspicion assessment (quant five-signal model) ────────────────────
     report.push("\n--- Suspicion Assessment ---".to_string());
-    let (suspicion, sigs) = compute_suspicion(&profile, 0.0, false, 1.0);
+    let (suspicion, sigs) = compute_suspicion(&profile, 0.0, false, false, 1.0);
     let stat_lb = if profile.n_quality_positions >= 5 {
         format!("{:.1}%  (n={} quality positions)",
             wilson_lower_bound(profile.n_quality_wins, profile.n_quality_positions, 1.96) * 100.0,
@@ -2344,13 +2422,14 @@ async fn quick_market_scan(
 
     if ranked.is_empty() { return fallback; }
 
-    // Fetch TRADE + REDEEM histories concurrently (shallow: 50 each)
-    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, 50)));
-    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, 50)));
+    // Fetch TRADE + REDEEM histories concurrently (200 each for accuracy)
+    let trade_futs  = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_trades(w, clients.history_limit)));
+    let redeem_futs = join_all(ranked.iter().map(|(w, _, _)| clients.polymarket.fetch_user_redeems(w, clients.history_limit)));
     let (trade_hists, redeem_hists) = tokio::join!(trade_futs, redeem_futs);
 
     let is_niche = market_volume.map(|v| v < 50_000.0).unwrap_or(false);
     let cat_mult  = market_insider_risk(market_category, market_title);
+    let is_spec   = is_speculation_market(market_category, market_title);
     let mut best = (0.0f64, String::new(), String::new());
 
     for (i, (wallet, market_size, pseudonym)) in ranked.iter().enumerate() {
@@ -2361,7 +2440,7 @@ async fn quick_market_scan(
             Some(v) if v > 0.0 => market_size / v,
             _ => 0.0,
         };
-        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, cat_mult);
+        let (suspicion, _) = compute_suspicion(&profile, vol_impact, is_niche, is_spec, cat_mult);
         if suspicion > best.0 {
             best = (suspicion, profile.pseudonym.clone(), wallet.clone());
         }

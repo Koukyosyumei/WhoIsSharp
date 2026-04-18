@@ -94,6 +94,10 @@ struct Cli {
     /// Emit JSON instead of human-readable text (useful for piping to jq or scripts)
     #[arg(long)]
     scan_json: bool,
+
+    /// Max trades/redeems to fetch per wallet for smart-money analysis [default: 500]
+    #[arg(long, default_value = "500")]
+    history: u32,
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -143,7 +147,7 @@ async fn main() -> Result<()> {
     };
 
     let newsdata_api_key = std::env::var("NEWSDATA_API_KEY").ok();
-    let clients = Arc::new(MarketClients::new(newsdata_api_key));
+    let clients = Arc::new(MarketClients::new(newsdata_api_key, cli.history));
 
     if cli.scan {
         let report = tools::headless_scan(
