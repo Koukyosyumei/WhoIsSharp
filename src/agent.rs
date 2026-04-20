@@ -47,6 +47,22 @@ pub enum AppEvent {
     WalletDetailLoading,
     WalletDetailLoaded(crate::tools::WalletDetail),
 
+    TooSmartLoading,
+    TooSmartLoaded(crate::tools::TooSmartResult),
+
+    /// LLM Too-Smart scan started (show spinner in TUI).
+    TooSmartLlmStarted,
+    /// LLM identified one suspect — stream results live as they arrive.
+    TooSmartLlmWalletFound {
+        wallet:      String,
+        pseudonym:   String,
+        rank:        usize,
+        reasoning:   String,
+        key_signals: Vec<String>,
+    },
+    /// LLM Too-Smart scan complete.
+    TooSmartLlmDone,
+
     // ── Time & Sales tape ─────────────────────────────────────────────────────
     TradesLoaded {
         market_id: String,
@@ -443,15 +459,16 @@ pub async fn refresh_price_history(
 }
 
 pub async fn refresh_smart_money(
-    clients:         Arc<MarketClients>,
-    market_id:       String,
-    market_volume:   Option<f64>,
-    coord_threshold: f64,
-    event_tx:        mpsc::UnboundedSender<AppEvent>,
+    clients:          Arc<MarketClients>,
+    market_id:        String,
+    market_volume:    Option<f64>,
+    market_category:  Option<String>,
+    coord_threshold:  f64,
+    event_tx:         mpsc::UnboundedSender<AppEvent>,
 ) {
     let _ = event_tx.send(AppEvent::SmartMoneyLoading);
 
-    match tools::smart_money_for_market(&clients, &market_id, 8, market_volume, coord_threshold).await {
+    match tools::smart_money_for_market(&clients, &market_id, 8, market_volume, market_category.as_deref(), coord_threshold).await {
         Ok(result) => {
             let _ = event_tx.send(AppEvent::SmartMoneyLoaded { market_id, result });
         }
@@ -459,6 +476,198 @@ pub async fn refresh_smart_money(
             let _ = event_tx.send(AppEvent::RefreshError(format!("Smart money: {}", e)));
         }
     }
+}
+
+/// Scan multiple Polymarket markets to find "too smart" wallets with persistent
+/// cross-market suspicion.
+pub async fn refresh_too_smart_wallets(
+    clients:         Arc<MarketClients>,
+    market_limit:    usize,
+    min_appearances: usize,
+    min_suspicion:   f64,
+    event_tx:        mpsc::UnboundedSender<AppEvent>,
+) {
+    let _ = event_tx.send(AppEvent::TooSmartLoading);
+
+    match tools::scan_too_smart_wallets(&clients, market_limit, min_appearances, min_suspicion).await {
+        Ok(result) => {
+            let _ = event_tx.send(AppEvent::TooSmartLoaded(result));
+        }
+        Err(e) => {
+            let _ = event_tx.send(AppEvent::RefreshError(format!("Too-smart scan: {}", e)));
+        }
+    }
+}
+
+/// Run the LLM-powered Too-Smart scan.
+///
+/// Pre-fetches (or reuses) the static cross-market scan data, formats it as
+/// context, and asks the LLM to independently identify the most suspicious
+/// wallets via `flag_too_smart_wallet` tool calls.
+/// Pass `Some(result)` as `ts_result` to reuse already-fetched static scan data (fast path);
+/// pass `None` to fetch fresh data first.
+pub async fn run_too_smart_llm_scan(
+    backend:   Arc<dyn LlmBackend>,
+    clients:   Arc<MarketClients>,
+    ts_result: Option<tools::TooSmartResult>,
+    event_tx:  mpsc::UnboundedSender<AppEvent>,
+) {
+    let _ = event_tx.send(AppEvent::TooSmartLlmStarted);
+
+    // ── Obtain raw scan data ──────────────────────────────────────────────────
+    let scan_data = match ts_result {
+        Some(r) => r,
+        None => {
+            let _ = event_tx.send(AppEvent::AgentThinking);
+            match tools::scan_too_smart_wallets(&clients, 30, 2, 30.0).await {
+                Ok(r)  => r,
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::RefreshError(
+                        format!("LLM scan pre-fetch failed: {}", e)
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+
+    // ── Format raw data as LLM context ───────────────────────────────────────
+    let mut ctx = vec![
+        format!(
+            "=== CROSS-MARKET SCAN  ({} markets, {} candidate wallets) ===",
+            scan_data.markets_scanned, scan_data.wallets.len()
+        ),
+        "Columns: rank | pseudonym (wallet_prefix) | flagged/total markets | avg_susp/max_susp | win_rate | vol($) | fresh | flagged_in".into(),
+    ];
+    for (i, w) in scan_data.wallets.iter().enumerate() {
+        let prefix = if w.wallet.len() >= 10 { &w.wallet[..10] } else { &w.wallet };
+        ctx.push(format!(
+            "{:2}. {:<22} ({}) | {}/{} mrkts | {:.0}/{:.0} susp | {:.1}% wr | ${:.0} vol | fresh={} | {}",
+            i + 1,
+            w.pseudonym, prefix,
+            w.markets_flagged, w.markets_total,
+            w.avg_suspicion, w.max_suspicion,
+            w.global_win_rate * 100.0,
+            w.total_vol,
+            w.is_fresh,
+            w.flagged_markets.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
+        ));
+    }
+    let context = ctx.join("\n");
+
+    // ── Build initial message ─────────────────────────────────────────────────
+    let user_msg = format!(
+        "Below is raw data from a cross-market scan of Polymarket traders.\n\n\
+        {context}\n\n\
+        Your task: independently identify wallets you believe are 'too smart' — \
+        likely informed insiders or sophisticated algos. Apply rigorous statistical \
+        reasoning. For each suspect, call `flag_too_smart_wallet` with:\n\
+        • wallet: full address from the data above\n\
+        • pseudonym: their display name\n\
+        • rank: your conviction rank (1 = most suspicious)\n\
+        • reasoning: 2–4 sentences citing specific stats and cross-market patterns\n\
+        • key_signals: 2–4 specific signal strings\n\n\
+        Be selective — aim for your top 3–7 highest-conviction suspects only. \
+        After flagging, give a brief synthesis of what these wallets have in common.",
+        context = context
+    );
+
+    let system = "You are a quantitative analyst specialising in on-chain prediction-market \
+        intelligence. You identify informed traders using rigorous statistical reasoning — \
+        Wilson lower bounds, informed sizing, alpha entry, and cross-market persistence. \
+        Use `flag_too_smart_wallet` for each confirmed suspect. Be selective: 3–7 wallets, \
+        ranked by conviction. Do not flag wallets with only borderline evidence.";
+
+    let tools = tools::too_smart_llm_definitions();
+    let mut history = vec![LlmMessage::user_text(user_msg)];
+
+    // ── Agent loop ────────────────────────────────────────────────────────────
+    loop {
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<String>();
+        let event_tx_clone = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(chunk) = chunk_rx.recv().await {
+                let _ = event_tx_clone.send(AppEvent::AgentTextChunk(chunk));
+            }
+        });
+
+        let _ = event_tx.send(AppEvent::AgentThinking);
+        let result = backend.generate_streaming(system, &history, &tools, &chunk_tx).await;
+        drop(chunk_tx);
+
+        let assistant_msg = match result {
+            Ok(msg) => msg,
+            Err(e) => {
+                let _ = event_tx.send(AppEvent::RefreshError(
+                    format!("LLM Too-Smart scan error: {}", e)
+                ));
+                return;
+            }
+        };
+
+        let texts = assistant_msg.texts();
+        if !texts.is_empty() {
+            let _ = event_tx.send(AppEvent::AgentText(texts.join("\n")));
+        }
+
+        history.push(assistant_msg.clone());
+
+        let calls = assistant_msg.tool_calls();
+        if calls.is_empty() {
+            break;
+        }
+
+        let mut results = Vec::new();
+        for tc in &calls {
+            if tc.name == "flag_too_smart_wallet" {
+                let wallet      = tc.args["wallet"].as_str().unwrap_or("").to_string();
+                let pseudonym   = tc.args["pseudonym"].as_str().unwrap_or("Unknown").to_string();
+                let rank        = tc.args["rank"].as_u64().unwrap_or(99) as usize;
+                let reasoning   = tc.args["reasoning"].as_str().unwrap_or("").to_string();
+                let key_signals: Vec<String> = tc.args["key_signals"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+
+                let _ = event_tx.send(AppEvent::TooSmartLlmWalletFound {
+                    wallet: wallet.clone(), pseudonym, rank, reasoning, key_signals,
+                });
+
+                let _ = event_tx.send(AppEvent::AgentToolCall {
+                    name: "flag_too_smart_wallet".into(),
+                    display_args: format!("rank={} wallet={}", rank, &wallet[..wallet.len().min(12)]),
+                });
+
+                results.push(crate::llm::ToolResult {
+                    call_id: tc.id.clone(),
+                    name:    tc.name.clone(),
+                    content: format!("Flagged wallet {} at rank {}.", wallet, rank),
+                });
+            } else {
+                let _ = event_tx.send(AppEvent::AgentToolCall {
+                    name:         tc.name.clone(),
+                    display_args: tc.args.to_string(),
+                });
+
+                let output = tools::dispatch(&clients, &tc.name, &tc.args).await;
+
+                let _ = event_tx.send(AppEvent::AgentToolResult {
+                    name:   tc.name.clone(),
+                    output: output.text.clone(),
+                });
+
+                results.push(crate::llm::ToolResult {
+                    call_id: tc.id.clone(),
+                    name:    tc.name.clone(),
+                    content: output.text,
+                });
+            }
+        }
+
+        history.push(LlmMessage::tool_results(results));
+    }
+
+    let _ = event_tx.send(AppEvent::TooSmartLlmDone);
 }
 
 /// Fetch recent Time & Sales tape for a Polymarket market.
