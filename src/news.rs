@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::cache::TtlCache;
@@ -101,12 +102,15 @@ impl NewsClient {
     ///
     /// Extracts the most informative terms from the title (removing question
     /// words and common stop-words) and uses them as the search query.
+    /// Results are deduplicated and sorted by relevance score.
     pub async fn fetch_for_market(&self, market_title: &str, limit: u8) -> Result<Vec<NewsArticle>> {
         let query = market_query(market_title);
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        self.fetch_latest(&query, limit).await
+        let articles = self.fetch_latest(&query, limit).await?;
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        Ok(deduplicate_and_score(articles, &terms))
     }
 
     async fn fetch_articles(&self, url: &str) -> Result<Vec<NewsArticle>> {
@@ -241,6 +245,83 @@ fn parse_news_body(body: &str) -> Result<Vec<NewsArticle>> {
     let resp: NewsResponse = serde_json::from_value(v)
         .context("Failed to deserialize newsdata.io response")?;
     Ok(resp.results.into_iter().map(raw_to_article).collect())
+}
+
+// ─── Deduplication + relevance scoring ───────────────────────────────────────
+
+/// Score, deduplicate, and re-sort articles by relevance.
+///
+/// Scoring:
+///   recency    — exponential decay over 72 h (weight ~0.5)
+///   sentiment  — +0.3 for strong sentiment (positive/negative), +0.1 for neutral
+///   keyword    — +0.2 per query term found in title or description (capped at 0.6)
+fn deduplicate_and_score(articles: Vec<NewsArticle>, query_terms: &[&str]) -> Vec<NewsArticle> {
+    if articles.is_empty() { return articles; }
+
+    // Score each article
+    let mut scored: Vec<(f64, usize)> = articles
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let recency = recency_score(&a.pub_date);
+            let sentiment = match a.sentiment.as_deref() {
+                Some("positive") | Some("negative") => 0.3,
+                Some("neutral")                     => 0.1,
+                _                                   => 0.0,
+            };
+            let body = format!("{} {}", a.title, a.description).to_lowercase();
+            let keyword_hits = query_terms
+                .iter()
+                .filter(|&&t| body.contains(&t.to_lowercase()))
+                .count()
+                .min(3) as f64 * 0.2;
+            (recency + sentiment + keyword_hits, i)
+        })
+        .collect();
+
+    // Sort descending by score
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Deduplicate: by normalised URL, then by 5-word title fingerprint
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut result = Vec::with_capacity(articles.len());
+    for (_, idx) in scored {
+        let a = &articles[idx];
+        let url_key = normalize_url(&a.link);
+        let title_key: String = a.title
+            .split_whitespace()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        if !seen.contains(&url_key)
+            && (title_key.is_empty() || !seen.contains(&title_key))
+        {
+            seen.insert(url_key);
+            if !title_key.is_empty() { seen.insert(title_key); }
+            result.push(articles[idx].clone());
+        }
+    }
+    result
+}
+
+fn normalize_url(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).trim_end_matches('/').to_lowercase()
+}
+
+fn recency_score(pub_date: &str) -> f64 {
+    use chrono::{DateTime, Utc};
+    let Ok(dt) = DateTime::parse_from_rfc3339(pub_date).or_else(|_| {
+        let with_t = pub_date.replace(' ', "T");
+        let with_z = if with_t.ends_with('Z') { with_t } else { format!("{}Z", with_t) };
+        DateTime::parse_from_rfc3339(&with_z)
+    }) else {
+        return 0.0;
+    };
+    let hours = (Utc::now() - dt.to_utc()).num_seconds().max(0) as f64 / 3600.0;
+    // Exponential decay: 1.0 at 0h, ~0.5 at 14h, ~0.1 at 46h
+    (-0.05 * hours).exp()
 }
 
 // ─── Minimal URL percent-encoding (letters/digits/- safe) ────────────────────

@@ -3,11 +3,16 @@
 //! All tools are async and return plain strings shown to the LLM and TUI.
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
+use crate::fred::FredClient;
 use crate::llm::ToolDefinition;
 use crate::markets::{kalshi::KalshiClient, polymarket::PolymarketClient, ChartInterval};
 use crate::news::NewsClient;
+
+/// Sender for MCP progress notifications: (completed, total).
+pub type ProgressTx = UnboundedSender<(u32, u32)>;
 
 // ─── Tool result ─────────────────────────────────────────────────────────────
 
@@ -27,16 +32,23 @@ pub struct MarketClients {
     pub kalshi:        KalshiClient,
     /// None when `NEWSDATA_API_KEY` is not set.
     pub news:          Option<NewsClient>,
+    /// None when `FRED_API_KEY` is not set.
+    pub fred:          Option<FredClient>,
     /// Max trades/redeems to fetch per wallet (CLI --history flag, default 500).
     pub history_limit: u32,
 }
 
 impl MarketClients {
-    pub fn new(newsdata_api_key: Option<String>, history_limit: u32) -> Self {
+    pub fn new(
+        newsdata_api_key: Option<String>,
+        fred_api_key:     Option<String>,
+        history_limit:    u32,
+    ) -> Self {
         MarketClients {
             polymarket: PolymarketClient::new(),
             kalshi:     KalshiClient::new(),
             news:       newsdata_api_key.map(NewsClient::new),
+            fred:       fred_api_key.map(FredClient::new),
             history_limit,
         }
     }
@@ -45,11 +57,12 @@ impl MarketClients {
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
 pub async fn dispatch(
-    clients: &MarketClients,
-    name:    &str,
-    args:    &serde_json::Value,
+    clients:  &MarketClients,
+    name:     &str,
+    args:     &Value,
+    prog_tx:  Option<ProgressTx>,
 ) -> ToolOutput {
-    match dispatch_inner(clients, name, args).await {
+    match dispatch_inner(clients, name, args, prog_tx).await {
         Ok(out)  => out,
         // Use alternate format to include the full anyhow error chain
         // (e.g. "Polymarket /prices-history request failed: HTTP 404: body…")
@@ -58,26 +71,36 @@ pub async fn dispatch(
 }
 
 async fn dispatch_inner(
-    clients: &MarketClients,
-    name:    &str,
-    args:    &serde_json::Value,
+    clients:  &MarketClients,
+    name:     &str,
+    args:     &Value,
+    prog_tx:  Option<ProgressTx>,
 ) -> Result<ToolOutput> {
     match name {
-        "list_markets"     => list_markets(clients, args).await,
-        "get_market"       => get_market(clients, args).await,
-        "get_orderbook"    => get_orderbook(clients, args).await,
+        "list_markets"      => list_markets(clients, args).await,
+        "get_market"        => get_market(clients, args).await,
+        "get_orderbook"     => get_orderbook(clients, args).await,
         "get_price_history" => get_price_history(clients, args).await,
-        "get_events"       => get_events(clients, args).await,
-        "search_markets"   => search_markets(clients, args).await,
-        "analyze_insider"  => analyze_insider(clients, args).await,
-        "find_smart_money" => find_smart_money(clients, args).await,
-        "analyze_wallet"      => analyze_wallet(clients, args).await,
-        "scan_smart_money"    => scan_smart_money(clients, args).await,
+        "get_events"        => get_events(clients, args).await,
+        "search_markets"    => search_markets(clients, args).await,
+        "analyze_insider"   => analyze_insider(clients, args).await,
+        "find_smart_money"  => find_smart_money(clients, args).await,
+        "analyze_wallet"    => analyze_wallet(clients, args).await,
+        "scan_smart_money"  => scan_smart_money(clients, args, prog_tx).await,
         "get_wallet_positions" => get_wallet_positions(clients, args).await,
-        "kelly_size"          => kelly_size(clients, args).await,
-        "search_news"         => search_news(clients, args).await,
-        "get_market_news"     => get_market_news(clients, args).await,
-        _                     => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
+        "kelly_size"           => kelly_size(clients, args).await,
+        "kelly_correlated"     => kelly_correlated(args).await,
+        "binary_greeks"        => binary_greeks(args).await,
+        "market_microstructure" => market_microstructure(clients, args).await,
+        "test_cointegration"   => test_cointegration(clients, args).await,
+        "get_portfolio"        => get_portfolio(clients).await,
+        "get_portfolio_risk"   => get_portfolio_risk(clients).await,
+        "get_watchlist"        => get_watchlist().await,
+        "get_signals"          => get_signals(clients).await,
+        "get_macro"            => get_macro(clients).await,
+        "search_news"          => search_news(clients, args).await,
+        "get_market_news"      => get_market_news(clients, args).await,
+        _                      => Ok(ToolOutput::err(format!("Unknown tool: {}", name))),
     }
 }
 
@@ -1181,7 +1204,7 @@ pub async fn headless_scan(
             out.push(format!("Rank #{} | {:.0}/100 (p{:.0}) | Leader score: {} | {}",
                 i + 1, w.avg_suspicion, pct, w.leader_score, w.pseudonym));
             let args = serde_json::json!({ "wallet": w.wallet, "limit": 250 });
-            let profile_out = dispatch(clients, "analyze_wallet", &args).await;
+            let profile_out = dispatch(clients, "analyze_wallet", &args, None).await;
             out.push(profile_out.text);
         }
     }
@@ -2454,8 +2477,12 @@ async fn quick_market_scan(
 /// repeatedly because it uses shallow histories (50 trades/wallet) and returns
 /// only summary rows.  Follow up with find_smart_money or analyze_wallet on the
 /// flagged markets/wallets for full detail.
-async fn scan_smart_money(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
-    use futures_util::future::join_all;
+async fn scan_smart_money(
+    clients:  &MarketClients,
+    args:     &Value,
+    prog_tx:  Option<ProgressTx>,
+) -> Result<ToolOutput> {
+    use futures_util::StreamExt;
 
     let limit         = args["limit"].as_u64().unwrap_or(20).min(30) as u32;
     let top_n         = args["top_n"].as_u64().unwrap_or(3).min(5) as usize;
@@ -2469,14 +2496,25 @@ async fn scan_smart_money(clients: &MarketClients, args: &serde_json::Value) -> 
         return Ok(ToolOutput::ok("No active Polymarket markets found.".to_string()));
     }
 
-    // Run all market scans concurrently (shallow, fast)
-    let scans = join_all(markets.iter().map(|m| {
+    // Run scans concurrently via FuturesUnordered so we can emit progress as each completes.
+    let total = markets.len() as u32;
+    let mut futs = futures_util::stream::FuturesUnordered::new();
+    for m in &markets {
         let cid   = m.id.clone();
         let title = m.title.clone();
         let cat   = m.category.clone();
         let vol   = m.volume;
-        async move { quick_market_scan(clients, &cid, &title, cat.as_deref(), vol, top_n).await }
-    })).await;
+        futs.push(async move {
+            quick_market_scan(clients, &cid, &title, cat.as_deref(), vol, top_n).await
+        });
+    }
+    let mut done = 0u32;
+    let mut scans = Vec::with_capacity(markets.len());
+    while let Some(result) = futs.next().await {
+        done += 1;
+        if let Some(tx) = &prog_tx { let _ = tx.send((done, total)); }
+        scans.push(result);
+    }
 
     // Filter and sort
     let mut flagged: Vec<_> = scans.into_iter()
@@ -2873,6 +2911,719 @@ async fn kelly_size(_clients: &MarketClients, args: &serde_json::Value) -> Resul
     Ok(ToolOutput::ok(report.join("\n")))
 }
 
+// ─── Correlated Kelly position sizing ────────────────────────────────────────
+
+/// Multi-asset Kelly criterion under pairwise correlations.
+///
+/// Uses the quadratic (normal) approximation to Kelly, equivalent to
+/// mean-variance optimisation:  w = Σ⁻¹ · μ
+/// where μ_i is the expected return per dollar wagered and Σ is the
+/// return-covariance matrix.
+async fn kelly_correlated(args: &serde_json::Value) -> Result<ToolOutput> {
+    let bets_raw = match args["bets"].as_array() {
+        Some(a) => a.clone(),
+        None    => return Ok(ToolOutput::err("Missing required parameter: bets (array)")),
+    };
+    if bets_raw.is_empty() {
+        return Ok(ToolOutput::err("bets array is empty"));
+    }
+    let bankroll = args["bankroll"].as_f64().unwrap_or(10_000.0);
+
+    struct Bet { label: String, c: f64, p: f64 }
+
+    let mut bets: Vec<Bet> = Vec::new();
+    for (i, b) in bets_raw.iter().enumerate() {
+        let label = b["label"].as_str().unwrap_or(&format!("Bet {}", i + 1)).to_string();
+        let c_raw = b["market_price"].as_f64().unwrap_or(0.0);
+        let p_raw = b["your_prob"].as_f64().unwrap_or(0.0);
+        let side  = b["side"].as_str().unwrap_or("yes").to_lowercase();
+
+        // Normalise NO bets to YES-equivalent framing
+        let (c, p) = if side == "no" { (1.0 - c_raw, 1.0 - p_raw) } else { (c_raw, p_raw) };
+
+        if !(0.001..0.999).contains(&c) || !(0.001..0.999).contains(&p) {
+            return Ok(ToolOutput::err(format!(
+                "Bet {}: market_price and your_prob must be in (0,1)", i + 1
+            )));
+        }
+        bets.push(Bet { label, c, p });
+    }
+
+    let n = bets.len();
+
+    // Build correlation matrix (default: identity — independent bets)
+    let mut corr = vec![vec![0.0f64; n]; n];
+    for i in 0..n { corr[i][i] = 1.0; }
+    if let Some(rows) = args["correlations"].as_array() {
+        for (i, row) in rows.iter().enumerate().take(n) {
+            if let Some(cols) = row.as_array() {
+                for (j, val) in cols.iter().enumerate().take(n) {
+                    if let Some(rho) = val.as_f64() {
+                        corr[i][j] = rho.clamp(-1.0, 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    // μ_i = expected return per dollar wagered on bet i
+    // b_i  = net odds = (1 − c_i) / c_i
+    // μ_i  = p_i * b_i − (1−p_i)  =  (p_i − c_i) / c_i
+    //
+    // Return std: σ_i = √(p_i*(1−p_i)) * (b_i + 1) = √(p_i*(1−p_i)) / c_i
+    // Σ_ij = ρ_ij * σ_i * σ_j
+    let mu: Vec<f64> = bets.iter().map(|b| (b.p - b.c) / b.c).collect();
+    let sigma: Vec<f64> = bets.iter()
+        .map(|b| (b.p * (1.0 - b.p)).sqrt() / b.c)
+        .collect();
+    let cov: Vec<Vec<f64>> = (0..n).map(|i| {
+        (0..n).map(|j| corr[i][j] * sigma[i] * sigma[j]).collect()
+    }).collect();
+
+    // Solve Σ · w = μ
+    let w_opt = match solve_linear(cov, mu.clone()) {
+        Some(w) => w,
+        None    => return Ok(ToolOutput::err("Correlation matrix is singular — check that correlations are valid")),
+    };
+
+    let standalone: Vec<f64> = bets.iter().map(|b| {
+        let f = (b.p - b.c) / (1.0 - b.c);
+        f.clamp(-1.0, 1.0)
+    }).collect();
+
+    let mut report = vec!["=== CORRELATED KELLY POSITION SIZING ===".to_string()];
+    report.push(format!("\nBankroll: ${:.0}  |  N bets: {}", bankroll, n));
+
+    if n > 1 {
+        report.push("\nCorrelation matrix:".to_string());
+        let header: String = (0..n).map(|i| format!("{:>8}", format!("Bet{}", i + 1))).collect::<Vec<_>>().join("");
+        report.push(format!("         {}", header));
+        for i in 0..n {
+            let row: String = (0..n).map(|j| format!("{:>8.2}", corr[i][j])).collect::<Vec<_>>().join("");
+            report.push(format!("  Bet{}  {}", i + 1, row));
+        }
+    }
+
+    report.push("\n--- Sizing ---".to_string());
+    report.push(format!("{:<22} {:>8} {:>10} {:>10} {:>10} {:>10}",
+        "Label", "Edge%", "Standalone", "Corr-Kelly", "Half-Kelly", "$ (half-K)"));
+    report.push("─".repeat(72));
+
+    for (i, bet) in bets.iter().enumerate() {
+        let edge_pct = (bet.p - bet.c) * 100.0;
+        let sa  = standalone[i] * 100.0;
+        let wc  = w_opt[i].clamp(-1.0, 1.0) * 100.0;
+        let hk  = wc / 2.0;
+        let usd = bankroll * (hk / 100.0).clamp(0.0, 1.0);
+        report.push(format!("{:<22} {:>7.1}% {:>9.1}% {:>9.1}% {:>9.1}% {:>9.0}",
+            &bet.label[..bet.label.len().min(22)],
+            edge_pct, sa, wc, hk, usd));
+    }
+
+    // Warn when correlation materially changes sizing
+    let max_reduction = standalone.iter().zip(w_opt.iter())
+        .map(|(s, w)| s - w.clamp(-1.0, 1.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if max_reduction > 0.03 && n > 1 {
+        report.push(format!(
+            "\n⚠ Correlation reduces the largest position by {:.1}% of bankroll vs standalone Kelly.",
+            max_reduction * 100.0
+        ));
+    }
+
+    report.push("\nNote: Corr-Kelly uses a quadratic approximation (valid for f << 1). Negative values indicate no edge on that leg.".to_string());
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+/// Gaussian elimination with partial pivoting.  Solves A·x = b in-place.
+/// Returns None if A is singular.
+fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&i, &j| {
+            a[i][col].abs().partial_cmp(&a[j][col].abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if a[pivot][col].abs() < 1e-12 { return None; }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let pv = a[col][col];
+        for j in col..n { a[col][j] /= pv; }
+        b[col] /= pv;
+        for row in 0..n {
+            if row != col {
+                let f = a[row][col];
+                for j in col..n { a[row][j] -= f * a[col][j]; }
+                b[row] -= f * b[col];
+            }
+        }
+    }
+    Some(b)
+}
+
+// ─── Binary option greeks ─────────────────────────────────────────────────────
+
+/// Compute prediction market greeks using the log-odds Brownian motion model.
+///
+/// Model: logit(P(t)) follows arithmetic BM → x(t) = logit(P) + σ·W(t)
+/// At resolution T the market pays $1 iff x(T) > 0.
+/// Under this model the fair price is N(x / (σ√T)) where x = logit(P).
+///
+/// Greeks:
+///   Theta (per share, per day) = ∂P/∂t = −n(d)·x / (2·T^{3/2}·σ) / 365
+///   Vega  (per share, per σ)   = ∂P/∂σ = −n(d)·x / (σ²·√T)
+///   Gamma (log-odds curvature)  = −n(d)·d / (σ·√T)
+async fn binary_greeks(args: &serde_json::Value) -> Result<ToolOutput> {
+    let p = args["market_price"].as_f64().unwrap_or(0.0);
+    let days_to_res  = args["days_to_resolution"].as_f64().unwrap_or(0.0);
+    let shares       = args["shares"].as_f64().unwrap_or(1.0);
+    let entry_price  = args["entry_price"].as_f64().unwrap_or(p);
+    let sigma        = args["volatility"].as_f64().unwrap_or(0.30); // annualised, logit-space
+
+    if !(0.001..0.999).contains(&p) {
+        return Ok(ToolOutput::err("market_price must be in (0, 1)"));
+    }
+    if days_to_res <= 0.0 {
+        return Ok(ToolOutput::err("days_to_resolution must be > 0"));
+    }
+    if sigma <= 0.0 {
+        return Ok(ToolOutput::err("volatility must be > 0"));
+    }
+
+    let x      = (p / (1.0 - p)).ln();               // logit(P)
+    let t_yr   = days_to_res / 365.0;
+    let d      = x / (sigma * t_yr.sqrt());
+    let nd     = normal_pdf(d);                        // n(d)
+    let model_p = crate::risk::normal_cdf(d);           // model price (should ≈ p)
+
+    // Greeks per unit of P (then scale by shares)
+    let theta_daily = -nd * x / (2.0 * t_yr.powi(2).sqrt() * sigma) / 365.0;
+    // ∂P/∂σ = n(d) · ∂d/∂σ = n(d) · (-x / (σ² · √T))
+    let vega_per_sigma = nd * (-x) / (sigma.powi(2) * t_yr.sqrt());
+    // ∂²P/∂x² in logit space
+    let gamma_logodds = -nd * d / (sigma * t_yr.sqrt());
+
+    let leverage = if p > 0.001 { 1.0 / entry_price } else { 0.0 };
+
+    let mut report = vec!["=== BINARY PREDICTION MARKET GREEKS ===".to_string()];
+    report.push(format!("\nMarket price:        {:.1}%  YES", p * 100.0));
+    report.push(format!("Days to resolution:  {:.0}", days_to_res));
+    report.push(format!("Position:            {:.1} shares @ {:.1}¢ entry", shares, entry_price * 100.0));
+    report.push(format!("Annualised vol (σ):  {:.2} (logit-space; default 0.30 if not estimated)", sigma));
+    report.push(format!("Model price check:   {:.1}%  (should ≈ market price)", model_p * 100.0));
+    report.push(format!("d statistic:         {:.3}", d));
+
+    report.push("\n--- Per-share Greeks ---".to_string());
+    report.push(format!("Delta:              +{:.3}  (trivial — $1 per share per $1 move in P)",
+        1.0));
+    report.push(format!("Theta (daily):      {:+.4}¢  (time-decay: P change per calendar day)",
+        theta_daily * 100.0));
+    report.push(format!("Vega (per +0.1 σ):  {:+.4}¢  ({})",
+        vega_per_sigma * 0.1 * 100.0,
+        if p > 0.5 { "ITM: higher vol hurts (pulls price toward 50%)" }
+        else if p < 0.5 { "OTM: higher vol helps (pulls price toward 50%)" }
+        else { "ATM: vega ≈ 0" }));
+    report.push(format!("Gamma (log-odds):   {:+.4}  (curvature in logit space)",
+        gamma_logodds));
+    report.push(format!("Leverage:           {:.2}×  (1% move = {:.2}% return on entry cost)",
+        leverage, leverage));
+
+    report.push("\n--- Position Greeks ---".to_string());
+    report.push(format!("Position Delta:     {:+.1}  (${:.2} per 1% YES price move)",
+        shares, shares * 0.01));
+    report.push(format!("Position Theta:     {:+.3}¢/day  = {:+.2} over {} days",
+        theta_daily * shares * 100.0,
+        theta_daily * shares * days_to_res,
+        days_to_res));
+    report.push(format!("Position Vega:      {:+.3}  per +0.1 σ increase",
+        vega_per_sigma * 0.1 * shares));
+
+    report.push("\n--- P&L Scenarios ---".to_string());
+    let scenarios = [(0.10, "+10%"), (-0.10, "-10%"), (0.20, "+20%"), (-0.20, "-20%")];
+    for (dp, label) in scenarios {
+        let new_p   = (p + dp).clamp(0.001, 0.999);
+        let pnl     = (new_p - entry_price) * shares;
+        let pnl_pct = if entry_price > 0.001 { (new_p - entry_price) / entry_price * 100.0 } else { 0.0 };
+        report.push(format!("  P → {:.0}%  ({}):  {:+.2} ({:+.1}% on cost)",
+            new_p * 100.0, label, pnl, pnl_pct));
+    }
+
+    let current_pnl = (p - entry_price) * shares;
+    report.push(format!("\nCurrent unrealised P&L:  {:+.2}  ({:+.1}% on cost basis)",
+        current_pnl,
+        if entry_price > 0.001 { (p - entry_price) / entry_price * 100.0 } else { 0.0 }));
+
+    report.push("\nModel: log-odds Brownian motion — greeks are approximate and σ-sensitive.".to_string());
+    report.push("Theta is near-zero for markets far from resolution; largest near T=0.".to_string());
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+fn normal_pdf(z: f64) -> f64 {
+    (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+// ─── Market microstructure metrics ───────────────────────────────────────────
+
+/// Compute Roll's spread, Amihud illiquidity, Kyle's λ and order-book metrics.
+async fn market_microstructure(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let platform = args["platform"].as_str().unwrap_or("polymarket");
+    let id       = args["id"].as_str().unwrap_or("");
+    let days     = args["days"].as_u64().unwrap_or(30).clamp(7, 90) as i64;
+
+    if id.is_empty() {
+        return Ok(ToolOutput::err("Missing required parameter: id"));
+    }
+
+    let now      = chrono::Utc::now().timestamp();
+    let start_ts = now - days * 86_400;
+
+    // ── Fetch price history ───────────────────────────────────────────────────
+    let candles = match platform {
+        "polymarket" => {
+            let token_id = match resolve_pm_token_id(clients, id).await {
+                Ok(t)  => t,
+                Err(e) => return Ok(ToolOutput::err(format!("{:#}", e))),
+            };
+            match clients.polymarket
+                .fetch_price_history(&token_id, ChartInterval::OneWeek.polymarket_fidelity(), start_ts, now)
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => Vec::new(),
+            }
+        }
+        "kalshi" => {
+            let series = args["series_ticker"].as_str()
+                .or_else(|| id.split('-').next()).unwrap_or("");
+            clients.kalshi
+                .fetch_candlesticks(series, id, ChartInterval::OneWeek.kalshi_period_interval(), start_ts, now)
+                .await.unwrap_or_default()
+        }
+        _ => return Ok(ToolOutput::err(format!("Unknown platform: {}", platform))),
+    };
+
+    // ── Fetch order book ──────────────────────────────────────────────────────
+    let book = match platform {
+        "polymarket" => {
+            let token_id = match resolve_pm_token_id(clients, id).await {
+                Ok(t) => t, Err(e) => return Ok(ToolOutput::err(format!("{:#}", e))),
+            };
+            clients.polymarket.fetch_orderbook(&token_id).await.ok()
+        }
+        _ => clients.kalshi.fetch_orderbook(id).await.ok(),
+    };
+
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let volumes: Vec<f64> = candles.iter().filter_map(|c| c.volume).collect();
+
+    let mut report = vec![format!("=== MARKET MICROSTRUCTURE: {} ({}) ===", id, platform.to_uppercase())];
+    report.push(format!("Analysis window: {} days  |  {} candles", days, closes.len()));
+
+    // ── Price-history metrics ─────────────────────────────────────────────────
+    if closes.len() >= 3 {
+        let returns: Vec<f64> = closes.windows(2).map(|w| w[1] - w[0]).collect();
+
+        // Roll's spread estimator: s = 2√(−Cov(r_t, r_{t−1}))
+        let roll = rolls_spread(&returns);
+        report.push(format!("\n--- Price-history metrics ({} candles) ---", closes.len()));
+        report.push(format!("Roll's spread est.:   {:.4}  ({:.2}¢)   [effective bid-ask proxy]",
+            roll, roll * 100.0));
+
+        // Price volatility (annualised)
+        let mean_r  = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var_r: f64 = returns.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>()
+            / (returns.len() as f64 - 1.0);
+        let daily_vol = var_r.sqrt();
+        let ann_vol   = daily_vol * (365.0f64).sqrt();
+        report.push(format!("Daily vol (σ_price):  {:.4}  ({:.2}¢)   annualised: {:.3}",
+            daily_vol, daily_vol * 100.0, ann_vol));
+
+        // Amihud ratio (when volume data available)
+        if volumes.len() >= closes.len().saturating_sub(2) && !volumes.is_empty() {
+            let amihud = amihud_ratio(&returns, &volumes);
+            report.push(format!("Amihud illiquidity:   {:.6}  (|Δp| per unit volume — lower = more liquid)",
+                amihud));
+        } else {
+            report.push("Amihud illiquidity:   N/A (no volume data in candles)".to_string());
+        }
+
+        // Returns autocorrelation lag-1
+        let ac1 = autocorr_lag1(&returns);
+        report.push(format!("Return autocorr (ρ₁): {:.4}  ({})",
+            ac1,
+            if ac1 < -0.05 { "negative — suggests mean-reversion / bid-ask bounce" }
+            else if ac1 > 0.05 { "positive — momentum effect" }
+            else { "near zero — consistent with weak EMH" }));
+    } else {
+        report.push("\n(Insufficient price history for metrics — need ≥ 3 candles)".to_string());
+    }
+
+    // ── Order-book metrics ────────────────────────────────────────────────────
+    if let Some(book) = &book {
+        let bid1 = book.bids.first().map(|l| l.price).unwrap_or(0.0);
+        let ask1 = book.asks.first().map(|l| l.price).unwrap_or(1.0);
+        let spread = ask1 - bid1;
+        let mid    = (bid1 + ask1) / 2.0;
+
+        let bid_vol: f64 = book.bids.iter().map(|l| l.size).sum();
+        let ask_vol: f64 = book.asks.iter().map(|l| l.size).sum();
+        let total_depth  = bid_vol + ask_vol;
+        let imbalance    = if total_depth > 0.0 {
+            (bid_vol - ask_vol) / total_depth
+        } else { 0.0 };
+
+        // Kyle's lambda approximation: price impact per unit depth
+        // λ ≈ (ask - bid) / (2 × total_depth_notional)
+        let bid_notional: f64 = book.bids.iter().map(|l| l.price * l.size).sum();
+        let ask_notional: f64 = book.asks.iter().map(|l| l.price * l.size).sum();
+        let total_notional = (bid_notional + ask_notional).max(1.0);
+        let kyles_lambda = spread / (2.0 * total_notional);
+
+        report.push(format!("\n--- Live order book ---"));
+        report.push(format!("Best bid:             {:.4}  ({:.2}¢)", bid1, bid1 * 100.0));
+        report.push(format!("Best ask:             {:.4}  ({:.2}¢)", ask1, ask1 * 100.0));
+        report.push(format!("Quoted spread:        {:.4}  ({:.2}¢)  =  {:.2} bps of mid",
+            spread, spread * 100.0, if mid > 0.001 { spread / mid * 10_000.0 } else { 0.0 }));
+        report.push(format!("Mid:                  {:.4}  ({:.2}¢)", mid, mid * 100.0));
+        report.push(format!("Bid depth:            {:.0} shares  |  Ask depth: {:.0} shares", bid_vol, ask_vol));
+        report.push(format!("Order imbalance:      {:+.3}  ({})",
+            imbalance,
+            if imbalance >  0.2 { "buy-side heavy → upward pressure" }
+            else if imbalance < -0.2 { "sell-side heavy → downward pressure" }
+            else { "balanced" }));
+        report.push(format!("Kyle's λ (approx):    {:.8}  (price impact per $1 notional traded)",
+            kyles_lambda));
+        report.push(format!("Bid levels:           {}  |  Ask levels: {}", book.bids.len(), book.asks.len()));
+    } else {
+        report.push("\n(Order book unavailable)".to_string());
+    }
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+/// Roll's spread estimator: s = 2·√(max(0, −Cov(r_t, r_{t−1}))).
+fn rolls_spread(returns: &[f64]) -> f64 {
+    if returns.len() < 3 { return 0.0; }
+    let n = returns.len() as f64 - 1.0;
+    let cov: f64 = returns.windows(2).map(|w| w[0] * w[1]).sum::<f64>() / n;
+    2.0 * (-cov).max(0.0).sqrt()
+}
+
+/// Amihud illiquidity: mean(|Δp_t|) / volume_t  (averaged across periods).
+fn amihud_ratio(returns: &[f64], volumes: &[f64]) -> f64 {
+    let pairs: Vec<f64> = returns.iter().zip(volumes.iter())
+        .filter(|(_, &v)| v > 1e-9)
+        .map(|(r, v)| r.abs() / v)
+        .collect();
+    if pairs.is_empty() { return 0.0; }
+    pairs.iter().sum::<f64>() / pairs.len() as f64
+}
+
+/// Lag-1 autocorrelation of a return series.
+fn autocorr_lag1(r: &[f64]) -> f64 {
+    if r.len() < 4 { return 0.0; }
+    let mean = r.iter().sum::<f64>() / r.len() as f64;
+    let cov: f64  = r.windows(2).map(|w| (w[0] - mean) * (w[1] - mean)).sum();
+    let var: f64  = r.iter().map(|v| (v - mean).powi(2)).sum();
+    if var < 1e-12 { return 0.0; }
+    cov / var
+}
+
+// ─── Engle-Granger cointegration test ────────────────────────────────────────
+
+/// Fetch aligned daily price series for two markets and run the Engle-Granger
+/// cointegration test.  Returns test statistics, hedge ratio, and half-life.
+async fn test_cointegration(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let pm_id  = args["pm_id"].as_str().unwrap_or("");
+    let kl_id  = args["kl_id"].as_str().unwrap_or("");
+    let days   = args["days"].as_u64().unwrap_or(60).clamp(20, 90) as i64;
+
+    if pm_id.is_empty() || kl_id.is_empty() {
+        return Ok(ToolOutput::err("Both pm_id and kl_id are required"));
+    }
+
+    let now      = chrono::Utc::now().timestamp();
+    let start_ts = now - days * 86_400;
+
+    // Fetch PM price history
+    let pm_token = match resolve_pm_token_id(clients, pm_id).await {
+        Ok(t)  => t,
+        Err(e) => return Ok(ToolOutput::err(format!("PM: {:#}", e))),
+    };
+    let pm_candles = match clients.polymarket
+        .fetch_price_history(&pm_token, ChartInterval::OneWeek.polymarket_fidelity(), start_ts, now)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolOutput::err(format!("PM price history: {:#}", e))),
+    };
+
+    // Fetch KL price history
+    let kl_series = args["kl_series"].as_str()
+        .or_else(|| kl_id.split('-').next()).unwrap_or("");
+    let kl_candles = match clients.kalshi
+        .fetch_candlesticks(kl_series, kl_id, ChartInterval::OneDay.kalshi_period_interval(), start_ts, now)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolOutput::err(format!("KL price history: {:#}", e))),
+    };
+
+    if pm_candles.is_empty() || kl_candles.is_empty() {
+        return Ok(ToolOutput::ok("Price history not available for one or both markets."));
+    }
+
+    // Align to daily closes
+    let (p1, p2) = crate::pairs::align_daily_closes(&pm_candles, &kl_candles);
+
+    if p1.len() < 20 {
+        return Ok(ToolOutput::ok(format!(
+            "Only {} aligned daily observations — need ≥ 20 for a meaningful test. \
+             Try a longer window with a larger 'days' parameter.",
+            p1.len()
+        )));
+    }
+
+    let result = match crate::pairs::engle_granger(&p1, &p2) {
+        Some(r) => r,
+        None    => return Ok(ToolOutput::ok("Insufficient aligned data for cointegration test.")),
+    };
+
+    // Summary stats on the series
+    let pm_mean = p1.iter().sum::<f64>() / p1.len() as f64;
+    let kl_mean = p2.iter().sum::<f64>() / p2.len() as f64;
+    let price_gap = (pm_mean - kl_mean).abs();
+
+    let verdict = if result.cointegrated_5pct {
+        "COINTEGRATED at 5% significance — spread likely to mean-revert"
+    } else if result.cointegrated_10pct {
+        "COINTEGRATED at 10% significance — weak evidence of mean-reversion"
+    } else {
+        "NOT cointegrated at standard significance levels — prices may not share a long-run equilibrium"
+    };
+
+    let mut report = vec![
+        format!("=== ENGLE-GRANGER COINTEGRATION TEST ==="),
+        format!("\nPM market:  {}", pm_id),
+        format!("KL market:  {}", kl_id),
+        format!("Window:     {} aligned daily observations", result.n_obs),
+        format!("PM avg:     {:.1}%   KL avg: {:.1}%   Gap: {:.1}¢",
+            pm_mean * 100.0, kl_mean * 100.0, price_gap * 100.0),
+    ];
+
+    report.push(format!("\n--- Step 1: OLS regression ---"));
+    report.push(format!("PM = α + β·KL + ε"));
+    report.push(format!("Hedge ratio (β):    {:.4}", result.hedge_ratio));
+    report.push(format!("Interpretation:     a 1¢ move in KL is associated with a {:.2}¢ move in PM",
+        result.hedge_ratio));
+
+    report.push(format!("\n--- Step 2: Dickey-Fuller test on residuals ---"));
+    report.push(format!("DF statistic:       {:.4}", result.df_stat));
+    report.push(format!("Critical values:    1%: -3.90  |  5%: -3.34  |  10%: -3.04"));
+    report.push(format!("Cointegrated (5%):  {}", if result.cointegrated_5pct { "YES ✓" } else { "NO ✗" }));
+    report.push(format!("Cointegrated (10%): {}", if result.cointegrated_10pct { "YES ✓" } else { "NO ✗" }));
+    report.push(format!("\nVerdict: {}", verdict));
+
+    report.push(format!("\n--- Mean-reversion parameters ---"));
+    report.push(format!("γ (speed):          {:.4}  ({})",
+        result.gamma,
+        if result.gamma < 0.0 { "negative ← mean-reverting ✓" } else { "non-negative ← no mean-reversion" }));
+    if result.half_life.is_finite() {
+        report.push(format!("Half-life:          {:.1} days  (spread halves in {:.1} days)",
+            result.half_life, result.half_life));
+        if result.half_life < 3.0 {
+            report.push("  Fast reversion — spread arb may be executable within days.".to_string());
+        } else if result.half_life < 14.0 {
+            report.push("  Moderate reversion — intraweek spread trades viable.".to_string());
+        } else {
+            report.push("  Slow reversion — long holding period required; consider resolution timing risk.".to_string());
+        }
+    } else {
+        report.push("Half-life:          ∞ (no mean-reversion detected)".to_string());
+    }
+
+    report.push("\nNote: Uses Engle-Granger two-step with Dickey-Fuller (no lags). \
+        For short series, interpret with caution — critical values assume asymptotics.".to_string());
+
+    Ok(ToolOutput::ok(report.join("\n")))
+}
+
+// ─── Local-data tools (portfolio, watchlist, signals, macro) ─────────────────
+
+/// Return all portfolio positions with mark prices and P&L.
+async fn get_portfolio(_clients: &MarketClients) -> Result<ToolOutput> {
+    let pf = crate::portfolio::load_portfolio();
+    if pf.positions.is_empty() {
+        return Ok(ToolOutput::ok("Portfolio is empty. Add positions via the TUI (/add) or /wallet import."));
+    }
+    let mut lines = vec![
+        format!("=== PORTFOLIO ({} positions) ===", pf.positions.len()),
+        format!("\n{:<6} {:<34} {:<5} {:>6} {:>7} {:>8} {:>8} {:>8}",
+            "Side", "Market", "Plat", "Shares", "Entry", "Mark", "P&L$", "P&L%"),
+        "─".repeat(90),
+    ];
+    for p in &pf.positions {
+        let mark     = p.mark_price.unwrap_or(p.entry_price);
+        let pnl      = (mark - p.entry_price) * p.shares;
+        let pnl_pct  = if p.entry_price > 1e-9 { (mark - p.entry_price) / p.entry_price * 100.0 } else { 0.0 };
+        let title_s: String = p.title.chars().take(33).collect();
+        lines.push(format!("{:<6} {:<34} {:<5} {:>6.1} {:>6.1}¢ {:>6.1}¢ {:>+7.2} {:>+7.1}%",
+            p.side.label(), title_s, p.platform.label(),
+            p.shares, p.entry_price * 100.0, mark * 100.0, pnl, pnl_pct));
+    }
+    let total_cost  = pf.total_cost();
+    let total_value = pf.total_value();
+    let total_pnl   = pf.total_pnl();
+    lines.push("─".repeat(90));
+    lines.push(format!("Total cost: ${:.2}   Market value: ${:.2}   Unrealised P&L: {:+.2} ({:+.1}%)",
+        total_cost, total_value, total_pnl,
+        if total_cost > 1e-9 { total_pnl / total_cost * 100.0 } else { 0.0 }));
+    Ok(ToolOutput::ok(lines.join("\n")))
+}
+
+/// Run full portfolio risk analysis (VaR/CVaR/stress) after refreshing mark prices.
+async fn get_portfolio_risk(clients: &MarketClients) -> Result<ToolOutput> {
+    let mut pf = crate::portfolio::load_portfolio();
+    if pf.positions.is_empty() {
+        return Ok(ToolOutput::ok("Portfolio is empty."));
+    }
+
+    // Refresh mark prices from live market data
+    let pm_markets = clients.polymarket.fetch_markets(100, None, None).await.unwrap_or_default();
+    let kl_markets = clients.kalshi.fetch_markets(100, None).await.unwrap_or_default();
+    let all_markets: Vec<_> = pm_markets.iter().chain(kl_markets.iter()).collect();
+    pf.update_marks(all_markets.iter().map(|m| (m.platform.clone(), m.id.clone(), m.yes_price)));
+
+    let risk = crate::risk::compute(&pf, &pm_markets.iter().chain(kl_markets.iter()).cloned().collect::<Vec<_>>());
+
+    let mut lines = vec![
+        "=== PORTFOLIO RISK ANALYSIS ===".to_string(),
+        format!("\nPositions:    {}", risk.positions.len()),
+        format!("E[P&L]:       {:+.2}", risk.expected_pnl),
+        format!("Std dev (σ):  {:.2}", risk.std_dev),
+        format!("P(profit):    {:.1}%", risk.prob_profit * 100.0),
+        format!("Best case:    {:+.2}", risk.best_case),
+        format!("Worst case:   {:+.2}", risk.worst_case),
+        String::new(),
+        format!("--- Value at Risk / CVaR (normal approximation) ---"),
+        format!("VaR  95%:     {:+.2}  (loss exceeded only 5% of the time)", -risk.var_95),
+        format!("CVaR 95%:     {:+.2}  (expected P&L in worst 5% of scenarios)", -risk.cvar_95),
+        format!("VaR  99%:     {:+.2}", -risk.var_99),
+        format!("CVaR 99%:     {:+.2}  (expected P&L in worst 1% of scenarios)", -risk.cvar_99),
+    ];
+
+    if !risk.category_stress.is_empty() {
+        lines.push(String::new());
+        lines.push("--- Category stress tests (all positions in category resolve against you) ---".to_string());
+        for cs in &risk.category_stress {
+            lines.push(format!("  {:<20}  {:>2} pos  conc {:.0}%  stressed P&L: {:+.2}",
+                &cs.category[..cs.category.len().min(20)],
+                cs.n_positions, cs.concentration * 100.0, cs.stressed_pnl));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("--- Per-position breakdown ---".to_string());
+    lines.push(format!("{:<34} {:>7} {:>8} {:>8} {:>8}",
+        "Market", "P(win)", "E[P&L]", "Win", "Lose"));
+    for pr in &risk.positions {
+        let title_s: String = pr.title.chars().take(33).collect();
+        lines.push(format!("{:<34} {:>6.1}% {:>+8.2} {:>+8.2} {:>+8.2}",
+            title_s, pr.win_prob * 100.0, pr.expected_pnl, pr.win_pnl, pr.lose_pnl));
+    }
+
+    Ok(ToolOutput::ok(lines.join("\n")))
+}
+
+/// Return the watchlist with alert thresholds.
+async fn get_watchlist() -> Result<ToolOutput> {
+    let wl = crate::portfolio::load_watchlist();
+    if wl.is_empty() {
+        return Ok(ToolOutput::ok("Watchlist is empty. Add markets via the TUI (/watchlist or /w)."));
+    }
+    let mut lines = vec![
+        format!("=== WATCHLIST ({} markets) ===", wl.len()),
+        format!("\n{:<40} {:>10} {:>10}", "Market", "Alert<", "Alert>"),
+        "─".repeat(64),
+    ];
+    for e in &wl {
+        let title_s: String = e.title.chars().take(39).collect();
+        let below = if e.alert_below > 0.001 { format!("{:.1}¢", e.alert_below * 100.0) } else { "—".into() };
+        let above = if e.alert_above < 0.999 { format!("{:.1}¢", e.alert_above * 100.0) } else { "—".into() };
+        lines.push(format!("{:<40} {:>10} {:>10}", title_s, below, above));
+        lines.push(format!("  id: {}", e.market_id));
+    }
+    Ok(ToolOutput::ok(lines.join("\n")))
+}
+
+/// Fetch both platforms' markets and run the signal engine.
+async fn get_signals(clients: &MarketClients) -> Result<ToolOutput> {
+    let (pm_res, kl_res) = tokio::join!(
+        clients.polymarket.fetch_markets(50, None, None),
+        clients.kalshi.fetch_markets(50, None),
+    );
+    let mut markets = pm_res.unwrap_or_default();
+    markets.extend(kl_res.unwrap_or_default());
+
+    if markets.is_empty() {
+        return Ok(ToolOutput::ok("No markets available."));
+    }
+
+    let signals = crate::signals::compute_signals(
+        &markets,
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    );
+
+    if signals.is_empty() {
+        return Ok(ToolOutput::ok("No signals detected in the current market snapshot."));
+    }
+
+    let mut lines = vec![
+        format!("=== TRADING SIGNALS ({} detected) ===", signals.len()),
+        format!("\n{:<6} {:<5} {:<55} {:>6}", "Type", "★", "Market", "Gap"),
+        "─".repeat(76),
+    ];
+    for s in &signals {
+        let title_s: String = s.title.chars().take(54).collect();
+        lines.push(format!("{:<6} {}★   {:<55} {:>5.1}¢",
+            s.kind.label(), s.stars, title_s, s.gap * 100.0));
+        lines.push(format!("       {} | {} | {:.1}¢  Action: {}",
+            s.platform_a.label(), &s.id_a[..s.id_a.len().min(24)],
+            s.price_a * 100.0, s.action));
+        if let (Some(pb), Some(ib)) = (&s.platform_b, &s.id_b) {
+            lines.push(format!("       {} | {}", pb.label(), &ib[..ib.len().min(24)]));
+        }
+    }
+    lines.push(format!("\nSignal key: ARB=arbitrage  INSDR=informed-flow  MOMT=momentum  THIN=thin-market  50/50=near-50%"));
+    Ok(ToolOutput::ok(lines.join("\n")))
+}
+
+/// Fetch the FRED macro snapshot (FEDFUNDS, 5y breakeven inflation, UNRATE, 10Y).
+async fn get_macro(clients: &MarketClients) -> Result<ToolOutput> {
+    let fred = match &clients.fred {
+        Some(f) => f,
+        None    => return Ok(ToolOutput::ok(
+            "FRED macro data is not available — set FRED_API_KEY to enable it.\n\
+             Free key at https://fred.stlouisfed.org/docs/api/api_key.html"
+        )),
+    };
+
+    let snap = fred.fetch_snapshot().await;
+    if snap.is_empty() {
+        return Ok(ToolOutput::ok("FRED returned no data — check your FRED_API_KEY."));
+    }
+
+    let mut lines = vec!["=== MACRO SNAPSHOT (FRED) ===".to_string(), String::new()];
+    if let Some(r) = snap.fed_rate     { lines.push(format!("Fed Funds Rate (FEDFUNDS):      {:.2}%", r)); }
+    if let Some(i) = snap.inflation    { lines.push(format!("5-Year Breakeven Inflation:     {:.2}%  (T5YIE — market inflation expectation)", i)); }
+    if let Some(u) = snap.unemployment { lines.push(format!("Unemployment Rate (UNRATE):     {:.1}%", u)); }
+    if let Some(t) = snap.t10yr        { lines.push(format!("10-Year Treasury Yield (DGS10): {:.2}%", t)); }
+    lines.push(String::new());
+    lines.push(format!("Summary: {}", snap.header_str()));
+    lines.push("\nData sourced from FRED (St. Louis Fed). Cached for 1 hour.".to_string());
+    Ok(ToolOutput::ok(lines.join("\n")))
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn all_definitions() -> Vec<ToolDefinition> {
@@ -3196,6 +3947,138 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "kelly_correlated".into(),
+            description: "Multi-asset Kelly position sizing that accounts for correlations between \
+                bets. Solves the mean-variance optimal Kelly system (Σ·w = μ) for up to 10 simultaneous \
+                bets. When bets are correlated (e.g. two Fed-rate markets), standalone Kelly \
+                over-sizes; this tool computes correlation-adjusted fractions. \
+                Always use this when you intend to size multiple related positions simultaneously.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "bets": {
+                        "type": "array",
+                        "description": "List of bets to size together.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label":        { "type": "string",  "description": "Short description of the bet." },
+                                "market_price": { "type": "number",  "description": "Current market price (0–1)." },
+                                "your_prob":    { "type": "number",  "description": "Your estimated probability (0–1)." },
+                                "side":         { "type": "string",  "enum": ["yes", "no"], "description": "Which side. Default 'yes'." }
+                            },
+                            "required": ["market_price", "your_prob"]
+                        }
+                    },
+                    "correlations": {
+                        "type": "array",
+                        "description": "N×N correlation matrix as a nested array (e.g. [[1,0.7],[0.7,1]]). \
+                            Default: identity (independent bets)."
+                    },
+                    "bankroll": {
+                        "type": "number",
+                        "description": "Total capital to size against. Default 10000."
+                    }
+                },
+                "required": ["bets"]
+            }),
+        },
+        ToolDefinition {
+            name: "binary_greeks".into(),
+            description: "Compute prediction market 'greeks' analogous to binary option sensitivities, \
+                using the log-odds Brownian motion model. \
+                Returns: Delta (position sensitivity to price), Theta (daily time decay in probability), \
+                Vega (sensitivity to volatility), Gamma (log-odds curvature), leverage, and P&L scenarios. \
+                Use before entering a position to understand how it behaves as time passes and if volatility changes. \
+                Volatility can be estimated from get_price_history.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "market_price": {
+                        "type": "number",
+                        "description": "Current YES probability / market price (0–1)."
+                    },
+                    "days_to_resolution": {
+                        "type": "number",
+                        "description": "Days until the market resolves."
+                    },
+                    "shares": {
+                        "type": "number",
+                        "description": "Number of shares / contracts held. Default 1."
+                    },
+                    "entry_price": {
+                        "type": "number",
+                        "description": "Your average entry price per share (0–1). Defaults to market_price."
+                    },
+                    "volatility": {
+                        "type": "number",
+                        "description": "Annualised logit-space volatility (e.g. 0.30). Default 0.30. \
+                            Estimate by running get_price_history and observing historical price swings."
+                    }
+                },
+                "required": ["market_price", "days_to_resolution"]
+            }),
+        },
+        ToolDefinition {
+            name: "market_microstructure".into(),
+            description: "Compute microstructure liquidity metrics from price history and live order book: \
+                Roll's spread estimator (effective bid-ask from serial return covariance), \
+                Amihud illiquidity ratio (|return|/volume), \
+                Kyle's lambda approximation (price impact per dollar notional), \
+                order imbalance, and quoted spread in basis points. \
+                Use to assess how easy/expensive it is to enter/exit a position and detect \
+                informed flow via elevated price impact.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["polymarket", "kalshi"]
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "For Polymarket: YES token_id. For Kalshi: market ticker."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of price history to analyse (7–90). Default 30."
+                    }
+                },
+                "required": ["platform", "id"]
+            }),
+        },
+        ToolDefinition {
+            name: "test_cointegration".into(),
+            description: "Run the Engle-Granger two-step cointegration test on a Polymarket / Kalshi \
+                market pair. Tests whether the two price series share a long-run equilibrium and estimates \
+                the mean-reversion half-life of the spread. \
+                Use before committing to a spread-arb strategy identified by the Pairs tab — a statistically \
+                cointegrated pair is far more likely to mean-revert than one matched purely by keyword similarity. \
+                Returns: DF test statistic, critical values, hedge ratio, γ speed, and half-life in days.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pm_id": {
+                        "type": "string",
+                        "description": "Polymarket conditionId or token_id."
+                    },
+                    "kl_id": {
+                        "type": "string",
+                        "description": "Kalshi market ticker."
+                    },
+                    "kl_series": {
+                        "type": "string",
+                        "description": "Kalshi series ticker (optional — derived from kl_id if omitted)."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of history to use (20–90). More data = more reliable test. Default 60."
+                    }
+                },
+                "required": ["pm_id", "kl_id"]
+            }),
+        },
+        ToolDefinition {
             name: "kelly_size".into(),
             description: "Compute Kelly criterion and half-Kelly position sizes for a binary \
                 prediction market bet. Given your probability estimate and the market price, \
@@ -3226,6 +4109,44 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["market_price", "your_probability"]
             }),
+        },
+        ToolDefinition {
+            name: "get_portfolio".into(),
+            description: "Return all open portfolio positions with entry price, current mark price, \
+                shares, and unrealised P&L. Reads from the local portfolio file — no API call required. \
+                Use before get_portfolio_risk or kelly_correlated to understand current exposure.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_portfolio_risk".into(),
+            description: "Run a full portfolio risk analysis: VaR(95/99), CVaR(95/99), expected P&L, \
+                probability of profit, category stress tests, and per-position breakdown. \
+                Refreshes mark prices from live market data before computing. \
+                Use after get_portfolio to quantify downside risk.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_watchlist".into(),
+            description: "Return all markets on the local watchlist with their price-alert thresholds. \
+                Reads from the local watchlist file — no API call required.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_signals".into(),
+            description: "Fetch current markets from both platforms and run the full signal engine. \
+                Returns ARB (cross-platform price gap), INSDR (informed-flow pattern), \
+                MOMT (momentum), THIN (low-liquidity), and 50/50 (near-50% uncertainty) signals, \
+                ranked by star rating and EV score. Best used as a starting point for a session — \
+                scan signals first, then deep-dive on the ones that fire.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_macro".into(),
+            description: "Fetch the latest macro indicators from FRED: \
+                Fed Funds Rate, 5-Year Breakeven Inflation, Unemployment Rate, 10-Year Treasury Yield. \
+                Cached for 1 hour. Requires FRED_API_KEY environment variable. \
+                Use as context when analysing interest-rate-sensitive markets.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
     ]
 }

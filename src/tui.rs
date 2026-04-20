@@ -35,7 +35,8 @@ use tokio::sync::mpsc;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agent::{self, AppEvent};
+use crate::agent::{self, AppEvent, Persona};
+use crate::fred::MacroSnapshot;
 use crate::llm::{LlmBackend, LlmMessage};
 use crate::news::NewsArticle;
 use crate::markets::{ChartInterval, Market, Orderbook, Platform};
@@ -67,6 +68,10 @@ const TIPS: &[&str] = &[
     "Type /wf to focus on starred markets only",
     "Type /dismiss on a signal to hide it for the current session",
     "Type /risk in Portfolio to toggle the risk/exposure view",
+    "Press Ctrl+K to open the fuzzy search — find markets and commands instantly",
+    "Press Alt+S or type /split to toggle split-pane mode (market list + chart)",
+    "Type /persona to cycle AI analyst style: Default → Contrarian → Macro → SmartMoney",
+    "Set FRED_API_KEY to see macro indicators (Fed rate, inflation, 10Y yield) in the header",
 ];
 
 
@@ -342,6 +347,22 @@ pub struct App {
     pub news_detail_idx: Option<usize>,
     /// Last error message from the news fetch (shown inside the tab)
     pub news_error:      Option<String>,
+
+    // ── FRED macro snapshot ───────────────────────────────────────────────────
+    pub macro_data:      MacroSnapshot,
+
+    // ── Active AI persona ─────────────────────────────────────────────────────
+    pub active_persona:  Persona,
+
+    // ── Fuzzy command / market search (Ctrl+K) ────────────────────────────────
+    pub fuzzy_mode:      bool,
+    pub fuzzy_input:     String,
+    pub fuzzy_matches:   Vec<FuzzyMatch>,
+    pub fuzzy_cursor:    usize,
+
+    // ── Split-pane layout (Alt+S toggles) ────────────────────────────────────
+    /// When true the Markets tab shows a left list + right mini-chart side-by-side.
+    pub split_pane:      bool,
 }
 
 // Smart Money view mode
@@ -380,6 +401,20 @@ pub enum TargetInputStep {
     #[default]
     TakeProfit,
     StopLoss,
+}
+
+// ─── Fuzzy search ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum FuzzyAction {
+    SelectMarket(String),   // market ID
+    RunCommand(&'static str), // slash command name (without /)
+}
+
+#[derive(Clone, Debug)]
+pub struct FuzzyMatch {
+    pub label:  String,
+    pub action: FuzzyAction,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -487,6 +522,13 @@ impl App {
             news_loading:      false,
             news_detail_idx:   None,
             news_error:        None,
+            macro_data:        MacroSnapshot::default(),
+            active_persona:    Persona::Default,
+            fuzzy_mode:        false,
+            fuzzy_input:       String::new(),
+            fuzzy_matches:     Vec::new(),
+            fuzzy_cursor:      0,
+            split_pane:        false,
         }
     }
 
@@ -955,6 +997,11 @@ fn render(f: &mut Frame, app: &App) {
         render_kelly_modal(f, area, app);
     }
 
+    // Fuzzy search overlay renders above content
+    if app.fuzzy_mode {
+        render_fuzzy_overlay(f, area, app);
+    }
+
     // Help overlay renders on top of everything
     if app.show_help {
         render_help_overlay(f, area);
@@ -972,22 +1019,46 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 
     let total_pnl = app.portfolio.total_pnl();
     let pnl_color = if total_pnl >= 0.0 { Color::Green } else { Color::Red };
-    let pnl_str = format!("  PnL: {:+.2}$", total_pnl);
+    let pnl_str = format!("PnL: {:+.2}$", total_pnl);
 
-    let line = Line::from(vec![
+    // Persona badge (dim for Default, colored otherwise)
+    let persona_span = match app.active_persona {
+        Persona::Default    => Span::raw(""),
+        Persona::Contrarian => Span::styled(" [Contrarian]", Style::default().fg(Color::Magenta).bold()),
+        Persona::Macro      => Span::styled(" [Macro]",      Style::default().fg(Color::Cyan).bold()),
+        Persona::SmartMoney => Span::styled(" [SmartMoney]", Style::default().fg(Color::Yellow).bold()),
+    };
+
+    // Macro data strip (only when FRED data is available)
+    let macro_str = app.macro_data.header_str();
+    let macro_span = if macro_str.is_empty() {
+        Span::raw("")
+    } else {
+        Span::styled(format!("  │  {}", macro_str), Style::default().fg(Color::DarkGray))
+    };
+
+    let mut spans = vec![
         Span::styled(" WhoIsSharp ", Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
         Span::raw(" "),
         Span::styled(&app.backend_name, Style::default().fg(Color::Yellow)),
+        persona_span,
         Span::raw("  │  "),
         Span::styled("PM", Style::default().fg(Color::Green)),
         Span::raw(" + "),
         Span::styled("KL", Style::default().fg(Color::Blue)),
         Span::raw(format!("{}  │  updated: {}  │  ", loading, updated)),
         Span::styled(pnl_str, Style::default().fg(pnl_color).bold()),
+        macro_span,
         Span::raw("  │  "),
         Span::styled(now, Style::default().fg(Color::White)),
-    ]);
+    ];
 
+    // Split-pane indicator
+    if app.split_pane {
+        spans.push(Span::styled("  [split]", Style::default().fg(Color::DarkGray)));
+    }
+
+    let line = Line::from(spans);
     f.render_widget(Paragraph::new(line).style(Style::default().bg(Color::DarkGray)), area);
 }
 
@@ -1283,7 +1354,11 @@ fn render_markets(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     render_market_list(f, chunks[0], app);
-    render_market_detail(f, chunks[1], app);
+    if app.split_pane && !app.chart_data.is_empty() {
+        render_chart(f, chunks[1], app);
+    } else {
+        render_market_detail(f, chunks[1], app);
+    }
 }
 
 fn render_market_list(f: &mut Frame, area: Rect, app: &App) {
@@ -1788,11 +1863,11 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     let inner = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
-    // Split vertically: summary row | histogram | scenario table | position breakdown
+    // Split vertically: summary rows | histogram | scenario table | position breakdown
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // key metrics
+            Constraint::Length(5),  // key metrics (2 data rows + padding)
             Constraint::Length(10), // histogram
             Constraint::Min(0),     // scenario stress + per-position EV
         ])
@@ -1801,6 +1876,9 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     // ── Key metrics ───────────────────────────────────────────────────────────
     let ep_color = if risk.expected_pnl >= 0.0 { Color::Green } else { Color::Red };
     let pp_color = if risk.prob_profit >= 0.5   { Color::Green } else { Color::Red };
+
+    let var95_color  = if risk.var_95  <= 0.0 { Color::Green } else { Color::Yellow };
+    let cvar95_color = if risk.cvar_95 <= 0.0 { Color::Green } else { Color::Red };
 
     let metric_lines = vec![
         Line::from(""),
@@ -1816,6 +1894,21 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("   Worst: "),
             Span::styled(format!("{:+.2}", risk.worst_case), Style::default().fg(Color::Red)),
         ]),
+        Line::from(vec![
+            Span::styled("  VaR(95)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.var_95), Style::default().fg(var95_color)),
+            Span::styled("  CVaR(95)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.cvar_95), Style::default().fg(cvar95_color).bold()),
+            Span::styled("  VaR(99)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.var_99), Style::default().fg(Color::Yellow)),
+            Span::styled("  CVaR(99)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.cvar_99), Style::default().fg(Color::Red).bold()),
+        ]),
+        Line::from(""),
     ];
     f.render_widget(Paragraph::new(metric_lines), rows[0]);
 
@@ -3659,6 +3752,74 @@ fn render_loading_overlay(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, popup);
 }
 
+// ── Fuzzy search overlay (Ctrl+K) ────────────────────────────────────────────
+
+fn render_fuzzy_overlay(f: &mut Frame, area: Rect, app: &App) {
+    // Height: input row + up to 20 results + 2 border lines, max 24 rows
+    let max_rows = app.fuzzy_matches.len().min(20);
+    let height   = (max_rows + 4) as u16;
+    let popup    = centered_rect_abs(70, height, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Fuzzy Search  (↑↓ navigate · Enter select · Esc cancel) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    // Inner area split: input line at top, then results
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height < 2 { return; }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // Input line
+    let prompt = format!("> {}_", app.fuzzy_input);
+    f.render_widget(
+        Paragraph::new(prompt).style(Style::default().fg(Color::White).bold()),
+        rows[0],
+    );
+
+    // Results list
+    let items: Vec<ListItem> = app.fuzzy_matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let style = if i == app.fuzzy_cursor {
+                Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = match &m.action {
+                FuzzyAction::RunCommand(_)  => Span::styled("cmd  ", Style::default().fg(Color::Yellow)),
+                FuzzyAction::SelectMarket(_)=> Span::styled("mkt  ", Style::default().fg(Color::Green)),
+            };
+            ListItem::new(Line::from(vec![prefix, Span::styled(m.label.clone(), style)]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.fuzzy_cursor));
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+        rows[1],
+        &mut list_state,
+    );
+}
+
+/// Centred popup with absolute width and height (clamps to screen).
+fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width.saturating_sub(2));
+    let h = height.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let popup = centered_rect(66, 92, area);
     f.render_widget(Clear, popup);
@@ -3700,9 +3861,13 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/export  or  /csv", "Export current tab to CSV"),
         kv("/report  or  /m", "Export Markdown report for selected market"),
         kv("/help  or  /?  or  ?", "Toggle this help overlay"),
+        kv("/persona  or  /mode", "Cycle AI analyst persona  (Default → Contrarian → Macro → SmartMoney)"),
+        kv("/split  or  /sp", "Toggle split-pane layout  (market list + chart side-by-side)"),
         Line::from(""),
         h(" Search / filter"),
+        kv("Ctrl+K", "Fuzzy search: markets and commands in one popup  (↑↓ navigate · Enter)"),
         kv("/", "Open command bar — unrecognised terms search markets"),
+        kv("Alt+S", "Toggle split-pane layout"),
         kv("Esc", "Close command bar / clear filter"),
         Line::from(""),
         h(" Chat / AI"),
@@ -4046,11 +4211,29 @@ pub async fn run_tui(
     app.refresh_secs = refresh_secs;
     let mut llm_history: Vec<LlmMessage> = Vec::new();
 
-    // Kick off initial market data refresh
+    // Restore previous view state
+    {
+        let vs = portfolio::load_tui_view_state();
+        if let Some(tab) = vs.last_tab.and_then(|n| Tab::from_index(n as usize)) { app.active_tab = tab; }
+        if let Some(id)  = vs.last_market_id  { app.selected_market_id = Some(id); }
+        if let Some(ci)  = vs.chart_interval  { app.chart_interval = match ci { 0 => ChartInterval::OneHour, 1 => ChartInterval::SixHours, 2 => ChartInterval::OneDay, 3 => ChartInterval::OneWeek, _ => ChartInterval::OneMonth }; }
+        if let Some(pf)  = vs.platform_filter { app.platform_filter = match pf { 1 => PlatformFilter::Polymarket, 2 => PlatformFilter::Kalshi, _ => PlatformFilter::All }; }
+        if let Some(ms)  = vs.market_sort     { app.market_sort = match ms { 1 => MarketSort::Volume, 2 => MarketSort::EndDate, 3 => MarketSort::Name, _ => MarketSort::YesPrice }; }
+        app.watchlist_only = vs.watchlist_only;
+        if let Some(s)   = vs.search          { app.search = s; }
+        app.split_pane = vs.split_pane;
+    }
+
+    // Kick off initial market data and FRED macro refresh
     {
         let clients_clone = clients.clone();
         let tx = event_tx.clone();
         tokio::spawn(async move { agent::refresh_markets(clients_clone, tx).await });
+    }
+    {
+        let clients_clone = clients.clone();
+        let tx = event_tx.clone();
+        tokio::spawn(async move { agent::refresh_macro(clients_clone, tx).await });
     }
 
     // Auto-refresh ticker (fires every refresh_secs; disabled when refresh_secs == 0)
@@ -4095,6 +4278,12 @@ pub async fn run_tui(
                 let clients_c = clients.clone();
                 let tx = event_tx.clone();
                 tokio::spawn(async move { agent::refresh_markets(clients_c, tx).await });
+                // Periodically refresh FRED macro data (every 10 refresh cycles ≈ hourly)
+                if app.tip_index % 10 == 1 {
+                    let clients_macro = clients.clone();
+                    let tx_macro = event_tx.clone();
+                    tokio::spawn(async move { agent::refresh_macro(clients_macro, tx_macro).await });
+                }
                 // Refresh chart + orderbook for whichever market is selected
                 if app.selected_market_id.is_some() {
                     trigger_chart_load(&app, &clients, &event_tx).await;
@@ -4335,6 +4524,9 @@ pub async fn run_tui(
                             app.pairs.len(), arb_count
                         );
                     }
+                    AppEvent::MacroLoaded(snapshot) => {
+                        app.macro_data = snapshot;
+                    }
                     AppEvent::NewsLoaded { market_id, articles } => {
                         app.news_loading = false;
                         app.news_error = None;
@@ -4414,6 +4606,19 @@ pub async fn run_tui(
     if !app.session.messages.is_empty() || !app.session.notes.is_empty() {
         let _ = portfolio::save_session(&app.session);
     }
+
+    // Save view state so we can restore it next launch
+    let view_state = portfolio::TuiViewState {
+        last_tab:        Some(app.active_tab as u8),
+        last_market_id:  app.selected_market_id.clone(),
+        chart_interval:  Some(app.chart_interval as u8),
+        platform_filter: Some(match app.platform_filter { PlatformFilter::All => 0, PlatformFilter::Polymarket => 1, PlatformFilter::Kalshi => 2 }),
+        market_sort:     Some(match app.market_sort { MarketSort::YesPrice => 0, MarketSort::Volume => 1, MarketSort::EndDate => 2, MarketSort::Name => 3 }),
+        watchlist_only:  app.watchlist_only,
+        search:          if app.search.is_empty() { None } else { Some(app.search.clone()) },
+        split_pane:      app.split_pane,
+    };
+    let _ = portfolio::save_tui_view_state(&view_state);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -5055,8 +5260,74 @@ async fn dispatch_slash_command(
             SlashCmd::Handled
         }
 
+        // ── persona cycle ─────────────────────────────────────────────────────
+        "persona" | "mode" => {
+            app.active_persona = app.active_persona.next();
+            app.status = format!("Persona: {} — new messages will use this style", app.active_persona.name());
+            SlashCmd::Handled
+        }
+
+        // ── split-pane toggle ─────────────────────────────────────────────────
+        "split" | "sp" => {
+            app.split_pane = !app.split_pane;
+            app.status = if app.split_pane {
+                "Split-pane ON  (market list + chart side-by-side)".to_string()
+            } else {
+                "Split-pane OFF  (full-width tab view)".to_string()
+            };
+            SlashCmd::Handled
+        }
+
         _ => SlashCmd::NotACommand,
     }
+}
+
+/// Rebuild the fuzzy-search match list from `app.markets` and built-in commands.
+fn rebuild_fuzzy_matches(app: &mut App) {
+    const COMMANDS: &[(&str, &str)] = &[
+        ("refresh",   "Refresh market data"),
+        ("platform",  "Cycle platform filter"),
+        ("chart",     "Cycle chart interval"),
+        ("sort",      "Cycle market sort"),
+        ("watchlist", "Toggle watchlist for selected market"),
+        ("persona",   "Cycle AI analyst persona"),
+        ("split",     "Toggle split-pane layout"),
+        ("analyze",   "Pre-fill AI analysis prompt"),
+        ("kelly",     "Open Kelly position-size calculator"),
+        ("risk",      "Toggle risk/exposure view"),
+        ("export",    "Export current tab to CSV"),
+        ("help",      "Show help overlay"),
+    ];
+
+    let q = app.fuzzy_input.to_lowercase();
+    let mut matches: Vec<FuzzyMatch> = Vec::new();
+
+    // Commands first
+    for (cmd, desc) in COMMANDS {
+        if q.is_empty() || cmd.contains(q.as_str()) || desc.to_lowercase().contains(q.as_str()) {
+            matches.push(FuzzyMatch {
+                label:  format!("/{cmd}  — {desc}"),
+                action: FuzzyAction::RunCommand(cmd),
+            });
+        }
+    }
+
+    // Then markets
+    for m in &app.markets {
+        if q.is_empty() || m.title.to_lowercase().contains(q.as_str()) {
+            let pct = m.yes_price * 100.0;
+            let plat = m.platform.label();
+            matches.push(FuzzyMatch {
+                label:  format!("{plat}  {pct:.0}¢  {}", trunc(&m.title, 55)),
+                action: FuzzyAction::SelectMarket(m.id.clone()),
+            });
+        }
+    }
+
+    // Cap at 20 so the popup stays compact
+    matches.truncate(20);
+    app.fuzzy_cursor = app.fuzzy_cursor.min(matches.len().saturating_sub(1));
+    app.fuzzy_matches = matches;
 }
 
 /// Returns `true` if the user requested to quit.
@@ -5245,6 +5516,70 @@ async fn handle_key(
                         app.kelly_step    = KellyStep::MyProb;
                         app.kelly_input   = String::new();
                         app.kelly_my_prob = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    // ── Fuzzy search overlay (Ctrl+K) ─────────────────────────────────────────
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KC::Char('k') {
+        app.fuzzy_mode = true;
+        app.fuzzy_input.clear();
+        app.fuzzy_cursor = 0;
+        rebuild_fuzzy_matches(app);
+        return false;
+    }
+
+    if app.fuzzy_mode {
+        match key.code {
+            KC::Esc => {
+                app.fuzzy_mode = false;
+                app.fuzzy_input.clear();
+                app.fuzzy_matches.clear();
+            }
+            KC::Up => {
+                if app.fuzzy_cursor > 0 { app.fuzzy_cursor -= 1; }
+            }
+            KC::Down => {
+                if !app.fuzzy_matches.is_empty() {
+                    app.fuzzy_cursor = (app.fuzzy_cursor + 1).min(app.fuzzy_matches.len() - 1);
+                }
+            }
+            KC::Backspace => {
+                app.fuzzy_input.pop();
+                app.fuzzy_cursor = 0;
+                rebuild_fuzzy_matches(app);
+            }
+            KC::Char(c) => {
+                app.fuzzy_input.push(c);
+                app.fuzzy_cursor = 0;
+                rebuild_fuzzy_matches(app);
+            }
+            KC::Enter => {
+                if let Some(m) = app.fuzzy_matches.get(app.fuzzy_cursor).cloned() {
+                    app.fuzzy_mode = false;
+                    app.fuzzy_input.clear();
+                    app.fuzzy_matches.clear();
+                    match m.action {
+                        FuzzyAction::SelectMarket(id) => {
+                            app.selected_market_id = Some(id.clone());
+                            app.chart_data.clear();
+                            app.chart_candles.clear();
+                            app.orderbook = None;
+                            app.status = format!("Loading data for {}", &id[..id.len().min(20)]);
+                            trigger_chart_load(app, clients, event_tx).await;
+                            trigger_orderbook_load(app, clients, event_tx).await;
+                            app.active_tab = AppTab::Chart;
+                        }
+                        FuzzyAction::RunCommand(cmd) => {
+                            match dispatch_slash_command(cmd, app, backend, clients, event_tx).await {
+                                SlashCmd::Quit    => return true,
+                                SlashCmd::Handled | SlashCmd::NotACommand => {}
+                            }
+                        }
                     }
                 }
             }
@@ -5737,6 +6072,16 @@ async fn handle_key(
             }
         }
 
+        // ── Alt+S — toggle split-pane ─────────────────────────────────────────
+        KC::Char('s') if key.modifiers.contains(KeyModifiers::ALT) && app.input.is_empty() => {
+            app.split_pane = !app.split_pane;
+            app.status = if app.split_pane {
+                "Split-pane ON  (Alt+S or /split to toggle)".to_string()
+            } else {
+                "Split-pane OFF  (Alt+S or /split to toggle)".to_string()
+            };
+        }
+
         // ── Input editing ─────────────────────────────────────────────────────
         KC::Char(c) => { app.input.push(c); app.sent_cursor = None; }
         KC::Backspace => { app.input.pop(); }
@@ -6027,8 +6372,9 @@ async fn send_chat(
     let tx         = event_tx.clone();
     let mut hist   = std::mem::take(llm_history);
 
+    let persona_c = app.active_persona;
     tokio::spawn(async move {
-        agent::run_turn(backend_c, clients_c, &mut hist, llm_msg, tx.clone()).await;
+        agent::run_turn(backend_c, clients_c, &mut hist, llm_msg, persona_c, tx.clone()).await;
         // Return history to the TUI via the event channel so it persists across turns.
         let _ = tx.send(AppEvent::HistoryUpdated(hist));
     });

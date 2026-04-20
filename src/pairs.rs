@@ -405,6 +405,128 @@ fn parse_llm_response(
     pairs
 }
 
+// ─── Engle-Granger cointegration test ────────────────────────────────────────
+
+/// Two-step Engle-Granger cointegration test for two aligned price series.
+///
+/// Step 1: OLS  P1_t = α + β·P2_t + ε_t  (hedge ratio)
+/// Step 2: Dickey-Fuller test on ε_t  →  H0: γ=0 (unit root, not cointegrated)
+///
+/// Critical values for residuals-based DF (MacKinnon, no constant, no trend):
+///   1%: -3.90 | 5%: -3.34 | 10%: -3.04
+#[derive(Debug, Clone)]
+pub struct CointResult {
+    /// Hedge ratio β from the first-step OLS regression.
+    pub hedge_ratio:        f64,
+    /// DF test statistic on residuals (more negative → more evidence of cointegration).
+    pub df_stat:            f64,
+    /// True when |df_stat| exceeds the 5% critical value (-3.34).
+    pub cointegrated_5pct:  bool,
+    /// True when |df_stat| exceeds the 10% critical value (-3.04).
+    pub cointegrated_10pct: bool,
+    /// Mean-reversion coefficient γ < 0 from Δε_t = γ·ε_{t-1}.
+    pub gamma:              f64,
+    /// Mean-reversion half-life in the same units as the input series (days/hours).
+    pub half_life:          f64,
+    /// Number of aligned observations used.
+    pub n_obs:              usize,
+}
+
+/// Run Engle-Granger test on two aligned price series.
+/// Returns `None` if fewer than 20 observations are available.
+pub fn engle_granger(p1: &[f64], p2: &[f64]) -> Option<CointResult> {
+    let n = p1.len().min(p2.len());
+    if n < 20 { return None; }
+
+    // Step 1: OLS  p1 = alpha + beta * p2
+    let (alpha, beta) = coint_ols(p1, p2, n);
+
+    // Compute OLS residuals ε_t
+    let residuals: Vec<f64> = (0..n).map(|i| p1[i] - alpha - beta * p2[i]).collect();
+
+    // Step 2: DF test — regress Δε_t on ε_{t-1} (no constant, no trend)
+    let delta:  Vec<f64> = (1..n).map(|i| residuals[i] - residuals[i - 1]).collect();
+    let lagged: Vec<f64> = residuals[..n - 1].to_vec();
+
+    // γ = Σ(ε_{t-1} · Δε_t) / Σ(ε_{t-1}²)
+    let gamma = coint_ols_no_const(&delta, &lagged);
+    let se    = coint_gamma_se(&delta, &lagged, gamma);
+    let df_stat = if se < 1e-12 { 0.0 } else { gamma / se };
+
+    let cointegrated_5pct  = df_stat < -3.34;
+    let cointegrated_10pct = df_stat < -3.04;
+    let half_life = if gamma < -1e-9 {
+        (-std::f64::consts::LN_2 / gamma).abs()
+    } else {
+        f64::INFINITY
+    };
+
+    Some(CointResult {
+        hedge_ratio:        beta,
+        df_stat,
+        cointegrated_5pct,
+        cointegrated_10pct,
+        gamma,
+        half_life,
+        n_obs: n,
+    })
+}
+
+/// Align two candle series by bucketing to the same daily timestamps.
+/// Returns `(p1_closes, p2_closes)` where both vecs have the same length
+/// (only days present in both series are kept).
+pub fn align_daily_closes(
+    series1: &[crate::markets::Candle],
+    series2: &[crate::markets::Candle],
+) -> (Vec<f64>, Vec<f64>) {
+    use std::collections::BTreeMap;
+    let bucket = |ts: i64| ts / 86_400;
+
+    let map1: BTreeMap<i64, f64> = series1.iter().map(|c| (bucket(c.ts), c.close)).collect();
+    let map2: BTreeMap<i64, f64> = series2.iter().map(|c| (bucket(c.ts), c.close)).collect();
+
+    let mut v1 = Vec::new();
+    let mut v2 = Vec::new();
+    for (day, p1) in &map1 {
+        if let Some(&p2) = map2.get(day) {
+            v1.push(*p1);
+            v2.push(p2);
+        }
+    }
+    (v1, v2)
+}
+
+// ── OLS helpers (private) ────────────────────────────────────────────────────
+
+/// OLS with constant: y = α + β·x.  Returns (α, β).
+fn coint_ols(y: &[f64], x: &[f64], n: usize) -> (f64, f64) {
+    let mx: f64 = x[..n].iter().sum::<f64>() / n as f64;
+    let my: f64 = y[..n].iter().sum::<f64>() / n as f64;
+    let cov: f64 = (0..n).map(|i| (x[i] - mx) * (y[i] - my)).sum();
+    let var: f64 = (0..n).map(|i| (x[i] - mx).powi(2)).sum();
+    if var < 1e-12 { return (my, 0.0); }
+    let beta = cov / var;
+    (my - beta * mx, beta)
+}
+
+/// OLS without constant: y = γ·x.  Returns γ.
+fn coint_ols_no_const(y: &[f64], x: &[f64]) -> f64 {
+    let xx: f64 = x.iter().map(|v| v * v).sum();
+    let xy: f64 = x.iter().zip(y.iter()).map(|(xi, yi)| xi * yi).sum();
+    if xx < 1e-12 { return 0.0; }
+    xy / xx
+}
+
+/// Standard error of γ from y = γ·x (no constant).
+fn coint_gamma_se(y: &[f64], x: &[f64], gamma: f64) -> f64 {
+    let n = y.len() as f64;
+    if n < 3.0 { return 1e-12; }
+    let rss: f64 = y.iter().zip(x.iter()).map(|(yi, xi)| (yi - gamma * xi).powi(2)).sum();
+    let xx:  f64 = x.iter().map(|v| v * v).sum();
+    if xx < 1e-12 { return 1e-12; }
+    (rss / ((n - 1.0) * xx)).sqrt()
+}
+
 fn sort_pairs(pairs: &mut Vec<MarketPair>) {
     pairs.sort_by(|a, b| {
         // Primary: descending net_gap (most profitable first)

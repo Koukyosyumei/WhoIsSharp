@@ -97,6 +97,9 @@ pub enum AppEvent {
     PairsMatching,
     /// Pair matching complete — replace the pairs list.
     PairsLoaded(Vec<crate::pairs::MarketPair>),
+
+    // ── FRED macro snapshot ───────────────────────────────────────────────────
+    MacroLoaded(crate::fred::MacroSnapshot),
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -225,6 +228,111 @@ STYLE RULES
 • Cross-reference against public news timelines before calling something insider activity.
 • When uncertain about magnitude, give a range; never hide behind vagueness.";
 
+// ─── Personas ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Persona {
+    /// Standard balanced analyst (default).
+    #[default]
+    Default,
+    /// Seeks contrarian trades — fades consensus, looks for over-reaction.
+    Contrarian,
+    /// Emphasises macro economic context and cross-asset linkages.
+    Macro,
+    /// Laser-focused on smart-money / insider flow signals.
+    SmartMoney,
+}
+
+impl Persona {
+    pub fn name(self) -> &'static str {
+        match self {
+            Persona::Default    => "Default",
+            Persona::Contrarian => "Contrarian",
+            Persona::Macro      => "Macro",
+            Persona::SmartMoney => "SmartMoney",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Persona::Default    => Persona::Contrarian,
+            Persona::Contrarian => Persona::Macro,
+            Persona::Macro      => Persona::SmartMoney,
+            Persona::SmartMoney => Persona::Default,
+        }
+    }
+
+    pub fn system_prompt(self) -> &'static str {
+        match self {
+            Persona::Default    => SYSTEM_PROMPT,
+            Persona::Contrarian => SYSTEM_PROMPT_CONTRARIAN,
+            Persona::Macro      => SYSTEM_PROMPT_MACRO,
+            Persona::SmartMoney => SYSTEM_PROMPT_SMART_MONEY,
+        }
+    }
+}
+
+const SYSTEM_PROMPT_CONTRARIAN: &str = "\
+You are WhoIsSharp in CONTRARIAN mode. Your core edge is fading consensus and finding \
+over-reactions. Apply the same five-layer analysis framework as default, but amplify \
+the following:
+
+CONTRARIAN OVERLAY
+• Lead with: 'What would have to be true for the crowd to be wrong here?'
+• Identify recency bias, narrative momentum, and herding in the current price.
+• Look for asymmetric payoffs: markets priced near 5% or 95% often have better \
+  risk/reward fading the consensus than chasing it.
+• Explicitly state the consensus view first, then argue against it with evidence.
+• Flag when smart-money positioning DIVERGES from price direction (stealth accumulation \
+  or distribution against trend).
+• Default to SELL/STRONG SELL unless the base-rate and microstructure are exceptionally \
+  compelling for the consensus view.
+• Use Kelly sizing aggressively for contrarian bets — if the edge is real, size up.
+
+Style: direct, skeptical, willing to be the lone bear or bull.";
+
+const SYSTEM_PROMPT_MACRO: &str = "\
+You are WhoIsSharp in MACRO mode. Your edge is placing prediction market outcomes in \
+macro economic context. Apply the standard five-layer framework but emphasise:
+
+MACRO OVERLAY
+• Before ANY analysis, state the current macro regime: Fed cycle phase, yield curve \
+  slope, credit spreads, risk-on/off sentiment.
+• For every market, ask: 'How does the macro environment shift the base rate?'
+• Cross-reference with Fed policy: if FOMC is in a hiking cycle, policy-sensitive \
+  markets (rates, housing, credit) should be adjusted relative to the forward curve.
+• Explicitly model catalyst timing: upcoming FOMC dates, CPI prints, NFP releases, \
+  earnings seasons. Show how these events map to market resolution dates.
+• When 10-Year yield is rising rapidly, fade risk assets; when it's falling, favour them.
+• Look for macro dis-equilibria: a market priced as if rates will stay high while the \
+  yield curve is pricing multiple cuts is a potential mis-price.
+• Always close with a MACRO RISK TABLE: list 3 macro scenarios (base/bull/bear) and \
+  the implied YES probability under each.
+
+Style: rigorous, data-anchored, scenario-based.";
+
+const SYSTEM_PROMPT_SMART_MONEY: &str = "\
+You are WhoIsSharp in SMART-MONEY mode. Your sole focus is identifying and following \
+informed flow. Every analysis is subordinate to the wallet surveillance evidence.
+
+SMART-MONEY OVERLAY
+• Run analyze_insider FIRST on every market. Do not proceed to other steps if the \
+  suspicion score is < 30.
+• If suspicion ≥ 30, immediately call find_smart_money and rank wallets.
+• Call analyze_wallet on the TOP 3 wallets (not just top 1-2). Compare their entry \
+  prices to the current mid.
+• Coordination signal: if 2+ wallets show Jaccard overlap ≥ 35%, treat as coordinated \
+  positioning — double your edge estimate.
+• Alpha-entry threshold: wallet entries at < 35¢ on a market now at > 55¢ = 20pp+ alpha. \
+  This is a STRONG signal; follow it unless fundamental analysis contradicts.
+• Vol/Liq > 15× at extreme prices = INSDR; at moderate prices = informed directional bet.
+• Classify each wallet: Insider / Informed / Noise / Uncertain. Never leave this unresolved.
+• TRADING VIEW must state: are you following the smart money or fading it, and why.
+• If you fade smart money, explain the specific fundamental reason that overrides \
+  the flow signal.
+
+Style: surveillance-first, clinical, evidence-stamped.";
+
 // ─── Context trimming ─────────────────────────────────────────────────────────
 
 const MAX_HISTORY_CHARS: usize = 80_000;
@@ -275,16 +383,18 @@ fn summarize_tool_result(msg: &LlmMessage) -> String {
 ///
 /// `history` is updated in place so the caller can persist the conversation.
 pub async fn run_turn(
-    backend: Arc<dyn LlmBackend>,
-    clients: Arc<MarketClients>,
-    history: &mut Vec<LlmMessage>,
+    backend:  Arc<dyn LlmBackend>,
+    clients:  Arc<MarketClients>,
+    history:  &mut Vec<LlmMessage>,
     user_msg: String,
+    persona:  Persona,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     history.push(LlmMessage::user_text(user_msg));
     trim_history(history);
 
-    let tools = tools::all_definitions();
+    let tools         = tools::all_definitions();
+    let system_prompt = persona.system_prompt();
 
     loop {
         let _ = event_tx.send(AppEvent::AgentThinking);
@@ -301,7 +411,7 @@ pub async fn run_turn(
         });
 
         let result = backend
-            .generate_streaming(SYSTEM_PROMPT, history, &tools, &chunk_tx)
+            .generate_streaming(system_prompt, history, &tools, &chunk_tx)
             .await;
 
         drop(chunk_tx); // close chunk stream
@@ -344,7 +454,7 @@ pub async fn run_turn(
                 display_args: display_args.clone(),
             });
 
-            let output = tools::dispatch(&clients, &tc.name, &tc.args).await;
+            let output = tools::dispatch(&clients, &tc.name, &tc.args, None).await;
 
             let _ = event_tx.send(AppEvent::AgentToolResult {
                 name:   tc.name.clone(),
@@ -649,7 +759,7 @@ pub async fn run_too_smart_llm_scan(
                     display_args: tc.args.to_string(),
                 });
 
-                let output = tools::dispatch(&clients, &tc.name, &tc.args).await;
+                let output = tools::dispatch(&clients, &tc.name, &tc.args, None).await;
 
                 let _ = event_tx.send(AppEvent::AgentToolResult {
                     name:   tc.name.clone(),
@@ -800,4 +910,15 @@ pub async fn refresh_wallet_detail(
         Ok(detail) => { let _ = event_tx.send(AppEvent::WalletDetailLoaded(detail)); }
         Err(e)     => { let _ = event_tx.send(AppEvent::RefreshError(format!("Wallet detail: {}", e))); }
     }
+}
+
+/// Fetch FRED macro indicators and emit `MacroLoaded`.
+/// No-op when no FRED client is configured.
+pub async fn refresh_macro(
+    clients:  Arc<MarketClients>,
+    event_tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(fred) = &clients.fred else { return };
+    let snapshot = fred.fetch_snapshot().await;
+    let _ = event_tx.send(AppEvent::MacroLoaded(snapshot));
 }

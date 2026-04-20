@@ -348,6 +348,51 @@ pub fn load_last_session() -> Option<Session> {
     serde_json::from_str(&data).ok()
 }
 
+// ─── TUI view state (tab, market, filters) persisted across restarts ─────────
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct TuiViewState {
+    pub last_tab:        Option<u8>,
+    pub last_market_id:  Option<String>,
+    /// ChartInterval index: 0=1h 1=6h 2=1d 3=1w 4=1m
+    pub chart_interval:  Option<u8>,
+    /// PlatformFilter index: 0=All 1=PM 2=KL
+    pub platform_filter: Option<u8>,
+    /// MarketSort index: 0=~50% 1=Vol 2=End 3=A-Z
+    pub market_sort:     Option<u8>,
+    pub watchlist_only:  bool,
+    pub search:          Option<String>,
+    pub split_pane:      bool,
+}
+
+fn tui_view_state_path() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".whoissharp");
+    p.push("view_state.json");
+    p
+}
+
+pub fn load_tui_view_state() -> TuiViewState {
+    let path = tui_view_state_path();
+    if !path.exists() { return TuiViewState::default(); }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_)   => TuiViewState::default(),
+    }
+}
+
+pub fn save_tui_view_state(s: &TuiViewState) -> Result<()> {
+    let path = tui_view_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create directory '{}'", parent.display()))?;
+    }
+    let data = serde_json::to_string_pretty(s)?;
+    std::fs::write(&path, data)
+        .with_context(|| format!("Cannot write view state to '{}'", path.display()))?;
+    Ok(())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
