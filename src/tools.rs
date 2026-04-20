@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
+use crate::fred::FredClient;
 use crate::llm::ToolDefinition;
 use crate::markets::{kalshi::KalshiClient, polymarket::PolymarketClient, ChartInterval};
 use crate::news::NewsClient;
@@ -27,16 +28,23 @@ pub struct MarketClients {
     pub kalshi:        KalshiClient,
     /// None when `NEWSDATA_API_KEY` is not set.
     pub news:          Option<NewsClient>,
+    /// None when `FRED_API_KEY` is not set.
+    pub fred:          Option<FredClient>,
     /// Max trades/redeems to fetch per wallet (CLI --history flag, default 500).
     pub history_limit: u32,
 }
 
 impl MarketClients {
-    pub fn new(newsdata_api_key: Option<String>, history_limit: u32) -> Self {
+    pub fn new(
+        newsdata_api_key: Option<String>,
+        fred_api_key:     Option<String>,
+        history_limit:    u32,
+    ) -> Self {
         MarketClients {
             polymarket: PolymarketClient::new(),
             kalshi:     KalshiClient::new(),
             news:       newsdata_api_key.map(NewsClient::new),
+            fred:       fred_api_key.map(FredClient::new),
             history_limit,
         }
     }

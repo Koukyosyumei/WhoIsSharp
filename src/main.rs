@@ -11,6 +11,7 @@
 mod agent;
 mod cache;
 mod config;
+mod fred;
 mod http;
 mod llm;
 mod markets;
@@ -147,7 +148,8 @@ async fn main() -> Result<()> {
     };
 
     let newsdata_api_key = std::env::var("NEWSDATA_API_KEY").ok();
-    let clients = Arc::new(MarketClients::new(newsdata_api_key, cli.history));
+    let fred_api_key     = std::env::var("FRED_API_KEY").ok();
+    let clients = Arc::new(MarketClients::new(newsdata_api_key, fred_api_key, cli.history));
 
     if cli.scan {
         let report = tools::headless_scan(
