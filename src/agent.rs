@@ -454,7 +454,7 @@ pub async fn run_turn(
                 display_args: display_args.clone(),
             });
 
-            let output = tools::dispatch(&clients, &tc.name, &tc.args).await;
+            let output = tools::dispatch(&clients, &tc.name, &tc.args, None).await;
 
             let _ = event_tx.send(AppEvent::AgentToolResult {
                 name:   tc.name.clone(),
@@ -759,7 +759,7 @@ pub async fn run_too_smart_llm_scan(
                     display_args: tc.args.to_string(),
                 });
 
-                let output = tools::dispatch(&clients, &tc.name, &tc.args).await;
+                let output = tools::dispatch(&clients, &tc.name, &tc.args, None).await;
 
                 let _ = event_tx.send(AppEvent::AgentToolResult {
                     name:   tc.name.clone(),

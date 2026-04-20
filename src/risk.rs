@@ -81,6 +81,15 @@ pub struct PortfolioRisk {
     /// Histogram: (pnl_midpoint, normalised_height 0.0–1.0).
     /// Empty when there are fewer than 2 positions or σ ≈ 0.
     pub histogram:       Vec<(f64, f64)>,
+    /// Value at Risk at 95% confidence: potential loss exceeded only 5% of the time.
+    /// Positive means expected loss; negative means even the worst 5% shows a gain.
+    pub var_95:          f64,
+    /// Conditional VaR (Expected Shortfall) at 95%: expected loss in the worst 5% of outcomes.
+    pub cvar_95:         f64,
+    /// Value at Risk at 99% confidence.
+    pub var_99:          f64,
+    /// Conditional VaR at 99%.
+    pub cvar_99:         f64,
 }
 
 impl PortfolioRisk {
@@ -118,6 +127,10 @@ pub fn compute(portfolio: &Portfolio, markets: &[Market]) -> PortfolioRisk {
             worst_case:      0.0,
             category_stress: Vec::new(),
             histogram:       Vec::new(),
+            var_95:          0.0,
+            cvar_95:         0.0,
+            var_99:          0.0,
+            cvar_99:         0.0,
         };
     }
 
@@ -132,6 +145,13 @@ pub fn compute(portfolio: &Portfolio, markets: &[Market]) -> PortfolioRisk {
         if expected_pnl > 0.0 { 1.0 } else if expected_pnl < 0.0 { 0.0 } else { 0.5 }
     } else {
         normal_cdf(expected_pnl / std_dev)
+    };
+
+    let (var_95, cvar_95, var_99, cvar_99) = if std_dev > 1e-9 {
+        compute_var_cvar(expected_pnl, std_dev)
+    } else {
+        let loss = (-expected_pnl).max(0.0);
+        (loss, loss, loss, loss)
     };
 
     // ── Category stress tests ─────────────────────────────────────────────────
@@ -188,6 +208,10 @@ pub fn compute(portfolio: &Portfolio, markets: &[Market]) -> PortfolioRisk {
         worst_case,
         category_stress,
         histogram,
+        var_95,
+        cvar_95,
+        var_99,
+        cvar_99,
     }
 }
 
@@ -224,8 +248,27 @@ fn position_risk(pos: &Position, cat_map: &HashMap<String, String>) -> PositionR
     }
 }
 
+/// Compute VaR and CVaR (Expected Shortfall) under the normal approximation.
+///
+/// Returns `(var_95, cvar_95, var_99, cvar_99)` expressed as potential losses
+/// (positive = you could lose this amount; negative = even the worst tail shows a gain).
+///
+/// Under N(mean, std²):
+///   VaR_α  = -(mean + z_α * std)     where z_α = Φ⁻¹(α)
+///   CVaR_α = -(mean - std * n(z_α) / α)  where n = normal PDF
+///
+/// Constants (α = 5%): z = -1.6449, n(z)/α = 2.0627
+/// Constants (α = 1%): z = -2.3263, n(z)/α = 2.6652
+fn compute_var_cvar(mean: f64, std: f64) -> (f64, f64, f64, f64) {
+    let var_95  = -(mean - 1.6449 * std);
+    let cvar_95 = -(mean - 2.0627 * std);
+    let var_99  = -(mean - 2.3263 * std);
+    let cvar_99 = -(mean - 2.6652 * std);
+    (var_95, cvar_95, var_99, cvar_99)
+}
+
 /// Normal CDF via Abramowitz & Stegun rational approximation (max error 7.5e-8).
-fn normal_cdf(z: f64) -> f64 {
+pub fn normal_cdf(z: f64) -> f64 {
     const P: f64 = 0.2316419;
     const B: [f64; 5] = [0.319381530, -0.356563782, 1.781477937, -1.821255978, 1.330274429];
     let t = 1.0 / (1.0 + P * z.abs());
@@ -403,6 +446,36 @@ mod tests {
         p.add(yes_pos(0.40, 80.0,  0.55));
         let risk = compute(&p, &[]);
         assert_eq!(risk.histogram.len(), HIST_BUCKETS);
+    }
+
+    #[test]
+    fn var_cvar_ordering() {
+        let mut p = Portfolio::default();
+        p.add(yes_pos(0.60, 100.0, 0.70));
+        p.add(yes_pos(0.40, 80.0,  0.55));
+        let risk = compute(&p, &[]);
+        // CVaR_95 ≥ VaR_95 (ES is always worse than VaR)
+        assert!(risk.cvar_95 >= risk.var_95, "CVaR_95 should be >= VaR_95");
+        assert!(risk.cvar_99 >= risk.var_99, "CVaR_99 should be >= VaR_99");
+        // VaR_99 ≥ VaR_95 (99% confidence is a more extreme loss level)
+        assert!(risk.var_99 >= risk.var_95, "VaR_99 should be >= VaR_95");
+    }
+
+    #[test]
+    fn var_cvar_positive_for_loss_heavy_portfolio() {
+        let mut p = Portfolio::default();
+        // Bought at 90¢ but current mark 10¢ — deep underwater
+        p.add(yes_pos(0.90, 100.0, 0.10));
+        let risk = compute(&p, &[]);
+        // Expected PnL is very negative — even best-case VaR should be a loss
+        assert!(risk.var_95 > 0.0, "VaR_95 should be a loss (positive) for deeply negative portfolio");
+    }
+
+    #[test]
+    fn cvar_formula_known_value() {
+        // For mean=0, std=1: CVaR_5% should be ≈ 2.0627
+        let (_, cvar_95, _, _) = compute_var_cvar(0.0, 1.0);
+        assert!((cvar_95 - 2.0627).abs() < 0.001, "CVaR_5% for N(0,1) should be ≈ 2.063");
     }
 
     #[test]

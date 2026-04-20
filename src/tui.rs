@@ -1863,11 +1863,11 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     let inner = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
-    // Split vertically: summary row | histogram | scenario table | position breakdown
+    // Split vertically: summary rows | histogram | scenario table | position breakdown
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // key metrics
+            Constraint::Length(5),  // key metrics (2 data rows + padding)
             Constraint::Length(10), // histogram
             Constraint::Min(0),     // scenario stress + per-position EV
         ])
@@ -1876,6 +1876,9 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
     // ── Key metrics ───────────────────────────────────────────────────────────
     let ep_color = if risk.expected_pnl >= 0.0 { Color::Green } else { Color::Red };
     let pp_color = if risk.prob_profit >= 0.5   { Color::Green } else { Color::Red };
+
+    let var95_color  = if risk.var_95  <= 0.0 { Color::Green } else { Color::Yellow };
+    let cvar95_color = if risk.cvar_95 <= 0.0 { Color::Green } else { Color::Red };
 
     let metric_lines = vec![
         Line::from(""),
@@ -1891,6 +1894,21 @@ fn render_portfolio_risk(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("   Worst: "),
             Span::styled(format!("{:+.2}", risk.worst_case), Style::default().fg(Color::Red)),
         ]),
+        Line::from(vec![
+            Span::styled("  VaR(95)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.var_95), Style::default().fg(var95_color)),
+            Span::styled("  CVaR(95)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.cvar_95), Style::default().fg(cvar95_color).bold()),
+            Span::styled("  VaR(99)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.var_99), Style::default().fg(Color::Yellow)),
+            Span::styled("  CVaR(99)", Style::default().fg(Color::DarkGray)),
+            Span::raw(": "),
+            Span::styled(format!("{:+.2}", -risk.cvar_99), Style::default().fg(Color::Red).bold()),
+        ]),
+        Line::from(""),
     ];
     f.render_widget(Paragraph::new(metric_lines), rows[0]);
 

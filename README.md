@@ -148,9 +148,9 @@ Override any model: `--model claude-opus-4-6` or `WHOISSHARP_MODEL=<id>`.
 
 ---
 
-## MCP Server (Claude Desktop integration)
+## MCP Server
 
-WhoIsSharp can run as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server, exposing all 14 market-analysis tools directly to Claude Desktop — no API fees beyond your existing Anthropic subscription.
+WhoIsSharp can run as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server, exposing all market-analysis tools to any MCP-compatible client — Claude Desktop, Claude Code (the CLI), or any other MCP host.
 
 ### Installation
 
@@ -158,7 +158,32 @@ WhoIsSharp can run as an [MCP (Model Context Protocol)](https://modelcontextprot
 cargo install --git https://github.com/Koukyosyumei/WhoIsSharp whoissharp
 ```
 
-### Claude Desktop configuration
+### Claude Code (CLI)
+
+The fastest way — one command, no config file editing:
+
+```bash
+claude mcp add whoissharp -- whoissharp --mcp
+```
+
+To pass optional API keys:
+
+```bash
+claude mcp add whoissharp \
+  -e NEWSDATA_API_KEY=your_newsdata_key \
+  -e FRED_API_KEY=your_fred_key \
+  -- whoissharp --mcp
+```
+
+This registers the server for your current project. Use `--scope user` to make it available in every project:
+
+```bash
+claude mcp add --scope user whoissharp -- whoissharp --mcp
+```
+
+Verify it's registered: `claude mcp list`
+
+### Claude Desktop
 
 Add the following to your `claude_desktop_config.json`
 (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`,
@@ -198,7 +223,11 @@ Once connected, Claude can call any of these tools in conversation:
 | `analyze_wallet` | Full profile for a single wallet |
 | `scan_smart_money` | Bulk suspicious-wallet scan |
 | `get_wallet_positions` | Current positions for a wallet |
-| `kelly_size` | Kelly Criterion position sizing |
+| `kelly_size` | Single-bet Kelly Criterion sizing |
+| `kelly_correlated` | Multi-bet Kelly under pairwise correlations |
+| `binary_greeks` | Delta, Theta, Vega for a prediction market position |
+| `market_microstructure` | Roll's spread, Amihud illiquidity, Kyle's λ |
+| `test_cointegration` | Engle-Granger cointegration test for a PM/KL pair |
 | `search_news` | Fetch related news articles |
 | `get_market_news` | News contextualised to a market |
 
