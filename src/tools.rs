@@ -102,6 +102,7 @@ async fn dispatch_inner(
         "get_signal_backtest"  => get_signal_backtest().await,
         "get_calibration"      => get_calibration().await,
         "get_professional_report" => get_professional_report(clients).await,
+        "simulate_portfolio"   => simulate_portfolio(clients, args).await,
         "get_macro"            => get_macro(clients).await,
         "search_news"          => search_news(clients, args).await,
         "get_market_news"      => get_market_news(clients, args).await,
@@ -3675,6 +3676,26 @@ async fn get_professional_report(clients: &MarketClients) -> Result<ToolOutput> 
     Ok(ToolOutput::ok(crate::research::professional_report(&portfolio, &markets, &signals)))
 }
 
+async fn simulate_portfolio(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let mut portfolio = crate::portfolio::load_portfolio();
+    if portfolio.positions.is_empty() {
+        return Ok(ToolOutput::ok("Portfolio is empty. Add positions before running a simulation."));
+    }
+
+    let (pm_res, kl_res) = tokio::join!(
+        clients.polymarket.fetch_markets(100, None, None),
+        clients.kalshi.fetch_markets(100, None),
+    );
+    let mut markets = pm_res.unwrap_or_default();
+    markets.extend(kl_res.unwrap_or_default());
+    portfolio.update_marks(markets.iter().map(|m| (m.platform.clone(), m.id.clone(), m.yes_price)));
+
+    let spec_json = args["spec"].as_str();
+    let spec = crate::simulation::parse_spec_json(spec_json)?;
+    let result = crate::simulation::run(&portfolio, &markets, spec)?;
+    Ok(ToolOutput::ok(crate::simulation::render_report(&result)))
+}
+
 /// Fetch the FRED macro snapshot (FEDFUNDS, 5y breakeven inflation, UNRATE, 10Y).
 async fn get_macro(clients: &MarketClients) -> Result<ToolOutput> {
     let fred = match &clients.fred {
@@ -4262,6 +4283,23 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             description: "Generate a professional book review combining local thesis ledger, \
                 portfolio exposure clusters, current signals, mark-to-market backtest, and calibration.".into(),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "simulate_portfolio".into(),
+            description: "Run a sandboxed Monte Carlo portfolio simulation from a structured JSON spec. \
+                The spec can define scenario shocks and correlated latent-factor groups; WhoIsSharp executes \
+                trusted Rust simulation code, not arbitrary model-generated code. Use this for questions like \
+                'what happens if CPI is hot, politics reprices down, and crypto sells off?'.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "string",
+                        "description": "Optional JSON string. Shape: {\"name\":\"Hot CPI\", \"trials\":50000, \"shocks\":[{\"target_type\":\"topic\", \"target\":\"macro\", \"yes_price_shift\":-0.12}], \"correlation_groups\":[{\"name\":\"Election\", \"targets\":[\"politics\"], \"rho\":0.65}]}. target_type is one of all/topic/category/market_id/title_contains."
+                    }
+                },
+                "required": []
+            }),
         },
         ToolDefinition {
             name: "get_macro".into(),

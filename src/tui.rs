@@ -70,6 +70,7 @@ const TIPS: &[&str] = &[
     "Type /risk in Portfolio to toggle the risk/exposure view",
     "Type /thesis <note> to log a research thesis for the selected market",
     "Type /backtest or /calibration to export professional signal analytics",
+    "Type /simulate to run a sandboxed Monte Carlo portfolio simulation",
     "Press Ctrl+K to open the fuzzy search — find markets and commands instantly",
     "Press Alt+S or type /split to toggle split-pane mode (market list + chart)",
     "Type /persona to cycle AI analyst style: Default → Contrarian → Macro → SmartMoney",
@@ -3867,6 +3868,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/backtest", "Export signal mark-to-market analytics"),
         kv("/calibration", "Export price calibration buckets"),
         kv("/book", "Export professional book review"),
+        kv("/simulate  or  /sim", "Run sandboxed Monte Carlo portfolio simulation"),
         kv("/help  or  /?  or  ?", "Toggle this help overlay"),
         kv("/persona  or  /mode", "Cycle AI analyst persona  (Default → Contrarian → Macro → SmartMoney)"),
         kv("/split  or  /sp", "Toggle split-pane layout  (market list + chart side-by-side)"),
@@ -5210,6 +5212,18 @@ async fn dispatch_slash_command(
             SlashCmd::Handled
         }
 
+        "simulate" | "sim" => {
+            app.status = match crate::simulation::run(
+                &app.portfolio,
+                &app.markets,
+                crate::simulation::default_spec(),
+            ) {
+                Ok(result) => save_named_text_report("simulation", &crate::simulation::render_report(&result)),
+                Err(e) => format!("Simulation failed: {}", e),
+            };
+            SlashCmd::Handled
+        }
+
         // ── AI analyze ────────────────────────────────────────────────────────
         "a" | "analyze" => {
             let info = analyze_target(app);
@@ -5348,6 +5362,7 @@ fn rebuild_fuzzy_matches(app: &mut App) {
         ("backtest",  "Export signal analytics"),
         ("calibration", "Export calibration buckets"),
         ("book",      "Export professional book review"),
+        ("simulate",  "Run portfolio simulation"),
         ("help",      "Show help overlay"),
     ];
 

@@ -24,6 +24,7 @@ mod portfolio;
 mod research;
 mod risk;
 mod signals;
+mod simulation;
 mod tools;
 mod tui;
 
