@@ -95,6 +95,11 @@ async fn dispatch_inner(
         "test_cointegration"   => test_cointegration(clients, args).await,
         "get_portfolio"        => get_portfolio(clients).await,
         "get_portfolio_risk"   => get_portfolio_risk(clients).await,
+        "init_demo_account"    => init_demo_account(args).await,
+        "get_demo_account"     => get_demo_account(clients).await,
+        "demo_trade"           => demo_trade(clients, args).await,
+        "demo_limit_order"     => demo_limit_order(clients, args).await,
+        "cancel_demo_order"    => cancel_demo_order(args).await,
         "get_watchlist"        => get_watchlist().await,
         "get_signals"          => get_signals(clients).await,
         "create_thesis"        => create_thesis(args).await,
@@ -3540,6 +3545,162 @@ async fn get_portfolio_risk(clients: &MarketClients) -> Result<ToolOutput> {
     Ok(ToolOutput::ok(lines.join("\n")))
 }
 
+async fn init_demo_account(args: &serde_json::Value) -> Result<ToolOutput> {
+    let cash = args["cash"].as_f64().unwrap_or(10_000.0);
+    let account = crate::demo::reset(cash)?;
+    Ok(ToolOutput::ok(crate::demo::summary(&account)))
+}
+
+async fn get_demo_account(clients: &MarketClients) -> Result<ToolOutput> {
+    let mut account = crate::demo::load();
+    if account.enabled {
+        let (pm_res, kl_res) = tokio::join!(
+            clients.polymarket.fetch_markets(100, None, None),
+            clients.kalshi.fetch_markets(100, None),
+        );
+        let mut markets = pm_res.unwrap_or_default();
+        markets.extend(kl_res.unwrap_or_default());
+        account.update_marks(&markets);
+        let _ = crate::demo::process_orders(&mut account, &markets);
+        let _ = crate::demo::save(&account);
+    }
+    Ok(ToolOutput::ok(crate::demo::summary(&account)))
+}
+
+async fn demo_trade(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let platform = args["platform"].as_str().unwrap_or("polymarket");
+    let id = args["market_id"].as_str().unwrap_or("").trim();
+    let query = args["query"].as_str().unwrap_or("").trim();
+    let side = crate::portfolio::Side::from_str(args["side"].as_str().unwrap_or("yes"));
+    let notional = args["notional"].as_f64().unwrap_or(0.0);
+    let rationale = args["rationale"].as_str().unwrap_or("LLM demo trade");
+
+    if id.is_empty() && query.is_empty() {
+        return Ok(ToolOutput::err("Provide market_id or query."));
+    }
+    if notional <= 0.0 {
+        return Ok(ToolOutput::err("Provide positive notional."));
+    }
+
+    let markets = match platform {
+        "polymarket" => clients.polymarket.fetch_markets(100, if query.is_empty() { None } else { Some(query) }, None).await?,
+        "kalshi" => clients.kalshi.fetch_markets(100, if query.is_empty() { None } else { Some(query) }).await?,
+        "all" => {
+            let (pm_res, kl_res) = tokio::join!(
+                clients.polymarket.fetch_markets(100, if query.is_empty() { None } else { Some(query) }, None),
+                clients.kalshi.fetch_markets(100, if query.is_empty() { None } else { Some(query) }),
+            );
+            let mut all = pm_res.unwrap_or_default();
+            all.extend(kl_res.unwrap_or_default());
+            all
+        }
+        other => return Ok(ToolOutput::err(format!("Unknown platform: {}", other))),
+    };
+
+    let market = markets.iter()
+        .find(|m| !id.is_empty() && m.id.eq_ignore_ascii_case(id))
+        .or_else(|| markets.iter().find(|m| !query.is_empty() && m.title.to_lowercase().contains(&query.to_lowercase())));
+
+    let Some(market) = market else {
+        return Ok(ToolOutput::err("Market not found for demo trade."));
+    };
+
+    let account = crate::demo::load();
+    let account = match crate::demo::buy(account, market, side, notional, rationale) {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolOutput::err(e.to_string())),
+    };
+    Ok(ToolOutput::ok(format!(
+        "Demo trade executed.\n\n{}",
+        crate::demo::summary(&account)
+    )))
+}
+
+async fn demo_limit_order(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
+    let (market, side, notional, rationale, limit_price, ttl_hours) =
+        resolve_demo_order_args(clients, args).await?;
+    let account = crate::demo::load();
+    let account = match crate::demo::place_limit_order(
+        account,
+        &market,
+        side,
+        limit_price,
+        notional,
+        ttl_hours,
+        rationale,
+    ) {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolOutput::err(e.to_string())),
+    };
+    Ok(ToolOutput::ok(format!(
+        "Demo limit order placed.\n\n{}",
+        crate::demo::summary(&account)
+    )))
+}
+
+async fn cancel_demo_order(args: &serde_json::Value) -> Result<ToolOutput> {
+    let order_id = args["order_id"].as_str().unwrap_or("").trim();
+    if order_id.is_empty() {
+        return Ok(ToolOutput::err("Provide order_id."));
+    }
+    let account = crate::demo::load();
+    let account = match crate::demo::cancel_order(account, order_id) {
+        Ok(a) => a,
+        Err(e) => return Ok(ToolOutput::err(e.to_string())),
+    };
+    Ok(ToolOutput::ok(format!(
+        "Demo order cancelled.\n\n{}",
+        crate::demo::summary(&account)
+    )))
+}
+
+async fn resolve_demo_order_args(
+    clients: &MarketClients,
+    args: &serde_json::Value,
+) -> Result<(crate::markets::Market, crate::portfolio::Side, f64, String, f64, Option<i64>)> {
+    let platform = args["platform"].as_str().unwrap_or("polymarket");
+    let id = args["market_id"].as_str().unwrap_or("").trim();
+    let query = args["query"].as_str().unwrap_or("").trim();
+    let side = crate::portfolio::Side::from_str(args["side"].as_str().unwrap_or("yes"));
+    let notional = args["notional"].as_f64().unwrap_or(0.0);
+    let rationale = args["rationale"].as_str().unwrap_or("LLM demo order").to_string();
+    let limit_price = args["limit_price"].as_f64().unwrap_or(0.0);
+    let ttl_hours = args["ttl_hours"].as_i64();
+
+    if id.is_empty() && query.is_empty() {
+        anyhow::bail!("Provide market_id or query.");
+    }
+    if notional <= 0.0 {
+        anyhow::bail!("Provide positive notional.");
+    }
+    if !(0.0..=1.0).contains(&limit_price) || limit_price <= 0.0 {
+        anyhow::bail!("Provide limit_price between 0 and 1.");
+    }
+
+    let markets = match platform {
+        "polymarket" => clients.polymarket.fetch_markets(100, if query.is_empty() { None } else { Some(query) }, None).await?,
+        "kalshi" => clients.kalshi.fetch_markets(100, if query.is_empty() { None } else { Some(query) }).await?,
+        "all" => {
+            let (pm_res, kl_res) = tokio::join!(
+                clients.polymarket.fetch_markets(100, if query.is_empty() { None } else { Some(query) }, None),
+                clients.kalshi.fetch_markets(100, if query.is_empty() { None } else { Some(query) }),
+            );
+            let mut all = pm_res.unwrap_or_default();
+            all.extend(kl_res.unwrap_or_default());
+            all
+        }
+        other => anyhow::bail!("Unknown platform: {}", other),
+    };
+
+    let market = markets.iter()
+        .find(|m| !id.is_empty() && m.id.eq_ignore_ascii_case(id))
+        .or_else(|| markets.iter().find(|m| !query.is_empty() && m.title.to_lowercase().contains(&query.to_lowercase())))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Market not found for demo order."))?;
+
+    Ok((market, side, notional, rationale, limit_price, ttl_hours))
+}
+
 /// Return the watchlist with alert thresholds.
 async fn get_watchlist() -> Result<ToolOutput> {
     let wl = crate::portfolio::load_watchlist();
@@ -4222,6 +4383,98 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                 Refreshes mark prices from live market data before computing. \
                 Use after get_portfolio to quantify downside risk.".into(),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "init_demo_account".into(),
+            description: "Initialize or reset the local paper-trading demo account with a fixed cash bankroll. \
+                This is simulation only and never places real exchange orders. Use before demo_trade when \
+                the user asks the AI to auto-trade with a specified demo amount.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "cash": {
+                        "type": "number",
+                        "description": "Starting demo bankroll in dollars, e.g. 10000."
+                    }
+                },
+                "required": ["cash"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_demo_account".into(),
+            description: "Return the local paper-trading account with cash, equity, P&L, positions, \
+                and recent demo trades. Refreshes marks from live market data when available.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "demo_trade".into(),
+            description: "Place a paper trade in the local demo account. This never sends real orders. \
+                The tool buys YES or NO with a dollar notional from demo cash using the current market price. \
+                Always keep notional within the user's stated demo bankroll/risk limit and include a rationale.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "enum": ["polymarket", "kalshi", "all"],
+                        "description": "Platform to search/trade. Default polymarket."
+                    },
+                    "market_id": {
+                        "type": "string",
+                        "description": "Exact market ID. Preferred when known."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Market title search fallback if market_id is not known."
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["yes", "no"],
+                        "description": "Side to buy."
+                    },
+                    "notional": {
+                        "type": "number",
+                        "description": "Dollar amount of demo cash to spend."
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Short reason for the paper trade."
+                    }
+                },
+                "required": ["side", "notional"]
+            }),
+        },
+        ToolDefinition {
+            name: "demo_limit_order".into(),
+            description: "Place a paper limit order in the local demo account. Cash is reserved, \
+                the order remains open across restarts, and WhoIsSharp auto-fills it on market refresh \
+                when the current YES/NO price is at or below the limit. This lets the AI wait for better entry.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "platform": { "type": "string", "enum": ["polymarket", "kalshi", "all"] },
+                    "market_id": { "type": "string", "description": "Exact market ID, preferred when known." },
+                    "query": { "type": "string", "description": "Market title search fallback." },
+                    "side": { "type": "string", "enum": ["yes", "no"] },
+                    "limit_price": { "type": "number", "description": "Maximum side price to pay, 0-1." },
+                    "notional": { "type": "number", "description": "Demo dollars to reserve." },
+                    "ttl_hours": { "type": "integer", "description": "Optional expiry in hours. If omitted, good-till-cancelled." },
+                    "rationale": { "type": "string", "description": "Why this resting order should exist." }
+                },
+                "required": ["side", "limit_price", "notional"]
+            }),
+        },
+        ToolDefinition {
+            name: "cancel_demo_order".into(),
+            description: "Cancel an open paper limit order and release its reserved demo cash. \
+                Use when the thesis changes or the order is no longer attractive.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "order_id": { "type": "string", "description": "Order ID or unique prefix shown by get_demo_account." }
+                },
+                "required": ["order_id"]
+            }),
         },
         ToolDefinition {
             name: "get_watchlist".into(),

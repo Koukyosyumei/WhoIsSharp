@@ -1148,6 +1148,14 @@ fn render_desk_summary(f: &mut Frame, area: Rect, app: &App) {
     let three_star = app.signals.iter().filter(|s| s.stars >= 3).count();
     let sim_tail = app.simulation_result.as_ref().map(|r| r.p05_pnl);
     let sim_color = sim_tail.map(|v| if v < 0.0 { Color::Red } else { Color::Green }).unwrap_or(Color::DarkGray);
+    let mut demo = crate::demo::load();
+    demo.update_marks(&app.markets);
+    let demo_label = if demo.enabled {
+        format!("${:.0} {:+.1}%", demo.equity(), if demo.starting_cash > 1e-9 { demo.pnl() / demo.starting_cash * 100.0 } else { 0.0 })
+    } else {
+        "off".to_string()
+    };
+    let demo_color = if !demo.enabled { Color::DarkGray } else if demo.pnl() >= 0.0 { Color::Green } else { Color::Red };
 
     let lines = vec![
         Line::from(vec![
@@ -1168,6 +1176,8 @@ fn render_desk_summary(f: &mut Frame, area: Rect, app: &App) {
             desk_metric("Signals", &format!("{} / {} hot", app.signals.len(), three_star), Color::Yellow),
             Span::raw("   "),
             desk_metric("5% Sim", &sim_tail.map(|v| format!("{:+.2}", v)).unwrap_or_else(|| "not run".into()), sim_color),
+            Span::raw("   "),
+            desk_metric("Demo", &demo_label, demo_color),
         ]),
     ];
 
@@ -4201,6 +4211,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/calibration", "Export price calibration buckets"),
         kv("/book", "Export professional book review"),
         kv("/simulate  or  /sim", "Run sandboxed Monte Carlo portfolio simulation"),
+        kv("/demo <cash>", "Start/reset paper-trading demo mode"),
+        kv("/demo buy <dollars> yes|no", "Paper-buy selected market"),
+        kv("/demo order <dollars> yes|no <limit¢>", "Place paper limit order"),
+        kv("/demo cancel <id>", "Cancel paper limit order"),
         kv("/help  or  /?  or  ?", "Toggle this help overlay"),
         kv("/persona  or  /mode", "Cycle AI analyst persona  (Default → Contrarian → Macro → SmartMoney)"),
         kv("/split  or  /sp", "Toggle split-pane layout  (market list + chart side-by-side)"),
@@ -4657,6 +4671,13 @@ pub async fn run_tui(
                         app.update_portfolio_marks();
                         app.check_position_alerts();
                         app.check_watch_alerts();
+                        let mut demo = crate::demo::load();
+                        if demo.enabled {
+                            demo.update_marks(&app.markets);
+                            if let Ok(events) = crate::demo::process_orders(&mut demo, &app.markets) {
+                                app.watch_alerts.extend(events);
+                            }
+                        }
 
                         // Recompute signals with velocity and dismissed state
                         let sigs = signals::compute_signals(
@@ -5517,6 +5538,94 @@ async fn dispatch_slash_command(
         }
 
         // ── Professional research ledger / analytics ─────────────────────────
+        "demo" | "paper" => {
+            let rest = raw.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+            if rest.is_empty() {
+                let mut account = crate::demo::load();
+                account.update_marks(&app.markets);
+                let _ = crate::demo::save(&account);
+                app.status = save_named_text_report("demo_account", &crate::demo::summary(&account));
+            } else if let Some(amount) = rest.parse::<f64>().ok() {
+                app.status = match crate::demo::reset(amount) {
+                    Ok(account) => format!("Demo mode enabled with ${:.2} paper cash.", account.cash),
+                    Err(e) => format!("Demo reset failed: {}", e),
+                };
+            } else if rest.starts_with("order ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() < 4 {
+                    app.status = "Usage: /demo order <dollars> yes|no <limit¢> [ttl_hours]".to_string();
+                } else if let (Ok(notional), Ok(limit_cents)) = (parts[1].parse::<f64>(), parts[3].parse::<f64>()) {
+                    let side = Side::from_str(parts[2]);
+                    let ttl = parts.get(4).and_then(|s| s.parse::<i64>().ok());
+                    if let Some(market) = app.selected_market().cloned() {
+                        let account = crate::demo::load();
+                        app.status = match crate::demo::place_limit_order(
+                            account,
+                            &market,
+                            side,
+                            limit_cents / 100.0,
+                            notional,
+                            ttl,
+                            "manual TUI limit order",
+                        ) {
+                            Ok(account) => format!(
+                                "Demo order placed. Cash ${:.2}, reserved ${:.2}",
+                                account.cash,
+                                account.reserved_cash(),
+                            ),
+                            Err(e) => format!("Demo order failed: {}", e),
+                        };
+                    } else {
+                        app.status = "Select a market first.".to_string();
+                    }
+                } else {
+                    app.status = "Usage: /demo order <dollars> yes|no <limit¢> [ttl_hours]".to_string();
+                }
+            } else if rest.starts_with("cancel ") {
+                let order_id = rest.split_whitespace().nth(1).unwrap_or("");
+                let account = crate::demo::load();
+                app.status = match crate::demo::cancel_order(account, order_id) {
+                    Ok(account) => format!(
+                        "Demo order cancelled. Cash ${:.2}, reserved ${:.2}",
+                        account.cash,
+                        account.reserved_cash(),
+                    ),
+                    Err(e) => format!("Cancel failed: {}", e),
+                };
+            } else if rest.starts_with("buy ") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() < 3 {
+                    app.status = "Usage: /demo buy <dollars> yes|no".to_string();
+                } else if let Ok(notional) = parts[1].parse::<f64>() {
+                    let side = Side::from_str(parts[2]);
+                    if let Some(market) = app.selected_market().cloned() {
+                        let account = crate::demo::load();
+                        app.status = match crate::demo::buy(
+                            account,
+                            &market,
+                            side,
+                            notional,
+                            "manual TUI demo trade",
+                        ) {
+                            Ok(account) => format!(
+                                "Demo BUY saved. Cash ${:.2}, equity ${:.2}",
+                                account.cash,
+                                account.equity(),
+                            ),
+                            Err(e) => format!("Demo trade failed: {}", e),
+                        };
+                    } else {
+                        app.status = "Select a market first.".to_string();
+                    }
+                } else {
+                    app.status = "Usage: /demo buy <dollars> yes|no".to_string();
+                }
+            } else {
+                app.status = "Usage: /demo <cash> | /demo | /demo buy <dollars> yes|no | /demo order <dollars> yes|no <limit¢> [ttl] | /demo cancel <id>".to_string();
+            }
+            SlashCmd::Handled
+        }
+
         "thesis" => {
             let note = raw.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
             if note.is_empty() {
@@ -5712,6 +5821,7 @@ fn rebuild_fuzzy_matches(app: &mut App) {
         ("calibration", "Export calibration buckets"),
         ("book",      "Export professional book review"),
         ("simulate",  "Run portfolio simulation"),
+        ("demo",      "Paper-trading demo account"),
         ("help",      "Show help overlay"),
     ];
 

@@ -13,6 +13,7 @@
 mod agent;
 mod cache;
 mod config;
+mod demo;
 mod fred;
 mod http;
 mod llm;
