@@ -68,6 +68,8 @@ const TIPS: &[&str] = &[
     "Type /wf to focus on starred markets only",
     "Type /dismiss on a signal to hide it for the current session",
     "Type /risk in Portfolio to toggle the risk/exposure view",
+    "Type /thesis <note> to log a research thesis for the selected market",
+    "Type /backtest or /calibration to export professional signal analytics",
     "Press Ctrl+K to open the fuzzy search — find markets and commands instantly",
     "Press Alt+S or type /split to toggle split-pane mode (market list + chart)",
     "Type /persona to cycle AI analyst style: Default → Contrarian → Macro → SmartMoney",
@@ -3860,6 +3862,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/lower  /  /raise", "Adjust threshold  (also: [ / ] keys)"),
         kv("/export  or  /csv", "Export current tab to CSV"),
         kv("/report  or  /m", "Export Markdown report for selected market"),
+        kv("/thesis <note>", "Log a research thesis for the selected market"),
+        kv("/ledger", "Export the local thesis ledger"),
+        kv("/backtest", "Export signal mark-to-market analytics"),
+        kv("/calibration", "Export price calibration buckets"),
+        kv("/book", "Export professional book review"),
         kv("/help  or  /?  or  ?", "Toggle this help overlay"),
         kv("/persona  or  /mode", "Cycle AI analyst persona  (Default → Contrarian → Macro → SmartMoney)"),
         kv("/split  or  /sp", "Toggle split-pane layout  (market list + chart side-by-side)"),
@@ -4321,6 +4328,7 @@ pub async fn run_tui(
                         );
                         app.prev_prices = prev;
                         app.signals = sigs;
+                        let _ = crate::research::append_signal_snapshot(&app.signals);
                         if app.signal_list.selected().is_none() && !app.signals.is_empty() {
                             app.signal_list.select(Some(0));
                         }
@@ -5163,6 +5171,45 @@ async fn dispatch_slash_command(
             SlashCmd::Handled
         }
 
+        // ── Professional research ledger / analytics ─────────────────────────
+        "thesis" => {
+            let note = raw.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+            if note.is_empty() {
+                app.status = "Usage: /thesis <your market thesis / invalidation note>".to_string();
+            } else if let Some(m) = app.selected_market().cloned() {
+                match crate::research::add_thesis(crate::research::thesis_from_market(&m, note)) {
+                    Ok(t) => app.status = format!("Thesis logged [{}] for {}", &t.id[..8], trunc(&t.title, 36)),
+                    Err(e) => app.status = format!("Thesis save failed: {}", e),
+                }
+            } else {
+                app.status = "Select a market first.".to_string();
+            }
+            SlashCmd::Handled
+        }
+
+        "ledger" => {
+            app.status = save_named_text_report("ledger", &crate::research::thesis_report());
+            SlashCmd::Handled
+        }
+
+        "backtest" => {
+            app.status = save_named_text_report("signal_backtest", &crate::research::backtest_report());
+            SlashCmd::Handled
+        }
+
+        "calibration" | "calib" => {
+            app.status = save_named_text_report("calibration", &crate::research::calibration_report());
+            SlashCmd::Handled
+        }
+
+        "book" | "review" => {
+            app.status = match crate::research::save_professional_report(&app.portfolio, &app.markets, &app.signals) {
+                Ok(path) => format!("Book review saved: {}", path.display()),
+                Err(e) => format!("Book review failed: {}", e),
+            };
+            SlashCmd::Handled
+        }
+
         // ── AI analyze ────────────────────────────────────────────────────────
         "a" | "analyze" => {
             let info = analyze_target(app);
@@ -5296,6 +5343,11 @@ fn rebuild_fuzzy_matches(app: &mut App) {
         ("kelly",     "Open Kelly position-size calculator"),
         ("risk",      "Toggle risk/exposure view"),
         ("export",    "Export current tab to CSV"),
+        ("thesis",    "Log thesis for selected market"),
+        ("ledger",    "Export research ledger"),
+        ("backtest",  "Export signal analytics"),
+        ("calibration", "Export calibration buckets"),
+        ("book",      "Export professional book review"),
         ("help",      "Show help overlay"),
     ];
 
@@ -6782,6 +6834,21 @@ fn export_markdown_report(app: &App) -> String {
     let path = dir.join(&filename);
     match std::fs::write(&path, &md) {
         Ok(_)  => format!("Report saved: ~/.whoissharp/reports/{}", filename),
+        Err(e) => format!("Export failed: {}", e),
+    }
+}
+
+fn save_named_text_report(prefix: &str, content: &str) -> String {
+    let mut dir = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push(".whoissharp");
+    dir.push("reports");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "Export failed: cannot create reports directory".to_string();
+    }
+    let filename = format!("{}_{}.txt", prefix, chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let path = dir.join(&filename);
+    match std::fs::write(&path, content) {
+        Ok(_) => format!("Report saved: {}", path.display()),
         Err(e) => format!("Export failed: {}", e),
     }
 }

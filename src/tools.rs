@@ -97,6 +97,11 @@ async fn dispatch_inner(
         "get_portfolio_risk"   => get_portfolio_risk(clients).await,
         "get_watchlist"        => get_watchlist().await,
         "get_signals"          => get_signals(clients).await,
+        "create_thesis"        => create_thesis(args).await,
+        "get_research_ledger"  => get_research_ledger().await,
+        "get_signal_backtest"  => get_signal_backtest().await,
+        "get_calibration"      => get_calibration().await,
+        "get_professional_report" => get_professional_report(clients).await,
         "get_macro"            => get_macro(clients).await,
         "search_news"          => search_news(clients, args).await,
         "get_market_news"      => get_market_news(clients, args).await,
@@ -3598,6 +3603,78 @@ async fn get_signals(clients: &MarketClients) -> Result<ToolOutput> {
     Ok(ToolOutput::ok(lines.join("\n")))
 }
 
+async fn create_thesis(args: &serde_json::Value) -> Result<ToolOutput> {
+    let platform = match args["platform"].as_str().unwrap_or("polymarket") {
+        "polymarket" => crate::markets::Platform::Polymarket,
+        "kalshi"     => crate::markets::Platform::Kalshi,
+        other        => return Ok(ToolOutput::err(format!("Unknown platform: {}", other))),
+    };
+    let market_id = args["market_id"].as_str().unwrap_or("").trim();
+    let title = args["title"].as_str().unwrap_or("").trim();
+    let thesis_text = args["thesis"].as_str().unwrap_or("").trim();
+    if market_id.is_empty() || title.is_empty() || thesis_text.is_empty() {
+        return Ok(ToolOutput::err("Required: platform, market_id, title, thesis"));
+    }
+
+    let thesis = crate::research::Thesis {
+        id: String::new(),
+        created_at: chrono::Utc::now(),
+        platform,
+        market_id: market_id.to_string(),
+        title: title.to_string(),
+        side: crate::portfolio::Side::from_str(args["side"].as_str().unwrap_or("yes")),
+        entry_price: args["entry_price"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0),
+        fair_value: args["fair_value"].as_f64().unwrap_or_else(|| args["entry_price"].as_f64().unwrap_or(0.5)).clamp(0.0, 1.0),
+        confidence: args["confidence"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0),
+        thesis: thesis_text.to_string(),
+        catalyst: args["catalyst"].as_str().unwrap_or("").to_string(),
+        invalidation: args["invalidation"].as_str().unwrap_or("").to_string(),
+        status: crate::research::ThesisStatus::Open,
+        exit_price: None,
+        outcome: None,
+    };
+    let saved = crate::research::add_thesis(thesis)?;
+    Ok(ToolOutput::ok(format!(
+        "Thesis logged [{}]\n{} {} @ {:.1}¢, fair value {:.1}¢, confidence {:.0}%\n{}",
+        &saved.id[..saved.id.len().min(8)],
+        saved.platform.label(),
+        saved.side.label(),
+        saved.entry_price * 100.0,
+        saved.fair_value * 100.0,
+        saved.confidence * 100.0,
+        saved.thesis,
+    )))
+}
+
+async fn get_research_ledger() -> Result<ToolOutput> {
+    Ok(ToolOutput::ok(crate::research::thesis_report()))
+}
+
+async fn get_signal_backtest() -> Result<ToolOutput> {
+    Ok(ToolOutput::ok(crate::research::backtest_report()))
+}
+
+async fn get_calibration() -> Result<ToolOutput> {
+    Ok(ToolOutput::ok(crate::research::calibration_report()))
+}
+
+async fn get_professional_report(clients: &MarketClients) -> Result<ToolOutput> {
+    let (pm_res, kl_res) = tokio::join!(
+        clients.polymarket.fetch_markets(50, None, None),
+        clients.kalshi.fetch_markets(50, None),
+    );
+    let mut markets = pm_res.unwrap_or_default();
+    markets.extend(kl_res.unwrap_or_default());
+    let signals = crate::signals::compute_signals(
+        &markets,
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    );
+    let mut portfolio = crate::portfolio::load_portfolio();
+    portfolio.update_marks(markets.iter().map(|m| (m.platform.clone(), m.id.clone(), m.yes_price)));
+    Ok(ToolOutput::ok(crate::research::professional_report(&portfolio, &markets, &signals)))
+}
+
 /// Fetch the FRED macro snapshot (FEDFUNDS, 5y breakeven inflation, UNRATE, 10Y).
 async fn get_macro(clients: &MarketClients) -> Result<ToolOutput> {
     let fred = match &clients.fred {
@@ -4138,6 +4215,52 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
                 MOMT (momentum), THIN (low-liquidity), and 50/50 (near-50% uncertainty) signals, \
                 ranked by star rating and EV score. Best used as a starting point for a session — \
                 scan signals first, then deep-dive on the ones that fire.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "create_thesis".into(),
+            description: "Persist a professional research thesis for a market: fair value, \
+                confidence, catalyst, invalidation condition, and side. Use this after completing \
+                analysis so the trader can later audit process quality and compare thesis to outcome.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "platform": { "type": "string", "enum": ["polymarket", "kalshi"] },
+                    "market_id": { "type": "string", "description": "ConditionId for Polymarket or ticker for Kalshi." },
+                    "title": { "type": "string", "description": "Market title." },
+                    "side": { "type": "string", "enum": ["yes", "no"], "description": "Recommended side. Default yes." },
+                    "entry_price": { "type": "number", "description": "Current side price, 0-1." },
+                    "fair_value": { "type": "number", "description": "Analyst fair probability for the side, 0-1." },
+                    "confidence": { "type": "number", "description": "Confidence in the thesis, 0-1." },
+                    "thesis": { "type": "string", "description": "Concise investment thesis." },
+                    "catalyst": { "type": "string", "description": "Expected catalyst or path to repricing." },
+                    "invalidation": { "type": "string", "description": "What would make the thesis wrong." }
+                },
+                "required": ["platform", "market_id", "title", "thesis"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_research_ledger".into(),
+            description: "Return the local thesis ledger: open research notes, fair values, \
+                confidence, catalysts, and invalidation conditions.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_signal_backtest".into(),
+            description: "Return mark-to-market signal analytics by signal type. This is a \
+                process-quality backtest based on repeated observed marks, not final market resolutions.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_calibration".into(),
+            description: "Return calibration buckets comparing observed signal prices with latest \
+                observed marks. Useful for seeing whether 20-30%, 50-60%, etc. signals are drifting as expected.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_professional_report".into(),
+            description: "Generate a professional book review combining local thesis ledger, \
+                portfolio exposure clusters, current signals, mark-to-market backtest, and calibration.".into(),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
         ToolDefinition {

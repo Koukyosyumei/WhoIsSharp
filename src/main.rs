@@ -21,6 +21,7 @@ mod mcp;
 mod news;
 mod pairs;
 mod portfolio;
+mod research;
 mod risk;
 mod signals;
 mod tools;
