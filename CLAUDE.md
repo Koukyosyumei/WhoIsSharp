@@ -12,6 +12,8 @@ cargo run --release -- --backend gemini                                  # Verte
 cargo run --release -- --backend openai                                  # OpenAI (OPENAI_API_KEY)
 cargo run --release -- --backend ollama --model llama3.2                 # local Ollama
 cargo run --release -- --backend anthropic --model claude-opus-4-6
+cargo run --release -- --backend claude-code                             # Claude Code CLI headless (no API key — uses your claude login)
+cargo run --release -- --backend codex                                   # Codex CLI headless (no API key — uses your `codex login`)
 cargo run --release -- --help                                            # flag reference
 ```
 
@@ -22,13 +24,15 @@ cargo test --release
 
 ## Credentials — never hardcode
 
-| Backend   | Required env vars                                           | Optional env vars               |
-|-----------|-------------------------------------------------------------|---------------------------------|
-| (none)    | —                                                           | —                               |
-| Anthropic | `ANTHROPIC_API_KEY`                                         | —                               |
-| Gemini    | `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_PROJECT_ID`     | `GOOGLE_LOCATION` (default: us-central1) |
-| OpenAI    | `OPENAI_API_KEY`                                            | `OPENAI_BASE_URL`               |
-| Ollama    | —                                                           | `OLLAMA_BASE_URL`               |
+| Backend       | Required env vars                                           | Optional env vars               |
+|---------------|-------------------------------------------------------------|---------------------------------|
+| (none)        | —                                                           | —                               |
+| Anthropic     | `ANTHROPIC_API_KEY`                                         | —                               |
+| Gemini        | `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_PROJECT_ID`     | `GOOGLE_LOCATION` (default: us-central1) |
+| OpenAI        | `OPENAI_API_KEY`                                            | `OPENAI_BASE_URL`               |
+| Ollama        | —                                                           | `OLLAMA_BASE_URL`               |
+| claude-code   | — (uses existing `claude` CLI login — Claude Code subscription) | `WHOISSHARP_MODEL` (passed as `claude --model`) |
+| codex         | — (uses existing `codex login`)                              | `WHOISSHARP_MODEL` (passed as `codex --model`) |
 
 Gemini can also use CLI flags: `--credentials /path/to/key.json --project my-project --location us-central1`
 
@@ -48,11 +52,39 @@ src/
     ├── polymarket.rs Polymarket Gamma + CLOB API client
     └── kalshi.rs    Kalshi Trade API v2 client
 └── llm/
-    ├── mod.rs       LlmBackend trait + universal types (same pattern as KaijuLab)
-    ├── anthropic.rs Anthropic Claude — x-api-key auth
-    ├── gemini.rs    Google Gemini — generativelanguage.googleapis.com + API key
-    └── openai.rs    OpenAI + Ollama — OpenAI-compatible /chat/completions
+    ├── mod.rs              LlmBackend trait + universal types (same pattern as KaijuLab)
+    ├── anthropic.rs        Anthropic Claude — x-api-key auth
+    ├── gemini.rs           Google Gemini — generativelanguage.googleapis.com + API key
+    ├── openai.rs           OpenAI + Ollama — OpenAI-compatible /chat/completions
+    ├── claude_headless.rs  Claude Code CLI — spawns `claude -p` per turn, MCP-wired to ourselves
+    └── codex_headless.rs   Codex CLI — spawns `codex exec` per turn, MCP-wired to ourselves
 ```
+
+## Headless CLI backends (`claude-code` / `codex`)
+
+These two backends do not call any HTTP API directly. They spawn the user's
+locally-installed `claude` (Claude Code) or `codex` (Codex CLI) as a subprocess
+per turn, configured to use **this binary in `--mcp` mode** as their only MCP
+server. The CLI handles its own internal tool-call loop; we receive the final
+text back via streaming JSON output.
+
+```
+WhoIsSharp TUI  ──spawns──►  claude -p "..." --mcp-config ...
+                                 └─spawns──►  whoissharp --mcp  (our binary, MCP mode)
+                                                  └─ serves list_markets, get_orderbook, …
+```
+
+Implications:
+- No API key required — uses the user's existing `claude` / `codex login`.
+- Conversation continuity: history is stuffed into the system prompt as a
+  transcript each turn (stateless; no `--resume` session tracking yet).
+- The agent loop in `agent.rs` runs once per user message because these backends
+  never return tool calls — Claude / Codex handle tool dispatch internally and
+  emit text-only `LlmMessage` results.
+- Tool-use traces are surfaced inline in the streamed text (`→ list_markets`),
+  not as structured `AgentToolCall` events.
+- Trade-off: ~1-2s subprocess startup per turn; first token slower than direct
+  HTTP backends.
 
 ## TUI layout
 

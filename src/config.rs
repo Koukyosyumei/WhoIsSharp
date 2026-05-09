@@ -13,19 +13,28 @@ pub enum BackendKind {
     Gemini,
     OpenAi,
     Ollama,
+    /// Claude Code CLI in headless mode (`claude -p`). Uses the user's
+    /// existing Claude Code login — no API key required.
+    ClaudeHeadless,
+    /// OpenAI Codex CLI in headless mode (`codex exec`). Uses the user's
+    /// existing `codex login` — no API key required.
+    CodexHeadless,
 }
 
 impl std::str::FromStr for BackendKind {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "none" | "no" | "" => Ok(BackendKind::None),
-            "anthropic" | "claude" => Ok(BackendKind::Anthropic),
-            "gemini"    | "google" => Ok(BackendKind::Gemini),
-            "openai"    | "gpt"    => Ok(BackendKind::OpenAi),
-            "ollama"               => Ok(BackendKind::Ollama),
+            "none" | "no" | ""                                    => Ok(BackendKind::None),
+            "anthropic" | "claude"                                => Ok(BackendKind::Anthropic),
+            "gemini"    | "google"                                => Ok(BackendKind::Gemini),
+            "openai"    | "gpt"                                   => Ok(BackendKind::OpenAi),
+            "ollama"                                              => Ok(BackendKind::Ollama),
+            "claude-code" | "claude-headless" | "claude-cli"      => Ok(BackendKind::ClaudeHeadless),
+            "codex" | "codex-headless" | "codex-cli"              => Ok(BackendKind::CodexHeadless),
             _ => anyhow::bail!(
-                "Unknown backend '{}'. Choose: none, anthropic, gemini, openai, ollama", s
+                "Unknown backend '{}'. Choose: none, anthropic, gemini, openai, ollama, \
+                 claude-code, codex", s
             ),
         }
     }
@@ -56,6 +65,14 @@ pub enum BackendConfig {
     Ollama {
         base_url: String,
         model_id: String,
+    },
+    /// Spawns `claude -p` per turn; no API key, uses Claude Code subscription.
+    ClaudeHeadless {
+        model_id: Option<String>,
+    },
+    /// Spawns `codex exec` per turn; no API key, uses Codex login.
+    CodexHeadless {
+        model_id: Option<String>,
     },
 }
 
@@ -150,6 +167,20 @@ impl BackendConfig {
                     .or_else(|| std::env::var("WHOISSHARP_MODEL").ok())
                     .unwrap_or_else(|| "llama3.2".to_string());
                 Ok(BackendConfig::Ollama { base_url, model_id })
+            }
+
+            BackendKind::ClaudeHeadless => {
+                let model_id = model_override
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("WHOISSHARP_MODEL").ok());
+                Ok(BackendConfig::ClaudeHeadless { model_id })
+            }
+
+            BackendKind::CodexHeadless => {
+                let model_id = model_override
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("WHOISSHARP_MODEL").ok());
+                Ok(BackendConfig::CodexHeadless { model_id })
             }
         }
     }

@@ -4,6 +4,8 @@
 //! own wire formats.  `agent.rs` only depends on this module.
 
 pub mod anthropic;
+pub mod claude_headless;
+pub mod codex_headless;
 pub mod gemini;
 pub mod openai;
 

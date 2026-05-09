@@ -6,6 +6,8 @@
 //!   whoissharp --backend gemini                         # Vertex AI (GOOGLE_APPLICATION_CREDENTIALS + GOOGLE_PROJECT_ID)
 //!   whoissharp --backend openai                         # OpenAI (OPENAI_API_KEY)
 //!   whoissharp --backend ollama --model llama3.2        # local Ollama
+//!   whoissharp --backend claude-code                    # Claude Code CLI in headless mode (no API key — uses your Claude Code login)
+//!   whoissharp --backend codex                          # Codex CLI in headless mode (no API key — uses your `codex login`)
 //!   whoissharp --help                                   # all flags
 
 mod agent;
@@ -32,6 +34,8 @@ use clap::Parser;
 use config::{BackendConfig, BackendKind};
 use llm::{
     anthropic::AnthropicBackend,
+    claude_headless::ClaudeHeadlessBackend,
+    codex_headless::CodexHeadlessBackend,
     gemini::GeminiBackend,
     openai::OpenAiBackend,
     LlmBackend,
@@ -44,7 +48,7 @@ use tools::MarketClients;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// LLM backend: none, anthropic, gemini, openai, ollama [default: none]
+    /// LLM backend: none, anthropic, gemini, openai, ollama, claude-code, codex
     #[arg(long, short = 'b', default_value = "none")]
     backend: String,
 
@@ -148,6 +152,18 @@ async fn main() -> Result<()> {
 
         BackendConfig::Ollama { base_url, model_id } => {
             let b = OpenAiBackend::new("", &base_url, &model_id);
+            let name = b.display_name();
+            (Some(Arc::new(b)), name)
+        }
+
+        BackendConfig::ClaudeHeadless { model_id } => {
+            let b = ClaudeHeadlessBackend::new(model_id)?;
+            let name = b.display_name();
+            (Some(Arc::new(b)), name)
+        }
+
+        BackendConfig::CodexHeadless { model_id } => {
+            let b = CodexHeadlessBackend::new(model_id)?;
             let name = b.display_name();
             (Some(Arc::new(b)), name)
         }
