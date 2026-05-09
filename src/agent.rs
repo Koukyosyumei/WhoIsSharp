@@ -23,6 +23,8 @@ pub enum AppEvent {
     AgentTextChunk(String),
     AgentDone,
     AgentError(String),
+    DemoAutoStarted,
+    DemoAutoDone,
 
     // ── Signal computation ────────────────────────────────────────────────────
     SignalsComputed(Vec<Signal>),

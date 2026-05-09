@@ -52,6 +52,16 @@ pub struct DemoTrade {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemoSnapshot {
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub ts: DateTime<Utc>,
+    pub cash: f64,
+    pub reserved: f64,
+    pub position_value: f64,
+    pub equity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DemoAccount {
     pub enabled: bool,
     pub starting_cash: f64,
@@ -60,6 +70,18 @@ pub struct DemoAccount {
     #[serde(default)]
     pub open_orders: Vec<DemoOrder>,
     pub trades: Vec<DemoTrade>,
+    #[serde(default)]
+    pub snapshots: Vec<DemoSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemoAutoConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub max_trade_notional_pct: f64,
+    pub max_position_pct: f64,
+    pub min_cash_pct: f64,
+    pub last_run_ts: i64,
 }
 
 impl Default for DemoAccount {
@@ -71,6 +93,20 @@ impl Default for DemoAccount {
             positions: Vec::new(),
             open_orders: Vec::new(),
             trades: Vec::new(),
+            snapshots: Vec::new(),
+        }
+    }
+}
+
+impl Default for DemoAutoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 900,
+            max_trade_notional_pct: 0.03,
+            max_position_pct: 0.10,
+            min_cash_pct: 0.20,
+            last_run_ts: 0,
         }
     }
 }
@@ -86,6 +122,10 @@ impl DemoAccount {
 
     pub fn equity(&self) -> f64 {
         self.cash + self.reserved_cash() + self.positions.iter().map(|p| p.market_value()).sum::<f64>()
+    }
+
+    pub fn position_value(&self) -> f64 {
+        self.positions.iter().map(|p| p.market_value()).sum()
     }
 
     pub fn pnl(&self) -> f64 {
@@ -125,6 +165,13 @@ fn demo_path() -> PathBuf {
     p
 }
 
+fn demo_auto_path() -> PathBuf {
+    let mut p = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".whoissharp");
+    p.push("demo_auto.json");
+    p
+}
+
 pub fn load() -> DemoAccount {
     let path = demo_path();
     if !path.exists() {
@@ -133,6 +180,17 @@ pub fn load() -> DemoAccount {
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default()
+}
+
+pub fn load_auto_config() -> DemoAutoConfig {
+    let path = demo_auto_path();
+    if !path.exists() {
+        return DemoAutoConfig::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
@@ -147,6 +205,17 @@ pub fn save(account: &DemoAccount) -> Result<()> {
     Ok(())
 }
 
+pub fn save_auto_config(config: &DemoAutoConfig) -> Result<()> {
+    let path = demo_auto_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_string_pretty(config)?;
+    std::fs::write(&path, data)
+        .with_context(|| format!("Cannot write demo automation config to '{}'", path.display()))?;
+    Ok(())
+}
+
 pub fn reset(starting_cash: f64) -> Result<DemoAccount> {
     if starting_cash <= 0.0 {
         return Err(anyhow!("Starting cash must be positive."));
@@ -158,7 +227,10 @@ pub fn reset(starting_cash: f64) -> Result<DemoAccount> {
         positions: Vec::new(),
         open_orders: Vec::new(),
         trades: Vec::new(),
+        snapshots: Vec::new(),
     };
+    let mut account = account;
+    record_snapshot(&mut account);
     save(&account)?;
     Ok(account)
 }
@@ -197,6 +269,7 @@ pub fn place_limit_order(
     };
     account.cash -= notional;
     account.open_orders.push(order);
+    record_snapshot(&mut account);
     save(&account)?;
     Ok(account)
 }
@@ -210,6 +283,7 @@ pub fn cancel_order(mut account: DemoAccount, order_id: &str) -> Result<DemoAcco
     }
     order.status = DemoOrderStatus::Cancelled;
     account.cash += order.notional;
+    record_snapshot(&mut account);
     save(&account)?;
     Ok(account)
 }
@@ -270,6 +344,9 @@ pub fn process_orders(account: &mut DemoAccount, markets: &[Market]) -> Result<V
             ));
         }
     }
+    if !events.is_empty() {
+        record_snapshot(account);
+    }
     save(account)?;
     Ok(events)
 }
@@ -321,8 +398,32 @@ pub fn buy(
         notional,
         rationale,
     });
+    record_snapshot(&mut account);
     save(&account)?;
     Ok(account)
+}
+
+pub fn record_snapshot(account: &mut DemoAccount) {
+    if !account.enabled {
+        return;
+    }
+    let snap = DemoSnapshot {
+        ts: Utc::now(),
+        cash: account.cash,
+        reserved: account.reserved_cash(),
+        position_value: account.position_value(),
+        equity: account.equity(),
+    };
+    let should_push = account.snapshots.last()
+        .map(|last| (last.equity - snap.equity).abs() > 0.01 || (snap.ts - last.ts).num_minutes() >= 5)
+        .unwrap_or(true);
+    if should_push {
+        account.snapshots.push(snap);
+        if account.snapshots.len() > 20_000 {
+            let keep_from = account.snapshots.len() - 20_000;
+            account.snapshots = account.snapshots.split_off(keep_from);
+        }
+    }
 }
 
 pub fn summary(account: &DemoAccount) -> String {
@@ -374,6 +475,90 @@ pub fn summary(account: &DemoAccount) -> String {
         }
     }
     lines.join("\n")
+}
+
+pub fn backtest_report(account: &DemoAccount) -> String {
+    if !account.enabled {
+        return "Demo mode is disabled. Run /demo <cash> to start collecting performance history.".to_string();
+    }
+
+    let equity = account.equity();
+    let pnl = account.pnl();
+    let ret_pct = if account.starting_cash > 1e-9 { pnl / account.starting_cash * 100.0 } else { 0.0 };
+    let reserved = account.reserved_cash();
+    let invested = account.position_value();
+    let cash_drag = if equity > 1e-9 { account.cash / equity * 100.0 } else { 0.0 };
+    let exposure = if equity > 1e-9 { invested / equity * 100.0 } else { 0.0 };
+
+    let open_orders = account.open_orders.iter().filter(|o| o.status == DemoOrderStatus::Open).count();
+    let filled_orders = account.open_orders.iter().filter(|o| o.status == DemoOrderStatus::Filled).count();
+    let cancelled_orders = account.open_orders.iter().filter(|o| o.status == DemoOrderStatus::Cancelled).count();
+    let expired_orders = account.open_orders.iter().filter(|o| o.status == DemoOrderStatus::Expired).count();
+    let decided_orders = filled_orders + cancelled_orders + expired_orders;
+    let fill_rate = if decided_orders > 0 { filled_orders as f64 / decided_orders as f64 * 100.0 } else { 0.0 };
+
+    let winners: Vec<&Position> = account.positions.iter().filter(|p| p.pnl() > 0.0).collect();
+    let losers: Vec<&Position> = account.positions.iter().filter(|p| p.pnl() < 0.0).collect();
+    let hit_rate = if account.positions.is_empty() { 0.0 } else { winners.len() as f64 / account.positions.len() as f64 * 100.0 };
+    let gross_win: f64 = winners.iter().map(|p| p.pnl()).sum();
+    let gross_loss: f64 = losers.iter().map(|p| p.pnl().abs()).sum();
+    let profit_factor = if gross_loss > 1e-9 { gross_win / gross_loss } else if gross_win > 0.0 { f64::INFINITY } else { 0.0 };
+    let avg_win = if winners.is_empty() { 0.0 } else { gross_win / winners.len() as f64 };
+    let avg_loss = if losers.is_empty() { 0.0 } else { -gross_loss / losers.len() as f64 };
+    let turnover = if account.starting_cash > 1e-9 {
+        account.trades.iter().map(|t| t.notional).sum::<f64>() / account.starting_cash * 100.0
+    } else {
+        0.0
+    };
+    let max_dd = max_drawdown(&account.snapshots);
+
+    let mut lines = vec![
+        "=== DEMO TRADING BACKTEST ===".to_string(),
+        format!("Snapshots:       {}", account.snapshots.len()),
+        format!("Trades/fills:    {}", account.trades.len()),
+        format!("Return:          {:+.2} ({:+.2}%)", pnl, ret_pct),
+        format!("Max drawdown:    {:.2}%", max_dd * 100.0),
+        format!("Equity:          ${:.2}", equity),
+        format!("Cash / reserved: ${:.2} / ${:.2}", account.cash, reserved),
+        format!("Exposure:        {:.1}% invested, {:.1}% idle cash", exposure, cash_drag),
+        String::new(),
+        "--- Order discipline ---".to_string(),
+        format!("Open / filled / cancelled / expired: {} / {} / {} / {}", open_orders, filled_orders, cancelled_orders, expired_orders),
+        format!("Limit fill rate: {:.1}%", fill_rate),
+        format!("Turnover:        {:.1}% of starting cash", turnover),
+        String::new(),
+        "--- Mark-to-market position quality ---".to_string(),
+        format!("Hit rate:        {:.1}%  ({} winners / {} positions)", hit_rate, winners.len(), account.positions.len()),
+        format!("Avg win/loss:    {:+.2} / {:+.2}", avg_win, avg_loss),
+        format!("Profit factor:   {}", if profit_factor.is_infinite() { "∞".to_string() } else { format!("{:.2}", profit_factor) }),
+    ];
+
+    let mut by_pnl: Vec<&Position> = account.positions.iter().collect();
+    by_pnl.sort_by(|a, b| a.pnl().partial_cmp(&b.pnl()).unwrap_or(std::cmp::Ordering::Equal));
+    if !by_pnl.is_empty() {
+        lines.push(String::new());
+        lines.push("--- Biggest mark-to-market drivers ---".to_string());
+        for p in by_pnl.iter().take(3) {
+            lines.push(format!("LOSS {:+.2}  {}", p.pnl(), trunc(&p.title, 54)));
+        }
+        for p in by_pnl.iter().rev().take(3) {
+            lines.push(format!("GAIN {:+.2}  {}", p.pnl(), trunc(&p.title, 54)));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn max_drawdown(snaps: &[DemoSnapshot]) -> f64 {
+    let mut peak = 0.0_f64;
+    let mut max_dd = 0.0_f64;
+    for s in snaps {
+        peak = peak.max(s.equity);
+        if peak > 1e-9 {
+            max_dd = max_dd.max((peak - s.equity) / peak);
+        }
+    }
+    max_dd
 }
 
 fn stable_id(seed: &str) -> String {

@@ -97,6 +97,7 @@ async fn dispatch_inner(
         "get_portfolio_risk"   => get_portfolio_risk(clients).await,
         "init_demo_account"    => init_demo_account(args).await,
         "get_demo_account"     => get_demo_account(clients).await,
+        "get_demo_backtest"    => get_demo_backtest(clients).await,
         "demo_trade"           => demo_trade(clients, args).await,
         "demo_limit_order"     => demo_limit_order(clients, args).await,
         "cancel_demo_order"    => cancel_demo_order(args).await,
@@ -3562,9 +3563,27 @@ async fn get_demo_account(clients: &MarketClients) -> Result<ToolOutput> {
         markets.extend(kl_res.unwrap_or_default());
         account.update_marks(&markets);
         let _ = crate::demo::process_orders(&mut account, &markets);
+        crate::demo::record_snapshot(&mut account);
         let _ = crate::demo::save(&account);
     }
     Ok(ToolOutput::ok(crate::demo::summary(&account)))
+}
+
+async fn get_demo_backtest(clients: &MarketClients) -> Result<ToolOutput> {
+    let mut account = crate::demo::load();
+    if account.enabled {
+        let (pm_res, kl_res) = tokio::join!(
+            clients.polymarket.fetch_markets(100, None, None),
+            clients.kalshi.fetch_markets(100, None),
+        );
+        let mut markets = pm_res.unwrap_or_default();
+        markets.extend(kl_res.unwrap_or_default());
+        account.update_marks(&markets);
+        let _ = crate::demo::process_orders(&mut account, &markets);
+        crate::demo::record_snapshot(&mut account);
+        let _ = crate::demo::save(&account);
+    }
+    Ok(ToolOutput::ok(crate::demo::backtest_report(&account)))
 }
 
 async fn demo_trade(clients: &MarketClients, args: &serde_json::Value) -> Result<ToolOutput> {
@@ -4404,6 +4423,14 @@ pub fn all_definitions() -> Vec<ToolDefinition> {
             name: "get_demo_account".into(),
             description: "Return the local paper-trading account with cash, equity, P&L, positions, \
                 and recent demo trades. Refreshes marks from live market data when available.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDefinition {
+            name: "get_demo_backtest".into(),
+            description: "Return professional paper-trading performance analytics for demo mode: \
+                return, drawdown, exposure, idle cash, order fill discipline, turnover, hit rate, \
+                profit factor, and biggest mark-to-market drivers. Use this to evaluate whether \
+                the AI's demo trading process is improving over time.".into(),
             parameters: json!({ "type": "object", "properties": {}, "required": [] }),
         },
         ToolDefinition {

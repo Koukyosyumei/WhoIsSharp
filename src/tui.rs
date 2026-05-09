@@ -373,6 +373,9 @@ pub struct App {
     // ── Split-pane layout (Alt+S toggles) ────────────────────────────────────
     /// When true the Markets tab shows a left list + right mini-chart side-by-side.
     pub split_pane:      bool,
+
+    // ── Demo auto-trading ────────────────────────────────────────────────────
+    pub demo_auto_running: bool,
 }
 
 // Smart Money view mode
@@ -540,6 +543,7 @@ impl App {
             fuzzy_matches:     Vec::new(),
             fuzzy_cursor:      0,
             split_pane:        false,
+            demo_auto_running: false,
         }
     }
 
@@ -1082,22 +1086,27 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let key = match Tab::from_index(i) {
-                Some(Tab::Desk)       => "desk",
-                Some(Tab::Signals)    => "1",
-                Some(Tab::Markets)    => "2",
-                Some(Tab::Chart)      => "3",
-                Some(Tab::Orderbook)  => "4",
-                Some(Tab::Portfolio)  => "5",
-                Some(Tab::Simulation) => "sim",
-                Some(Tab::Chat)       => "6",
-                Some(Tab::SmartMoney) => "7",
-                Some(Tab::Trades)     => "8",
-                Some(Tab::Pairs)      => "9",
-                Some(Tab::News)       => "0",
-                None                  => "?",
+            let (key, short) = match Tab::from_index(i) {
+                Some(Tab::Desk)       => ("d", "Desk"),
+                Some(Tab::Signals)    => ("1", "Sig"),
+                Some(Tab::Markets)    => ("2", "Mkt"),
+                Some(Tab::Chart)      => ("3", "Chrt"),
+                Some(Tab::Orderbook)  => ("4", "Book"),
+                Some(Tab::Portfolio)  => ("5", "Port"),
+                Some(Tab::Simulation) => ("s", "Sim"),
+                Some(Tab::Chat)       => ("6", "Chat"),
+                Some(Tab::SmartMoney) => ("7", "SM"),
+                Some(Tab::Trades)     => ("8", "Tape"),
+                Some(Tab::Pairs)      => ("9", "Pair"),
+                Some(Tab::News)       => ("0", "News"),
+                None                  => ("?", "?"),
             };
-            Line::from(format!(" [{}] {} ", key, name))
+            let label = if area.width < 100 {
+                format!(" {}:{} ", key, short)
+            } else {
+                format!(" [{}] {} ", key, name)
+            };
+            Line::from(label)
         })
         .collect();
 
@@ -4215,6 +4224,9 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("/demo buy <dollars> yes|no", "Paper-buy selected market"),
         kv("/demo order <dollars> yes|no <limit¢>", "Place paper limit order"),
         kv("/demo cancel <id>", "Cancel paper limit order"),
+        kv("/demo backtest", "Export paper-trading performance report"),
+        kv("/demo auto on [min]", "Let the LLM run demo decision cycles automatically"),
+        kv("/demo auto now", "Run one LLM demo decision cycle immediately"),
         kv("/help  or  /?  or  ?", "Toggle this help overlay"),
         kv("/persona  or  /mode", "Cycle AI analyst persona  (Default → Contrarian → Macro → SmartMoney)"),
         kv("/split  or  /sp", "Toggle split-pane layout  (market list + chart side-by-side)"),
@@ -4615,6 +4627,9 @@ pub async fn run_tui(
     let mut spinner_iv = tokio::time::interval(std::time::Duration::from_millis(80));
     spinner_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut demo_auto_iv = tokio::time::interval(std::time::Duration::from_secs(30));
+    demo_auto_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut term_events = EventStream::new();
 
     loop {
@@ -4624,6 +4639,10 @@ pub async fn run_tui(
             // ── Startup spinner tick (only while markets haven't loaded yet) ──
             _ = spinner_iv.tick(), if app.markets.is_empty() && app.is_loading => {
                 app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            }
+
+            _ = demo_auto_iv.tick() => {
+                trigger_demo_auto(&mut app, &backend, &clients, &event_tx, false);
             }
 
             // ── Auto-refresh tick ──────────────────────────────────────────────
@@ -4677,6 +4696,8 @@ pub async fn run_tui(
                             if let Ok(events) = crate::demo::process_orders(&mut demo, &app.markets) {
                                 app.watch_alerts.extend(events);
                             }
+                            crate::demo::record_snapshot(&mut demo);
+                            let _ = crate::demo::save(&demo);
                         }
 
                         // Recompute signals with velocity and dismissed state
@@ -4873,6 +4894,16 @@ pub async fn run_tui(
                         app.is_loading = false;
                         app.chat_msgs.push(ChatMsg::Error(e.clone()));
                         app.status = format!("Error: {}", e);
+                    }
+                    AppEvent::DemoAutoStarted => {
+                        app.demo_auto_running = true;
+                        app.is_loading = true;
+                        app.status = "Demo auto cycle running…".to_string();
+                    }
+                    AppEvent::DemoAutoDone => {
+                        app.demo_auto_running = false;
+                        app.is_loading = false;
+                        app.status = "Demo auto cycle complete.".to_string();
                     }
                     AppEvent::HistoryUpdated(hist) => {
                         llm_history = hist;
@@ -5543,8 +5574,55 @@ async fn dispatch_slash_command(
             if rest.is_empty() {
                 let mut account = crate::demo::load();
                 account.update_marks(&app.markets);
+                crate::demo::record_snapshot(&mut account);
                 let _ = crate::demo::save(&account);
                 app.status = save_named_text_report("demo_account", &crate::demo::summary(&account));
+            } else if rest == "backtest" || rest == "perf" || rest == "performance" {
+                let mut account = crate::demo::load();
+                account.update_marks(&app.markets);
+                crate::demo::record_snapshot(&mut account);
+                let _ = crate::demo::save(&account);
+                app.status = save_named_text_report("demo_backtest", &crate::demo::backtest_report(&account));
+            } else if rest.starts_with("auto") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                match parts.get(1).copied().unwrap_or("status") {
+                    "on" | "enable" => {
+                        let mut config = crate::demo::load_auto_config();
+                        config.enabled = true;
+                        if let Some(minutes) = parts.get(2).and_then(|s| s.parse::<u64>().ok()) {
+                            config.interval_secs = minutes.saturating_mul(60).max(60);
+                        }
+                        app.status = match crate::demo::save_auto_config(&config) {
+                            Ok(()) => format!("Demo auto enabled. Interval: {} min.", config.interval_secs / 60),
+                            Err(e) => format!("Demo auto save failed: {}", e),
+                        };
+                    }
+                    "off" | "disable" => {
+                        let mut config = crate::demo::load_auto_config();
+                        config.enabled = false;
+                        app.status = match crate::demo::save_auto_config(&config) {
+                            Ok(()) => "Demo auto disabled.".to_string(),
+                            Err(e) => format!("Demo auto save failed: {}", e),
+                        };
+                    }
+                    "now" | "run" => {
+                        trigger_demo_auto(app, backend, clients, event_tx, true);
+                    }
+                    "status" => {
+                        let config = crate::demo::load_auto_config();
+                        let state = if config.enabled { "enabled" } else { "disabled" };
+                        app.status = format!(
+                            "Demo auto {state}. Interval {} min, max trade {:.1}%, max position {:.1}%, min cash {:.1}%.",
+                            config.interval_secs / 60,
+                            config.max_trade_notional_pct * 100.0,
+                            config.max_position_pct * 100.0,
+                            config.min_cash_pct * 100.0,
+                        );
+                    }
+                    _ => {
+                        app.status = "Usage: /demo auto on [minutes] | /demo auto off | /demo auto now | /demo auto status".to_string();
+                    }
+                }
             } else if let Some(amount) = rest.parse::<f64>().ok() {
                 app.status = match crate::demo::reset(amount) {
                     Ok(account) => format!("Demo mode enabled with ${:.2} paper cash.", account.cash),
@@ -5621,7 +5699,7 @@ async fn dispatch_slash_command(
                     app.status = "Usage: /demo buy <dollars> yes|no".to_string();
                 }
             } else {
-                app.status = "Usage: /demo <cash> | /demo | /demo buy <dollars> yes|no | /demo order <dollars> yes|no <limit¢> [ttl] | /demo cancel <id>".to_string();
+                app.status = "Usage: /demo <cash> | /demo auto on [min] | /demo auto now | /demo buy <dollars> yes|no | /demo order <dollars> yes|no <limit¢> [ttl] | /demo cancel <id>".to_string();
             }
             SlashCmd::Handled
         }
@@ -6906,6 +6984,99 @@ async fn send_chat(
     });
     // llm_history stays empty until HistoryUpdated arrives; a second message
     // sent before the first turn completes starts a fresh context (rare edge case).
+}
+
+fn build_demo_auto_prompt(app: &App, config: &crate::demo::DemoAutoConfig) -> String {
+    let mut account = crate::demo::load();
+    account.update_marks(&app.markets);
+    let account_summary = crate::demo::summary(&account);
+    let backtest = crate::demo::backtest_report(&account);
+    let signals = app.signals.iter()
+        .take(8)
+        .map(|s| format!(
+            "- [{}] {} stars: {} | {}",
+            s.kind.label(),
+            s.stars,
+            trunc(&s.title, 90),
+            trunc(&s.action, 120),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "AUTONOMOUS DEMO TRADING CYCLE\n\n\
+         You are running a paper-trading account only. Never imply real orders were placed.\n\
+         Your job is to operate the demo account like a disciplined professional trader.\n\n\
+         Current guardrails:\n\
+         - Max new trade notional: {max_trade:.1}% of starting bankroll.\n\
+         - Max total exposure in one market: {max_pos:.1}% of starting bankroll.\n\
+         - Keep at least {min_cash:.1}% of starting bankroll as idle cash unless there is an unusually strong edge.\n\
+         - Prefer limit orders when entry quality matters. Hold cash when there is no clear edge.\n\
+         - Cancel stale demo orders when the thesis has changed.\n\
+         - Before buying, use the available tools to verify the market, price history, orderbook/microstructure, and sizing.\n\
+         - Use demo_trade or demo_limit_order only when the thesis and sizing clear these guardrails.\n\n\
+         Current demo account:\n{account_summary}\n\n\
+         Current demo backtest/performance:\n{backtest}\n\n\
+         Current top signals from the TUI:\n{signals}\n\n\
+         Execute one decision cycle now. You may scan markets, analyze candidates, place/cancel paper orders, or explicitly HOLD. \
+         End with a concise blotter-style summary: action, thesis, sizing, risk, next trigger.",
+        max_trade = config.max_trade_notional_pct * 100.0,
+        max_pos = config.max_position_pct * 100.0,
+        min_cash = config.min_cash_pct * 100.0,
+        account_summary = account_summary,
+        backtest = backtest,
+        signals = if signals.is_empty() { "No current signals loaded.".to_string() } else { signals },
+    )
+}
+
+fn trigger_demo_auto(
+    app:      &mut App,
+    backend:  &Option<Arc<dyn LlmBackend>>,
+    clients:  &Arc<MarketClients>,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+    force:    bool,
+) {
+    let Some(backend_arc) = backend.clone() else {
+        app.status = "Demo auto requires an LLM backend.".to_string();
+        return;
+    };
+    if app.demo_auto_running {
+        app.status = "Demo auto cycle already running.".to_string();
+        return;
+    }
+    let mut config = crate::demo::load_auto_config();
+    if !force && !config.enabled {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if !force && config.last_run_ts > 0 {
+        let elapsed = now.saturating_sub(config.last_run_ts) as u64;
+        if elapsed < config.interval_secs {
+            return;
+        }
+    }
+    let account = crate::demo::load();
+    if !account.enabled {
+        app.status = "Demo auto needs a paper account first. Run /demo <cash>.".to_string();
+        return;
+    }
+
+    config.last_run_ts = now;
+    let _ = crate::demo::save_auto_config(&config);
+
+    let prompt = build_demo_auto_prompt(app, &config);
+    app.active_tab = Tab::Chat;
+    app.chat_msgs.push(ChatMsg::User("[demo auto] autonomous decision cycle".to_string()));
+    app.status = "Starting demo auto cycle…".to_string();
+
+    let tx = event_tx.clone();
+    let clients_c = clients.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(AppEvent::DemoAutoStarted);
+        let mut history = Vec::new();
+        agent::run_turn(backend_arc, clients_c, &mut history, prompt, Persona::SmartMoney, tx.clone()).await;
+        let _ = tx.send(AppEvent::DemoAutoDone);
+    });
 }
 
 /// Spawn a background task that fetches open positions for `wallet` from the
