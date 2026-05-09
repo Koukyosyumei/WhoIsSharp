@@ -47,7 +47,7 @@ use crate::tools::{LlmIdentifiedWallet, MarketClients, SmartMoneyWallet, TooSmar
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 
-const TAB_NAMES: &[&str] = &["Signals", "Markets", "Chart", "Book", "Portfolio", "Chat", "SmartMoney", "Trades", "Pairs", "News"];
+const TAB_NAMES: &[&str] = &["Desk", "Signals", "Markets", "Chart", "Book", "Portfolio", "Sim", "Chat", "SmartMoney", "Trades", "Pairs", "News"];
 
 const TIPS: &[&str] = &[
     "Press / to open the command bar — type a command and press Enter",
@@ -80,31 +80,35 @@ const TIPS: &[&str] = &[
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
-    Signals    = 0,
-    Markets    = 1,
-    Chart      = 2,
-    Orderbook  = 3,
-    Portfolio  = 4,
-    Chat       = 5,
-    SmartMoney = 6,
-    Trades     = 7,
-    Pairs      = 8,
-    News       = 9,
+    Desk       = 0,
+    Signals    = 1,
+    Markets    = 2,
+    Chart      = 3,
+    Orderbook  = 4,
+    Portfolio  = 5,
+    Simulation = 6,
+    Chat       = 7,
+    SmartMoney = 8,
+    Trades     = 9,
+    Pairs      = 10,
+    News       = 11,
 }
 
 impl Tab {
     fn from_index(n: usize) -> Option<Self> {
         match n {
-            0 => Some(Tab::Signals),
-            1 => Some(Tab::Markets),
-            2 => Some(Tab::Chart),
-            3 => Some(Tab::Orderbook),
-            4 => Some(Tab::Portfolio),
-            5 => Some(Tab::Chat),
-            6 => Some(Tab::SmartMoney),
-            7 => Some(Tab::Trades),
-            8 => Some(Tab::Pairs),
-            9 => Some(Tab::News),
+            0 => Some(Tab::Desk),
+            1 => Some(Tab::Signals),
+            2 => Some(Tab::Markets),
+            3 => Some(Tab::Chart),
+            4 => Some(Tab::Orderbook),
+            5 => Some(Tab::Portfolio),
+            6 => Some(Tab::Simulation),
+            7 => Some(Tab::Chat),
+            8 => Some(Tab::SmartMoney),
+            9 => Some(Tab::Trades),
+            10 => Some(Tab::Pairs),
+            11 => Some(Tab::News),
             _ => None,
         }
     }
@@ -324,6 +328,9 @@ pub struct App {
     // Portfolio risk view toggle (v key in Portfolio tab)
     pub show_risk_view:    bool,
 
+    // Last portfolio simulation result
+    pub simulation_result: Option<crate::simulation::SimulationResult>,
+
     // Startup loading spinner (cycles 0–9)
     pub spinner_tick:      u8,
 
@@ -440,7 +447,7 @@ impl App {
             chart_data:        Vec::new(),
             chart_min:         0.0,
             chart_max:         100.0,
-            active_tab:        Tab::Signals,
+            active_tab:        Tab::Desk,
             market_list:       ListState::default(),
             signal_list:       ListState::default(),
             portfolio_list:    ListState::default(),
@@ -511,6 +518,7 @@ impl App {
             pairs_cursor:      0,
             pairs_loading:     false,
             show_risk_view:    false,
+            simulation_result: None,
             spinner_tick:      0,
             tip_index:         0,
             kelly_mode:        false,
@@ -976,11 +984,13 @@ fn render(f: &mut Frame, app: &App) {
     render_header(f, chunks[0], app);
     render_tabs(f, chunks[1], app);
     match app.active_tab {
+        Tab::Desk       => render_desk(f, chunks[2], app),
         Tab::Signals    => render_signals(f, chunks[2], app),
         Tab::Markets    => render_markets(f, chunks[2], app),
         Tab::Chart      => render_chart(f, chunks[2], app),
         Tab::Orderbook  => render_orderbook(f, chunks[2], app),
         Tab::Portfolio  => render_portfolio(f, chunks[2], app),
+        Tab::Simulation => render_simulation(f, chunks[2], app),
         Tab::Chat       => render_chat(f, chunks[2], app),
         Tab::SmartMoney => render_smart_money(f, chunks[2], app),
         Tab::Trades     => render_trades(f, chunks[2], app),
@@ -1072,8 +1082,21 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            // Tab indices 0-8 → keys 1-9; index 9 (News) → key 0
-            let key = if i < 9 { (i + 1).to_string() } else { "0".to_string() };
+            let key = match Tab::from_index(i) {
+                Some(Tab::Desk)       => "desk",
+                Some(Tab::Signals)    => "1",
+                Some(Tab::Markets)    => "2",
+                Some(Tab::Chart)      => "3",
+                Some(Tab::Orderbook)  => "4",
+                Some(Tab::Portfolio)  => "5",
+                Some(Tab::Simulation) => "sim",
+                Some(Tab::Chat)       => "6",
+                Some(Tab::SmartMoney) => "7",
+                Some(Tab::Trades)     => "8",
+                Some(Tab::Pairs)      => "9",
+                Some(Tab::News)       => "0",
+                None                  => "?",
+            };
             Line::from(format!(" [{}] {} ", key, name))
         })
         .collect();
@@ -1085,6 +1108,173 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
         .divider(symbols::DOT);
 
     f.render_widget(tabs, area);
+}
+
+// ── Desk tab ─────────────────────────────────────────────────────────────────
+
+fn render_desk(f: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
+
+    render_desk_summary(f, rows[0], app);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(rows[1]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(cols[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(cols[1]);
+
+    render_desk_signals(f, left[0], app);
+    render_desk_alerts(f, left[1], app);
+    render_desk_sim(f, right[0], app);
+    render_desk_context(f, right[1], app);
+}
+
+fn render_desk_summary(f: &mut Frame, area: Rect, app: &App) {
+    let cost = app.portfolio.total_cost();
+    let value = app.portfolio.total_value();
+    let pnl = app.portfolio.total_pnl();
+    let pnl_pct = if cost > 1e-9 { pnl / cost * 100.0 } else { 0.0 };
+    let pnl_color = if pnl >= 0.0 { Color::Green } else { Color::Red };
+    let three_star = app.signals.iter().filter(|s| s.stars >= 3).count();
+    let sim_tail = app.simulation_result.as_ref().map(|r| r.p05_pnl);
+    let sim_color = sim_tail.map(|v| if v < 0.0 { Color::Red } else { Color::Green }).unwrap_or(Color::DarkGray);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" Desk ", Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
+            Span::raw("  Live book overview"),
+            Span::styled("   [/refresh] [/simulate] [/risk] [/book]", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            desk_metric("Positions", &format!("{}", app.portfolio.positions.len()), Color::White),
+            Span::raw("   "),
+            desk_metric("Cost", &format!("${:.0}", cost), Color::White),
+            Span::raw("   "),
+            desk_metric("Value", &format!("${:.0}", value), Color::White),
+            Span::raw("   "),
+            desk_metric("P&L", &format!("{:+.2} ({:+.1}%)", pnl, pnl_pct), pnl_color),
+            Span::raw("   "),
+            desk_metric("Signals", &format!("{} / {} hot", app.signals.len(), three_star), Color::Yellow),
+            Span::raw("   "),
+            desk_metric("5% Sim", &sim_tail.map(|v| format!("{:+.2}", v)).unwrap_or_else(|| "not run".into()), sim_color),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Desk ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+    f.render_widget(p, area);
+}
+
+fn render_desk_signals(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    if app.signals.is_empty() {
+        lines.push(Line::from(" No active signals. Press ^ or /refresh."));
+    } else {
+        for s in app.signals.iter().take(area.height.saturating_sub(2) as usize) {
+            let color = match s.kind {
+                SignalKind::Arb => Color::Magenta,
+                SignalKind::InsiderAlert => Color::Red,
+                SignalKind::Momentum => Color::Green,
+                SignalKind::VolSpike => Color::Yellow,
+                SignalKind::Thin => Color::Blue,
+                SignalKind::NearFifty => Color::Cyan,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<5}", s.kind.label()), Style::default().fg(color).bold()),
+                Span::styled(format!(" {} ", "★".repeat(s.stars as usize)), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{:>5.1}¢ ", s.price_a * 100.0), Style::default().fg(Color::White)),
+                Span::raw(trunc(&s.title, area.width.saturating_sub(20) as usize)),
+            ]));
+        }
+    }
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Priority Signals ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_desk_alerts(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    if app.watch_alerts.is_empty() {
+        lines.push(Line::from(" No active watchlist or position alerts."));
+    } else {
+        for alert in app.watch_alerts.iter().take(area.height.saturating_sub(2) as usize) {
+            lines.push(Line::from(Span::styled(trunc(alert, area.width.saturating_sub(4) as usize), Style::default().fg(Color::Yellow))));
+        }
+    }
+    if lines.len() < area.height.saturating_sub(2) as usize {
+        lines.push(Line::from(Span::styled(format!(" {} watched markets", app.watchlist.len()), Style::default().fg(Color::DarkGray))));
+    }
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Alerts ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_desk_sim(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    if let Some(r) = &app.simulation_result {
+        lines.push(Line::from(vec![
+            Span::styled(trunc(&r.spec.name, 34), Style::default().fg(Color::White).bold()),
+            Span::styled(format!("  {} trials", r.spec.trials), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(sim_row("Expected", r.expected_pnl, if r.expected_pnl >= 0.0 { Color::Green } else { Color::Red }));
+        lines.push(sim_row("5% worst", r.p05_pnl, Color::Yellow));
+        lines.push(sim_row("1% worst", r.p01_pnl, Color::Red));
+        lines.push(Line::from(vec![
+            Span::styled(" P(loss)  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}%", r.prob_loss * 100.0), Style::default().fg(if r.prob_loss > 0.35 { Color::Red } else { Color::Green }).bold()),
+        ]));
+    } else {
+        lines.push(Line::from(" No simulation run yet."));
+        lines.push(Line::from(" Type /simulate to generate tail-risk view."));
+    }
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Simulation ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_desk_context(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    let macro_str = app.macro_data.header_str();
+    if macro_str.is_empty() {
+        lines.push(Line::from(" Macro: set FRED_API_KEY for Fed/CPI/yield context."));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Macro ", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(macro_str),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Markets ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{} loaded   filter {}   sort {}", app.markets.len(), app.platform_filter.label(), app.market_sort.label())),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Research ", Style::default().fg(Color::DarkGray)),
+        Span::raw("use /thesis, /ledger, /backtest, /calibration"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("AI ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{}   persona {}", app.backend_name, app.active_persona.name())),
+    ]));
+    let p = Paragraph::new(lines)
+        .block(Block::default().title(" Context ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+fn desk_metric(label: &str, value: &str, color: Color) -> Span<'static> {
+    Span::styled(format!("{} {}", label, value), Style::default().fg(color).bold())
 }
 
 // ── Signals tab ───────────────────────────────────────────────────────────────
@@ -2265,6 +2455,147 @@ fn render_portfolio_positions(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = app.portfolio_list.clone();
     f.render_stateful_widget(list, area, &mut state);
+}
+
+// ── Simulation tab ───────────────────────────────────────────────────────────
+
+fn render_simulation(f: &mut Frame, area: Rect, app: &App) {
+    let Some(result) = &app.simulation_result else {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("  No simulation has been run yet.", Style::default().fg(Color::White).bold())),
+            Line::from(""),
+            Line::from("  Type /simulate to run a base Monte Carlo on the tracked portfolio."),
+            Line::from("  Ask the AI to run simulate_portfolio with scenario shocks for richer what-if analysis."),
+            Line::from(""),
+            Line::from(Span::styled("  Example shock: topic=macro, YES shift -12pp, rho 0.65", Style::default().fg(Color::DarkGray))),
+        ];
+        let p = Paragraph::new(lines)
+            .block(Block::default().title(" Simulation Lab ").borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(10), Constraint::Length(8)])
+        .split(area);
+
+    render_sim_summary(f, rows[0], result);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(rows[1]);
+    render_sim_distribution(f, cols[0], result);
+    render_sim_tail_drivers(f, cols[1], result);
+    render_sim_scenario(f, rows[2], result);
+}
+
+fn render_sim_summary(f: &mut Frame, area: Rect, result: &crate::simulation::SimulationResult) {
+    let loss_color = if result.prob_loss > 0.35 { Color::Red } else if result.prob_loss > 0.20 { Color::Yellow } else { Color::Green };
+    let ev_color = if result.expected_pnl >= 0.0 { Color::Green } else { Color::Red };
+    let rows = vec![
+        Line::from(vec![
+            Span::styled(" Scenario ", Style::default().fg(Color::DarkGray)),
+            Span::styled(result.spec.name.clone(), Style::default().fg(Color::White).bold()),
+            Span::raw(format!("   {} trials   {} positions", result.spec.trials, result.positions)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            metric_span("E[P&L]", result.expected_pnl, ev_color),
+            Span::raw("    "),
+            metric_span("Median", result.median_pnl, Color::White),
+            Span::raw("    "),
+            metric_span("5% tail", result.p05_pnl, Color::Yellow),
+            Span::raw("    "),
+            metric_span("1% tail", result.p01_pnl, Color::Red),
+            Span::raw("    "),
+            Span::styled(format!("P(loss) {:.1}%", result.prob_loss * 100.0), Style::default().fg(loss_color).bold()),
+        ]),
+    ];
+    let p = Paragraph::new(rows)
+        .block(Block::default().title(" Simulation Dashboard ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)));
+    f.render_widget(p, area);
+}
+
+fn render_sim_distribution(f: &mut Frame, area: Rect, result: &crate::simulation::SimulationResult) {
+    let rows = vec![
+        sim_row("Expected", result.expected_pnl, Color::Green),
+        sim_row("Median", result.median_pnl, Color::White),
+        sim_row("5% worst", result.p05_pnl, Color::Yellow),
+        sim_row("1% worst", result.p01_pnl, Color::Red),
+        sim_row("CVaR 5%", result.cvar_05, Color::Yellow),
+        sim_row("CVaR 1%", result.cvar_01, Color::Red),
+        sim_row("Worst", result.worst_pnl, Color::Red),
+        sim_row("Best", result.best_pnl, Color::Green),
+    ];
+    let p = Paragraph::new(rows)
+        .block(Block::default().title(" Distribution ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_sim_tail_drivers(f: &mut Frame, area: Rect, result: &crate::simulation::SimulationResult) {
+    let worst = result.tail_drivers.iter()
+        .map(|d| d.avg_tail_pnl.abs())
+        .fold(1.0_f64, f64::max);
+    let mut rows = vec![Line::from(Span::styled(" Avg contribution in worst 5% scenarios", Style::default().fg(Color::DarkGray)))];
+    for d in &result.tail_drivers {
+        let bar_len = ((d.avg_tail_pnl.abs() / worst) * 18.0).round() as usize;
+        let bar = "█".repeat(bar_len.max(1));
+        rows.push(Line::from(vec![
+            Span::styled(format!("{:>9.2} ", d.avg_tail_pnl), Style::default().fg(if d.avg_tail_pnl < 0.0 { Color::Red } else { Color::Green })),
+            Span::styled(format!("{:<18}", bar), Style::default().fg(Color::Red)),
+            Span::raw(format!(" {}", trunc(&d.title, 42))),
+        ]));
+    }
+    if result.tail_drivers.is_empty() {
+        rows.push(Line::from(" No tail drivers available."));
+    }
+    let p = Paragraph::new(rows)
+        .block(Block::default().title(" Tail Drivers ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(p, area);
+}
+
+fn render_sim_scenario(f: &mut Frame, area: Rect, result: &crate::simulation::SimulationResult) {
+    let mut rows = Vec::new();
+    if result.spec.shocks.is_empty() && result.spec.correlation_groups.is_empty() {
+        rows.push(Line::from(" Base case: no explicit scenario shocks or correlation groups."));
+        rows.push(Line::from(" Ask AI: \"simulate my book if macro drops 12pp and politics is 65% correlated\"."));
+    } else {
+        for s in &result.spec.shocks {
+            rows.push(Line::from(vec![
+                Span::styled("Shock ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}={}  YES {:+.1}pp", s.target_type, s.target, s.yes_price_shift * 100.0)),
+            ]));
+        }
+        for g in &result.spec.correlation_groups {
+            rows.push(Line::from(vec![
+                Span::styled("Corr  ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!("{}  rho {:.2}  {}", g.name, g.rho.clamp(0.0, 0.95), g.targets.join(", "))),
+            ]));
+        }
+    }
+    let p = Paragraph::new(rows)
+        .block(Block::default().title(" Scenario Spec ").borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+fn metric_span(label: &str, value: f64, color: Color) -> Span<'static> {
+    Span::styled(format!("{} {:+.2}", label, value), Style::default().fg(color).bold())
+}
+
+fn sim_row(label: &str, value: f64, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {:<10}", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:>+10.2}", value), Style::default().fg(color).bold()),
+    ])
 }
 
 // ── Chat tab ──────────────────────────────────────────────────────────────────
@@ -3837,6 +4168,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(""),
         h(" Navigation"),
         kv("1–9 / Tab / Shift+Tab", "Switch tabs directly"),
+        kv("/desk  or  /home", "Return to the overview dashboard"),
         kv("j / ↓  ·  k / ↑", "Navigate list / scroll"),
         kv("Enter", "Select market → load chart + book + trades"),
         kv("Ctrl+C", "Quit (saves session automatically)"),
@@ -4177,23 +4509,27 @@ mod tests {
 
     #[test]
     fn tab_next_cycles_forward() {
+        assert_eq!(Tab::Desk.next(),        Tab::Signals);
         assert_eq!(Tab::Signals.next(),     Tab::Markets);
         assert_eq!(Tab::Markets.next(),     Tab::Chart);
         assert_eq!(Tab::Chart.next(),       Tab::Orderbook);
         assert_eq!(Tab::Orderbook.next(),   Tab::Portfolio);
-        assert_eq!(Tab::Portfolio.next(),   Tab::Chat);
+        assert_eq!(Tab::Portfolio.next(),   Tab::Simulation);
+        assert_eq!(Tab::Simulation.next(),  Tab::Chat);
         assert_eq!(Tab::Chat.next(),        Tab::SmartMoney);
         assert_eq!(Tab::SmartMoney.next(),  Tab::Trades);
         assert_eq!(Tab::Trades.next(),      Tab::Pairs);
         assert_eq!(Tab::Pairs.next(),       Tab::News);
-        assert_eq!(Tab::News.next(),        Tab::Signals); // wraps
+        assert_eq!(Tab::News.next(),        Tab::Desk); // wraps
     }
 
     #[test]
     fn tab_prev_cycles_backward() {
-        assert_eq!(Tab::Signals.prev(),     Tab::News); // wraps
+        assert_eq!(Tab::Desk.prev(),        Tab::News); // wraps
+        assert_eq!(Tab::Signals.prev(),     Tab::Desk);
         assert_eq!(Tab::Markets.prev(),     Tab::Signals);
-        assert_eq!(Tab::Chat.prev(),        Tab::Portfolio);
+        assert_eq!(Tab::Simulation.prev(),  Tab::Portfolio);
+        assert_eq!(Tab::Chat.prev(),        Tab::Simulation);
         assert_eq!(Tab::SmartMoney.prev(),  Tab::Chat);
         assert_eq!(Tab::Trades.prev(),      Tab::SmartMoney);
         assert_eq!(Tab::Pairs.prev(),       Tab::Trades);
@@ -4938,6 +5274,13 @@ async fn dispatch_slash_command(
     let cmd = raw.trim().to_lowercase();
     let cmd_word = cmd.split_whitespace().next().unwrap_or("");
     match cmd_word {
+        // ── desk overview ────────────────────────────────────────────────────
+        "desk" | "home" => {
+            app.active_tab = AppTab::Desk;
+            app.status = "Desk overview.".to_string();
+            SlashCmd::Handled
+        }
+
         // ── quit ─────────────────────────────────────────────────────────────
         "q" | "quit" => SlashCmd::Quit,
 
@@ -5218,7 +5561,12 @@ async fn dispatch_slash_command(
                 &app.markets,
                 crate::simulation::default_spec(),
             ) {
-                Ok(result) => save_named_text_report("simulation", &crate::simulation::render_report(&result)),
+                Ok(result) => {
+                    let status = save_named_text_report("simulation", &crate::simulation::render_report(&result));
+                    app.simulation_result = Some(result);
+                    app.active_tab = AppTab::Simulation;
+                    status
+                }
                 Err(e) => format!("Simulation failed: {}", e),
             };
             SlashCmd::Handled
@@ -5346,6 +5694,7 @@ async fn dispatch_slash_command(
 /// Rebuild the fuzzy-search match list from `app.markets` and built-in commands.
 fn rebuild_fuzzy_matches(app: &mut App) {
     const COMMANDS: &[(&str, &str)] = &[
+        ("desk",      "Open overview dashboard"),
         ("refresh",   "Refresh market data"),
         ("platform",  "Cycle platform filter"),
         ("chart",     "Cycle chart interval"),
