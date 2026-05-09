@@ -286,6 +286,7 @@ pub struct App {
 
     // Help overlay
     pub show_help:        bool,
+    pub help_scroll:      u16,
 
     // Auto-refresh state
     pub refresh_secs:     u64,
@@ -498,6 +499,7 @@ impl App {
             alert_edit_step:   AlertEditStep::default(),
             alert_edit_mkt:    String::new(),
             show_help:         false,
+            help_scroll:       0,
             refresh_secs:      60,
             next_refresh_at:   None,
             status:            "Loading market data…".to_string(),
@@ -1021,7 +1023,7 @@ fn render(f: &mut Frame, app: &App) {
 
     // Help overlay renders on top of everything
     if app.show_help {
-        render_help_overlay(f, area);
+        render_help_overlay(f, area, app);
     }
 }
 
@@ -4173,7 +4175,7 @@ fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-fn render_help_overlay(f: &mut Frame, area: Rect) {
+fn render_help_overlay(f: &mut Frame, area: Rect, app: &App) {
     let popup = centered_rect(66, 92, area);
     f.render_widget(Clear, popup);
 
@@ -4243,7 +4245,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         kv("!note <text>", "Append timestamped note to research log"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Press /help or Esc to close               WhoIsSharp v0.1.0",
+            "  Scroll: j/k, arrows, PgUp/PgDn, Home/End   Close: Esc or ?",
             Style::default().fg(Color::DarkGray),
         )]),
     ];
@@ -4255,6 +4257,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
+        .scroll((app.help_scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(p, popup);
 }
@@ -5773,6 +5776,7 @@ async fn dispatch_slash_command(
         // ── help overlay ──────────────────────────────────────────────────────
         "?" | "help" | "h" => {
             app.show_help = !app.show_help;
+            app.help_scroll = 0;
             SlashCmd::Handled
         }
 
@@ -6397,6 +6401,25 @@ async fn handle_key(
         // ── Help overlay ──────────────────────────────────────────────────────
         KC::Char('?') if app.input.is_empty() => {
             app.show_help = !app.show_help;
+            app.help_scroll = 0;
+        }
+        KC::Char('j') | KC::Down if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KC::Char('k') | KC::Up if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KC::PageDown if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_add(10);
+        }
+        KC::PageUp if app.show_help => {
+            app.help_scroll = app.help_scroll.saturating_sub(10);
+        }
+        KC::Home if app.show_help => {
+            app.help_scroll = 0;
+        }
+        KC::End if app.show_help => {
+            app.help_scroll = 200;
         }
 
         // ── Smart Money mode toggle (t = toggle between MarketFocus / TooSmart) ──
